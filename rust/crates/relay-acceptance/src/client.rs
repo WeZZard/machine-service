@@ -270,6 +270,9 @@ impl RelayClient {
             call,
             execution: execution.into(),
             op,
+            // The broker names the lease itself and overwrites any value a
+            // client sends (DC-174).
+            lease: None,
         }))?;
         if uploads {
             let mut hasher = Sha256::new();
