@@ -930,10 +930,28 @@ version = "0.1.1"
 dependencies = [
  "guest-actions",
  "libc",
+ "remote-session",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "relay-broker"
+version = "0.1.1"
+dependencies = [
+ "base64 0.22.1",
+ "guest-actions",
+ "libc",
+ "rand",
+ "rcgen",
+ "relay-agent",
+ "remote-session",
+ "rustls",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

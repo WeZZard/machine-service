@@ -28,6 +28,10 @@ pub struct Config {
     pub broker_url: String,
     /// The bearer token the broker checks in the session's first message.
     pub agent_credential: String,
+    /// The broker's own authority, PEM, trusted beside the public roots, as
+    /// machine-service writes it for its self-signed broker (RP-1).
+    #[serde(default)]
+    pub broker_ca_pem: Option<String>,
 }
 
 impl fmt::Debug for Config {
@@ -36,6 +40,10 @@ impl fmt::Debug for Config {
             .debug_struct("Config")
             .field("broker_url", &self.broker_url)
             .field("agent_credential", &"<redacted>")
+            .field(
+                "broker_ca_pem",
+                &self.broker_ca_pem.as_ref().map(|_| "<pem>"),
+            )
             .finish()
     }
 }

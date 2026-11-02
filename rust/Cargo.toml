@@ -24,6 +24,7 @@ members = [
   "crates/runtime-launcher",
   "crates/remote-session",
   "crates/network-rig",
+  "crates/relay-broker",
 ]
 
 [workspace.package]

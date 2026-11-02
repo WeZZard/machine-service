@@ -421,7 +421,10 @@ impl Session {
             Message::Heartbeat
             | Message::Hello(_)
             | Message::Result(_)
-            | Message::QueryResult { .. } => {}
+            | Message::QueryResult { .. }
+            | Message::Ready(_)
+            | Message::Pending(_)
+            | Message::Revoked { .. } => {}
         }
     }
 

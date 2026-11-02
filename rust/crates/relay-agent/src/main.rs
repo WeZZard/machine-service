@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use relay_agent::config::{config_path, wait_for};
+use relay_agent::config::{config_path, load, wait_for};
 use relay_agent::dial::run;
-use relay_agent::{Agent, AgentOptions, LinkError, MemoryLink, StreamLink};
+use relay_agent::session_link::{self, DialOptions};
+use relay_agent::{Agent, AgentOptions, StreamLink};
 
 /// How long a stopping agent waits for running commands to record their end.
 const GRACE: Duration = Duration::from_secs(2);
@@ -58,15 +59,33 @@ fn serve_broker() {
         "relay-agent: configuration loaded; broker {}",
         config.broker_url
     );
+    let options = match DialOptions::from_environment() {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("relay-agent: {error}");
+            std::process::exit(2);
+        }
+    };
     let agent = open_agent();
     let _ = running.set(agent.clone());
+    // The file is read again before every dial, so a rotated credential or a
+    // moved broker takes effect without a restart; a file that stops loading
+    // leaves the last good configuration in use.
+    let mut current = config;
     run(
         &agent,
-        &config,
-        |_| -> Result<MemoryLink, LinkError> {
-            Err(LinkError::Failed(
-                "this build cannot dial the broker yet: it has no WebSocket session".into(),
-            ))
+        &current.clone(),
+        |_| {
+            if let Ok(fresh) = load(&path) {
+                if fresh != current {
+                    eprintln!(
+                        "relay-agent: configuration changed; broker {}",
+                        fresh.broker_url
+                    );
+                    current = fresh;
+                }
+            }
+            session_link::dial(&current, &options)
         },
         |reason| eprintln!("relay-agent: {reason}"),
     );

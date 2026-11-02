@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 guest-actions = { path = "../guest-actions" }
+remote-session = { path = "../remote-session" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

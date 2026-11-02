@@ -1587,6 +1587,7 @@ fn run_serves_each_dialed_link_and_dials_again_after_failures() {
     let config = config::Config {
         broker_url: "wss://broker.example/relay".into(),
         agent_credential: "t".into(),
+        broker_ca_pem: None,
     };
     let (brokers, received) = std::sync::mpsc::channel::<MemoryLink>();
     let running = {

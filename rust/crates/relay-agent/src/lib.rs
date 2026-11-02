@@ -8,6 +8,7 @@
 //! - [`config`]: the broker URL and agent credential, and waiting for them.
 //! - [`dial`]: the dial-out loop that serves each link a dialer opens.
 //! - [`driver`]: the broker's end of one link.
+//! - [`session_link`]: the link over a resumable session to the broker.
 //!
 //! The actions themselves are those of the guest session agent, shared
 //! through the `guest-actions` crate.
@@ -18,6 +19,7 @@ pub mod dial;
 pub mod driver;
 pub mod link;
 pub mod protocol;
+pub mod session_link;
 pub mod store;
 
 pub use agent::{Agent, AgentOptions};

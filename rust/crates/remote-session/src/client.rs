@@ -1,7 +1,7 @@
 //! The client side: dial by URL, say hello, and keep the session alive across
 //! broken connections with backoff (RS-2, RS-4, TC-1, TC-4, TC-6).
 
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,36 @@ use crate::session::{Session, SessionEnd, Shared, DEFAULT_MAX_BUFFERED};
 use crate::timing::{Backoff, Timing};
 use crate::wire::{Control, ExpiryReason, Hello, Welcome, PROTOCOL_VERSION};
 use crate::{tls, Error};
+
+/// Resolves a host name and port to the addresses to try, on every connection
+/// attempt. The default is the system resolver.
+pub type Resolver = Arc<dyn Fn(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + Sync>;
+
+/// A resolver that answers `address` for `host:port`, as `curl --resolve
+/// host:port:address` does, and the system resolver for any other name. The
+/// spec is `host:port:address`; an IPv6 address may be bracketed.
+pub fn fixed_resolver(spec: &str) -> Result<Resolver, Error> {
+    let bad = || Error::Config(format!("resolve {spec:?} is not host:port:address"));
+    let (host, rest) = spec.split_once(':').ok_or_else(bad)?;
+    let (port, address) = rest.split_once(':').ok_or_else(bad)?;
+    let port: u16 = port.parse().map_err(|_| bad())?;
+    let address: IpAddr = address
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| bad())?;
+    if host.is_empty() {
+        return Err(bad());
+    }
+    let host = host.to_ascii_lowercase();
+    Ok(Arc::new(move |name: &str, wanted: u16| {
+        if name.eq_ignore_ascii_case(&host) && wanted == port {
+            Ok(vec![SocketAddr::new(address, port)])
+        } else {
+            (name, wanted).to_socket_addrs().map(Iterator::collect)
+        }
+    }))
+}
 
 /// How a client reaches and authenticates to a session server.
 #[derive(Clone)]
@@ -32,6 +62,9 @@ pub struct ClientConfig {
     pub backoff: Backoff,
     /// Bytes held unacknowledged before [`Session::send`] waits.
     pub max_buffered: usize,
+    /// How the URL's host is resolved on each attempt; `None` is the system
+    /// resolver. The TLS server name stays the URL's host either way.
+    pub resolver: Option<Resolver>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -56,20 +89,27 @@ impl ClientConfig {
             timing: Timing::default(),
             backoff: Backoff::default(),
             max_buffered: DEFAULT_MAX_BUFFERED,
+            resolver: None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Target {
     url: String,
     secure: bool,
     host: String,
     port: u16,
+    resolver: Option<Resolver>,
 }
 
 impl Target {
+    #[cfg(test)]
     pub fn parse(url: &str) -> Result<Self, Error> {
+        Self::parse_with(url, None)
+    }
+
+    pub fn parse_with(url: &str, resolver: Option<Resolver>) -> Result<Self, Error> {
         let uri: Uri = url
             .parse()
             .map_err(|e| Error::Config(format!("bad URL {url:?}: {e}")))?;
@@ -90,6 +130,7 @@ impl Target {
             secure,
             host,
             port,
+            resolver,
         };
         if !secure {
             target.resolve()?;
@@ -99,9 +140,15 @@ impl Target {
 
     /// The addresses to try now. Plain WebSocket is only for loopback.
     fn resolve(&self) -> Result<Vec<SocketAddr>, Error> {
-        let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port)
-            .to_socket_addrs()
+        let resolved = match &self.resolver {
+            Some(resolve) => resolve(&self.host, self.port),
+            None => (self.host.as_str(), self.port)
+                .to_socket_addrs()
+                .map(Iterator::collect),
+        };
+        let addrs: Vec<SocketAddr> = resolved
             .map_err(|e| Error::Connect(format!("resolve {}: {e}", self.host)))?
+            .into_iter()
             .filter(|a| self.secure || a.ip().is_loopback())
             .collect();
         if addrs.is_empty() {
@@ -201,7 +248,7 @@ fn open(
 /// the background.
 pub fn connect(config: ClientConfig) -> Result<Session, Error> {
     config.timing.validate()?;
-    let target = Target::parse(&config.url)?;
+    let target = Target::parse_with(&config.url, config.resolver.clone())?;
     let tls = config
         .tls
         .clone()
@@ -376,5 +423,36 @@ mod tests {
         ));
         let t = Target::parse("wss://broker.example.invalid/relay").unwrap();
         assert_eq!((t.host.as_str(), t.port), ("broker.example.invalid", 443));
+    }
+
+    #[test]
+    fn a_fixed_resolver_answers_its_name_and_port_only() {
+        let resolve = fixed_resolver("broker.relay-rig.test:8443:127.0.0.1").unwrap();
+        assert_eq!(
+            resolve("Broker.Relay-Rig.test", 8443).unwrap(),
+            vec!["127.0.0.1:8443".parse().unwrap()]
+        );
+        // Any other name goes to the system resolver.
+        assert!(resolve("127.0.0.1", 9)
+            .unwrap()
+            .iter()
+            .all(|a| a.ip().is_loopback()));
+        let six = fixed_resolver("h:1:[::1]").unwrap();
+        assert_eq!(six("h", 1).unwrap(), vec!["[::1]:1".parse().unwrap()]);
+        for bad in ["", "h", "h:1", "h:x:127.0.0.1", ":1:127.0.0.1", "h:1:nope"] {
+            assert!(fixed_resolver(bad).is_err(), "{bad}");
+        }
+        let target = Target::parse_with(
+            "wss://broker.relay-rig.test:8443/relay",
+            Some(resolve.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            target.resolve().unwrap(),
+            vec!["127.0.0.1:8443".parse().unwrap()]
+        );
+        // A resolver may make a name plain-WebSocket-eligible only by
+        // answering loopback.
+        assert!(Target::parse_with("ws://broker.relay-rig.test:8443/relay", Some(resolve)).is_ok());
     }
 }

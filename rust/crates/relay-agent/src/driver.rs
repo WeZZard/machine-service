@@ -178,7 +178,12 @@ impl Driver {
                 self.queries.insert(call, state);
             }
             Message::Heartbeat => self.heartbeats += 1,
-            Message::Hello(_) | Message::Call(_) | Message::Query { .. } => {}
+            Message::Hello(_)
+            | Message::Call(_)
+            | Message::Query { .. }
+            | Message::Ready(_)
+            | Message::Pending(_)
+            | Message::Revoked { .. } => {}
         }
         Ok(())
     }

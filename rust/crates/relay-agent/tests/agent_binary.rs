@@ -355,7 +355,9 @@ fn run_waits_for_a_private_configuration() {
     assert!(!relay_agent::agent::state_directory(home.path()).exists());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     expect("configuration loaded; broker wss://broker.example/relay");
-    expect("cannot dial the broker yet");
+    // It dials now; `.example` never resolves (RFC 2606), so the dial fails
+    // and is retried with backoff.
+    expect("connect:");
     // SAFETY: `kill` takes plain integers.
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);

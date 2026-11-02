@@ -31,7 +31,7 @@ mod timing;
 pub mod tls;
 mod wire;
 
-pub use client::{connect, ClientConfig};
+pub use client::{connect, fixed_resolver, ClientConfig, Resolver};
 pub use server::{
     AuthRequest, Authenticator, Listening, Rejection, ServerConfig, SessionServer, StaticToken,
     DEFAULT_GRACE, DEFAULT_SESSION_PORT, RELAY_PATH, SESSION_PORT_ENV,

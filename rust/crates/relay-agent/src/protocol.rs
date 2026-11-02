@@ -69,7 +69,7 @@ pub enum Message {
         /// The execution ID asked about.
         execution: String,
     },
-    /// Agent → broker: the answer to a query.
+    /// Agent → broker, and broker → client: the answer to a query.
     QueryResult {
         /// The query's number.
         call: u64,
@@ -78,6 +78,57 @@ pub enum Message {
         /// What the agent knows of it.
         state: ExecutionState,
     },
+    /// Broker → client, first on every new client session
+    /// (`docs/arch/relay-protocol.md` RP-4).
+    Ready(Ready),
+    /// Broker → client: a call or query waits for the lease's relay agent
+    /// (RP-8).
+    Pending(Pending),
+    /// Broker → client: the lease's credentials were revoked; the broker
+    /// closes the session next (RP-10).
+    Revoked {
+        /// `released` or `expired`.
+        reason: String,
+    },
+}
+
+/// The broker's first message to a client.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Ready {
+    /// [`PROTOCOL`].
+    pub protocol: u32,
+    /// The lease's machine name.
+    pub lease: String,
+    /// The lease's relay agent, when it has a session.
+    pub agent: Option<AgentInfo>,
+}
+
+/// What a client learns of a relay agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    /// `macos` or `linux`.
+    pub os: String,
+    /// The processor architecture.
+    pub arch: String,
+    /// The SHA-256 of the agent's executable.
+    pub build: String,
+    /// The agent's protocol version.
+    pub protocol: u32,
+}
+
+/// A call or query that waits for the relay agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    /// The client's call number.
+    pub call: u64,
+    /// The call's execution ID.
+    pub execution: String,
+    /// Why it waits: `agent_not_connected`.
+    pub code: String,
+    /// What it waits for, for people.
+    pub message: String,
+    /// How long it waits at most.
+    pub wait_ms: u64,
 }
 
 /// The agent's first message on a link.
