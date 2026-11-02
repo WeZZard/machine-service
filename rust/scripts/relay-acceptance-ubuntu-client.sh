@@ -29,9 +29,21 @@ exec_script() {
         -H 'content-type: application/json' -d "$body"
 }
 
+cell=""
+profile=""
+prev=""
+for arg in "$@"; do
+    [ "$prev" = "--cell" ] && cell="$arg"
+    [ "$prev" = "--profile" ] && profile="$arg"
+    prev="$arg"
+done
+
+# A purpose is leased once per image, so each client VM names its cell, in
+# the characters a purpose takes.
+purpose=$(printf 'acc-client-%s-%s' "$cell" "$profile" | tr 'A-Z.' 'a-z-' | cut -c1-64)
 echo "leasing the Ubuntu client VM from $client_instance"
 answer=$(curl -fsS -m 1800 -X POST "$client_instance/acquire" -H 'content-type: application/json' \
-    -d '{"purpose":"relay-acceptance-client","image":"ubuntu2404","ttl_hours":8}')
+    -d "{\"purpose\":\"$purpose\",\"image\":\"ubuntu2404\",\"ttl_hours\":8}")
 vm=$(printf %s "$answer" | json 'd["vm"]')
 lease=$(printf %s "$answer" | json 'd.get("lease_id","")')
 echo "client VM: $vm"
@@ -66,14 +78,6 @@ done
 quoted=""
 for arg in "$@"; do
     quoted="$quoted '$(printf %s "$arg" | sed "s/'/'\\\\''/g")'"
-done
-cell=""
-profile=""
-prev=""
-for arg in "$@"; do
-    [ "$prev" = "--cell" ] && cell="$arg"
-    [ "$prev" = "--profile" ] && profile="$arg"
-    prev="$arg"
 done
 
 exec_script "$vm" "chmod +x ~/relay-acceptance; printf '$hosts' | sudo -n tee -a /etc/hosts >/dev/null; \

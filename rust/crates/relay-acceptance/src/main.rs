@@ -83,7 +83,13 @@ fn run(args: &[String]) -> i32 {
         seed,
         manage_agent_rig: flag(args, "agent-rig").as_deref() != Some("external"),
         host,
-        purpose: flag(args, "purpose").unwrap_or_else(|| "relay-acceptance".into()),
+        // A purpose is leased once per image, so each cell and profile has
+        // its own, in the characters a purpose takes.
+        purpose: flag(args, "purpose").unwrap_or_else(|| {
+            format!("acc-{}-{}", cell.id(), profile.id)
+                .to_ascii_lowercase()
+                .replace('.', "-")
+        }),
     };
     let evidence = PathBuf::from(need(args, "evidence"));
     let mut target = RealTarget::new(settings);
