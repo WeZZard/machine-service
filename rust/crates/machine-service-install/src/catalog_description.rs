@@ -315,6 +315,37 @@ fn effective_environment(
 }
 
 /// Run `catalog-description` for the Mac whose home is `home`.
+/// The broker's metadata for Consul (BK-4, RP-11): `relay_url` and, once
+/// the instance has made its authority, `relay_ca_sha256`. Empty unless the
+/// installed instance serves the relay link.
+pub fn relay_meta(env: &BTreeMap<String, String>, home: &Path) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::new();
+    if env.get("MACHINE_SERVICE_GUEST_LINK").map(String::as_str) != Some("relay") {
+        return meta;
+    }
+    let port = env
+        .get(machine_service_core::remote_session::SESSION_PORT_ENV)
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(machine_service_core::remote_session::DEFAULT_SESSION_PORT);
+    let url = env
+        .get(machine_service_core::relay::RELAY_URL_VARIABLE)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| machine_service_core::relay::default_relay_url(port));
+    meta.insert("relay_url".to_string(), url);
+    let state = env
+        .get("MACHINE_SERVICE_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/state/machine-service"));
+    if let Some(sha256) = std::fs::read_to_string(state.join("relay/tls/ca.pem"))
+        .ok()
+        .and_then(|pem| machine_service_core::relay_broker::tls::pem_sha256(&pem))
+    {
+        meta.insert("relay_ca_sha256".to_string(), sha256);
+    }
+    meta
+}
+
 pub fn run(argument: Option<Exposure>, home: &Path) -> Result<(), InstallError> {
     let plist = crate::migration::agent_plist(home, installer::LABEL);
     let installed = match installer::load_old_plist(&plist)? {
@@ -386,7 +417,13 @@ to serve the LAN (FD-1)."
     eprintln!(
         "machine_id: {machine_id} (this Mac's hardware UUID, published as meta.{MACHINE_ID_META})"
     );
-    print!("{}", render(&description(&offers, port, &machine_id)));
+    let mut described = description(&offers, port, &machine_id);
+    let relay = relay_meta(&env, home);
+    if let Some(url) = relay.get("relay_url") {
+        eprintln!("relay: the broker is advertised as {url} (meta.relay_url)");
+    }
+    described.meta.extend(relay);
+    print!("{}", render(&described));
     eprintln!(
         "place this file at ~/.config/service-catalog/services/{SERVICE_ID}.json; the registrar \
 publishes it on its next pass"
@@ -399,6 +436,31 @@ mod tests {
     use super::*;
 
     /// MI-4/DC-87: the Consul description survives a mutable host name.
+    #[test]
+    fn the_broker_is_in_the_metadata_only_when_the_relay_link_is_served() {
+        let home = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::new();
+        assert!(relay_meta(&env, home.path()).is_empty());
+        env.insert("MACHINE_SERVICE_GUEST_LINK".into(), "relay".into());
+        env.insert("MACHINE_SERVICE_SESSION_PORT".into(), "7001".into());
+        let meta = relay_meta(&env, home.path());
+        assert!(meta["relay_url"].ends_with(":7001/relay"), "{meta:?}");
+        assert!(!meta.contains_key("relay_ca_sha256"));
+        env.insert(
+            "MACHINE_SERVICE_RELAY_URL".into(),
+            "wss://broker.example.test/relay".into(),
+        );
+        let state = home.path().join("state");
+        env.insert("MACHINE_SERVICE_STATE".into(), state.display().to_string());
+        let authority = machine_service_core::relay_broker::tls::Authority::load_or_create(
+            &state.join("relay/tls"),
+        )
+        .unwrap();
+        let meta = relay_meta(&env, home.path());
+        assert_eq!(meta["relay_url"], "wss://broker.example.test/relay");
+        assert_eq!(meta["relay_ca_sha256"], authority.sha256());
+    }
+
     #[test]
     fn mi4_catalog_metadata_is_machine_identity_only() {
         let machine_id = "00000000-0000-4000-8000-000000000001";

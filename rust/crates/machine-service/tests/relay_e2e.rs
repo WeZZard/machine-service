@@ -301,6 +301,18 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
     assert_eq!(pulled.body["sha256"], json!(sha256_hex(&bytes)));
     assert_eq!(std::fs::read(&back).unwrap(), bytes);
 
+    // machctl's exec takes the same route (it calls the HTTP API).
+    let cli = run_machctl(
+        &["exec", &vm, "--", "sh", "-c", "pwd"],
+        &lab.fixture.machctl_env(),
+    );
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cli.stdout).contains(&lab.guest_home.display().to_string()));
+
     // A client of the lease reaches the same relay agent and the same
     // records (RP-3, RP-7).
     let url = answer["relay"]["url"].as_str().unwrap().to_string();

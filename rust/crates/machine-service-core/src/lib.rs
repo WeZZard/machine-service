@@ -40,6 +40,7 @@ pub use environment;
 pub use guest_firewall;
 pub use lease_keys;
 pub use relay_broker;
+pub use remote_session;
 
 pub use error::{OpError, OpResult};
 pub use host::{BootProcess, Host, RealHost, TartOutput};
