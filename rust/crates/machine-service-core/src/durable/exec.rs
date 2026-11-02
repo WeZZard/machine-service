@@ -156,6 +156,7 @@ pub fn start(
     let session = LeaseSession {
         sid: pid,
         leader_start,
+        group: false,
     };
     if let Err(error) = record(session) {
         kill_session(session, uid, &request.ci_root);

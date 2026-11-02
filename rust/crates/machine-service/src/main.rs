@@ -24,6 +24,15 @@ fn main() {
         probe::run();
         return;
     }
+    // A durable lease's command, started by the relay agent (DM-4, M4).
+    if arguments.first().map(String::as_str)
+        == Some(machine_service_core::durable::launch::ARGUMENT)
+    {
+        let request = arguments.get(1).map(String::as_str).unwrap_or_default();
+        std::process::exit(machine_service_core::durable::launch::run(
+            std::path::Path::new(request),
+        ));
+    }
     if let Err(message) = run(&arguments) {
         eprintln!("machine-service: {message}");
         std::process::exit(1);

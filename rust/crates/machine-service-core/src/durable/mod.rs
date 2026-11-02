@@ -15,6 +15,7 @@ pub mod exec;
 pub mod hostlock;
 pub mod identity;
 pub mod inventory;
+pub mod launch;
 pub mod lease;
 pub mod process;
 pub mod session_env;

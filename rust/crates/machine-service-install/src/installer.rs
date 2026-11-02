@@ -24,6 +24,7 @@ use serde_json::{json, Map, Value};
 
 use crate::migration;
 use crate::plist;
+use service_layout::release::Release;
 
 /// The launchd label that identifies the installed agent.
 pub const LABEL: &str = "com.wezzard.machine-service";
@@ -69,7 +70,7 @@ pub enum InstallError {
 }
 
 impl InstallError {
-    fn refused(message: impl Into<String>) -> Self {
+    pub(crate) fn refused(message: impl Into<String>) -> Self {
         Self::Refused(message.into())
     }
 }
@@ -83,6 +84,11 @@ pub enum Action {
     Remove,
     /// Print this Mac's service-catalog description (FD-1). Reads only.
     CatalogDescription,
+    /// Install or replace only the durable Mac's relay agent and its
+    /// LaunchAgent, for the instance the environment names (IN-3).
+    RelayAgent,
+    /// Remove only the relay agent named by `--label` (IN-3).
+    RemoveRelayAgent,
 }
 
 impl Action {
@@ -91,6 +97,8 @@ impl Action {
             Action::Install => "install",
             Action::Remove => "remove",
             Action::CatalogDescription => "catalog-description",
+            Action::RelayAgent => "relay-agent",
+            Action::RemoveRelayAgent => "remove-relay-agent",
         }
     }
 }
@@ -123,6 +131,14 @@ pub struct Cli {
     /// beside the installer is the install folder.
     #[arg(long, value_name = "DIR")]
     pub prefix: Option<PathBuf>,
+    /// The relay agent's LaunchAgent label, for `relay-agent` and
+    /// `remove-relay-agent`; a second instance's test agent uses its own
+    /// (TL-6).
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
+    /// Make a new agent credential for the durable Mac's relay agent (RA-4).
+    #[arg(long)]
+    pub rotate_relay_credential: bool,
 }
 
 /// The durable-exposure setting (DC-39).
@@ -263,6 +279,28 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
         }
     }
 
+    let relay_label = match (&cli.label, action) {
+        (Some(_), Action::Install | Action::Remove) => {
+            return Err(InstallError::refused(
+                "--label applies to relay-agent and remove-relay-agent only",
+            ))
+        }
+        (Some(label), _) => label.clone(),
+        (None, _) => crate::relay_agent::DEFAULT_LABEL.to_string(),
+    };
+    if matches!(action, Action::RelayAgent | Action::RemoveRelayAgent) {
+        return relay_agent_only(cli, action, &env, source, home, &relay_label, readonly);
+    }
+    let exposed = env.get(EXPOSE_KEY).map(String::as_str) == Some("on");
+    if action == Action::Install
+        && exposed
+        && crate::relay_agent::durable_lease_current(&state_root(&env, home)?)
+    {
+        return Err(InstallError::refused(
+            "a durable lease is current; release it before install, which restarts its relay agent",
+        ));
+    }
+
     let new_root = state_root(&env, home)?;
     let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
     roots.insert(new_root.clone());
@@ -386,6 +424,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
         }
         println!("removed {}", plist.display());
         migration::remove_link(home, source)?;
+        crate::relay_agent::remove(home, crate::relay_agent::DEFAULT_LABEL)?;
         return Ok(());
     }
 
@@ -407,10 +446,25 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     }
     migration::remove_legacy_link(home, &old_dirs)?;
 
-    let (payload, executables) =
+    let (payload, executables, release) =
         payload.expect("install payload is computed for the install action");
     // The old daemon is stopped, so no executable is replaced under it.
     install_executables(source, &deployed, &executables)?;
+    install_release(source, &deployed, release.as_ref())?;
+    // The durable Mac's relay agent, from the installed release, with the
+    // daemon stopped so its credential and authority are settled (IN-3).
+    if exposed {
+        crate::relay_agent::install(&crate::relay_agent::Spec {
+            home: home.to_path_buf(),
+            label: crate::relay_agent::DEFAULT_LABEL.to_string(),
+            state_dir: state_root(&env, home)?,
+            session_port: session_port(&env)?,
+            release_dir: deployed.join(service_layout::release::FOLDER),
+            rotate: cli.rotate_relay_credential,
+        })?;
+    } else {
+        crate::relay_agent::remove(home, crate::relay_agent::DEFAULT_LABEL)?;
+    }
     let parent = plist
         .parent()
         .ok_or_else(|| InstallError::refused("invalid LaunchAgent path"))?;
@@ -556,6 +610,10 @@ fn refuse_leases(roots: &BTreeSet<PathBuf>) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// What a validated installation writes: the LaunchAgent, the executables
+/// to copy, and the relay agent release, when the installation needs one.
+type Validated = (Vec<u8>, Vec<String>, Option<Release>);
+
 fn validate_install(
     cli: &Cli,
     old: &Map<String, Value>,
@@ -564,7 +622,7 @@ fn validate_install(
     written: &BTreeMap<String, String>,
     source: &Path,
     deployed: &Path,
-) -> Result<(Vec<u8>, Vec<String>), InstallError> {
+) -> Result<Validated, InstallError> {
     let service_name = service_layout::Executable::Service.name();
     let service = source.join(service_name);
     if !service.is_file() || !is_executable(&service) {
@@ -614,6 +672,31 @@ fn validate_install(
             )));
         }
     }
+
+    // The relay agent's release: an archive, matching its sum and holding
+    // the one executable, for every platform the installation serves; the
+    // macOS one signed for the privacy grants (DC-135, DC-140).
+    let platforms = service_layout::release::platforms(tart.is_some(), exposed);
+    let release = if platforms.is_empty() {
+        None
+    } else {
+        let folder = source.join(service_layout::release::FOLDER);
+        let release = Release::open(&folder).map_err(InstallError::Refused)?;
+        for archive in &release.archives {
+            release
+                .verified(&archive.platform)
+                .map_err(InstallError::Refused)?;
+        }
+        for platform in &platforms {
+            release
+                .check_members(platform)
+                .map_err(InstallError::Refused)?;
+        }
+        if exposed {
+            crate::relay_agent::release_executable(&folder)?;
+        }
+        Some(release)
+    };
 
     let config = console::config::load_config(None, Some(&env_map))?
         .unwrap_or_else(console::config::ConsoleConfig::disabled);
@@ -696,7 +779,130 @@ fn validate_install(
              and viewing remain unverified."
         );
     }
-    Ok((plist::dumps(&Value::Object(data)), helpers))
+    Ok((plist::dumps(&Value::Object(data)), helpers, release))
+}
+
+/// The session port of the instance `env` configures (BK-1).
+fn session_port(env: &BTreeMap<String, String>) -> Result<u16, InstallError> {
+    let variable = machine_service_core::remote_session::SESSION_PORT_ENV;
+    match env.get(variable).map(|value| value.trim()) {
+        None | Some("") => Ok(machine_service_core::remote_session::DEFAULT_SESSION_PORT),
+        Some(value) => value
+            .parse()
+            .map_err(|_| InstallError::refused(format!("{variable}={value:?} is not a port"))),
+    }
+}
+
+/// `relay-agent` and `remove-relay-agent`: the relay agent alone, for the
+/// instance the environment names, without touching machine-service's own
+/// job (IN-3, TL-6).
+fn relay_agent_only(
+    cli: &Cli,
+    action: Action,
+    env: &BTreeMap<String, String>,
+    source: &Path,
+    home: &Path,
+    label: &str,
+    readonly: bool,
+) -> Result<(), InstallError> {
+    let state_dir = state_root(env, home)?;
+    if crate::relay_agent::durable_lease_current(&state_dir) {
+        return Err(InstallError::refused(
+            "a durable lease is current; release it before changing its relay agent",
+        ));
+    }
+    if action == Action::RemoveRelayAgent {
+        if readonly {
+            println!("Check passed; no files written and no launchctl calls (remove-relay-agent).");
+            return Ok(());
+        }
+        crate::relay_agent::remove(home, label)?;
+        return Ok(());
+    }
+    let release_dir = source.join(service_layout::release::FOLDER);
+    crate::relay_agent::release_executable(&release_dir)?;
+    let spec = crate::relay_agent::Spec {
+        home: home.to_path_buf(),
+        label: label.to_string(),
+        state_dir,
+        session_port: session_port(env)?,
+        release_dir,
+        rotate: cli.rotate_relay_credential,
+    };
+    if readonly {
+        println!("Check passed; no files written and no launchctl calls (relay-agent).");
+        return Ok(());
+    }
+    crate::relay_agent::install(&spec)?;
+    if cli.rotate_relay_credential {
+        println!(
+            "rotated the relay agent credential; restart the instance so its broker accepts only the new one"
+        );
+    }
+    Ok(())
+}
+
+/// Copy the relay agent's release into `deployed`, verbatim: its
+/// `SHA256SUMS` and the archives it names, through a temporary folder that
+/// replaces the old one; and remove the relay agent builds of an earlier
+/// layout (DC-140, IN-2).
+fn install_release(
+    source: &Path,
+    deployed: &Path,
+    release: Option<&Release>,
+) -> Result<(), InstallError> {
+    for retired in service_layout::release::RETIRED {
+        match std::fs::remove_file(deployed.join(retired)) {
+            Ok(()) => println!("removed {retired}, a build of an earlier layout"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let Some(release) = release else {
+        return Ok(());
+    };
+    if std::fs::canonicalize(source)? == std::fs::canonicalize(deployed)? {
+        return Ok(());
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{}.", service_layout::release::FOLDER))
+        .tempdir_in(deployed)?;
+    let mut files = vec![service_layout::release::SUMS.to_string()];
+    files.extend(release.archives.iter().map(|archive| archive.file.clone()));
+    for file in &files {
+        std::fs::copy(release.dir.join(file), staging.path().join(file))?;
+        std::fs::set_permissions(
+            staging.path().join(file),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )?;
+    }
+    // The copy is checked again, so the folder in place is the release.
+    let copied = Release::open(staging.path()).map_err(InstallError::Refused)?;
+    for archive in &copied.archives {
+        copied
+            .verified(&archive.platform)
+            .map_err(InstallError::Refused)?;
+    }
+    let target = deployed.join(service_layout::release::FOLDER);
+    let staged = staging.keep();
+    if target.exists() {
+        let old = tempfile::Builder::new()
+            .prefix(&format!(".{}.old.", service_layout::release::FOLDER))
+            .tempdir_in(deployed)?
+            .keep();
+        std::fs::rename(&target, old.join("release"))?;
+        std::fs::rename(&staged, &target)?;
+        std::fs::remove_dir_all(&old)?;
+    } else {
+        std::fs::rename(&staged, &target)?;
+    }
+    println!(
+        "installed the relay agent release {} ({} archives) into {}",
+        copied.version,
+        copied.archives.len(),
+        target.display()
+    );
+    Ok(())
 }
 
 /// Copy `executables` from `source` into `deployed`, each through a
@@ -904,7 +1110,7 @@ fn launchctl(operands: &[&str], plist: &Path) -> Result<(), InstallError> {
 pub(crate) struct CommandOutput {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 /// Run a command with the Python `subprocess.run(..., timeout=...)` semantics:

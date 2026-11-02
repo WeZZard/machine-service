@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 
+use machine_service_core::durable::lease::DurableRelay;
 use machine_service_core::durable::{DurableConfig, DurableMachine, Reply};
 use machine_service_core::relay::Relay;
 use machine_service_core::relay_broker::{Role, Target};
@@ -17,11 +18,6 @@ use machine_service_core::service::Service;
 
 static MACHINE: OnceLock<Arc<DurableMachine>> = OnceLock::new();
 static RELAY: OnceLock<Arc<Relay>> = OnceLock::new();
-
-/// The per-machine agent credential of the durable machine's relay agent,
-/// under the state folder (RA-4). The installer writes it into the relay
-/// agent's configuration; removing it and restarting rotates it.
-const DURABLE_AGENT_CREDENTIAL: &str = "relay/durable-agent.credential";
 
 /// The broker's target for this instance's durable machine: its hardware
 /// UUID, which survives a rename (MI-1), else its name.
@@ -35,42 +31,16 @@ fn durable_target(machine: &DurableMachine) -> Target {
     )
 }
 
-/// Read the durable machine's agent credential, or make it, mode 600.
-fn durable_agent_credential(path: &std::path::Path) -> Result<String, String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(text) = std::fs::read_to_string(path) {
-        let credential = text.trim().to_string();
-        if !credential.is_empty() {
-            return Ok(credential);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    let credential = machine_service_core::relay_broker::new_credential();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    writeln!(file, "{credential}").map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(credential)
-}
-
 /// Accept the durable machine's relay agent on the broker, when exposure is
-/// on (RA-4). Its exec still runs in the session of DM-4 until M4 moves it
-/// to the relay agent.
+/// on (RA-4), and route the lease's exec, push and pull through it while it
+/// has a session and runs the installed release's build (M4, RA-8).
 pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
     let Some(machine) = machine() else { return };
     if !machine.exposed() {
         return;
     }
     let _ = RELAY.set(Arc::clone(relay));
-    let path = state_dir.join(DURABLE_AGENT_CREDENTIAL);
-    match durable_agent_credential(&path) {
+    match machine_service_core::relay::durable_agent_credential(state_dir, false) {
         Ok(credential) => relay.broker.admit(
             &durable_target(machine),
             Role::Agent,
@@ -82,6 +52,27 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
             &format!("WARN: relay: no durable agent credential: {error}"),
         ),
     }
+    let expected_build = machine_service_core::relay::release_executable(
+        &machine_service_core::service_layout::release::platform_for("macos"),
+    )
+    .map(|bytes| machine_service_core::service_layout::release::sha256_hex(&bytes))
+    .map_err(|error| format!("no relay agent release: {}", error.message));
+    if let Err(reason) = &expected_build {
+        machine_service_core::config::log_to_file(
+            &machine.config.log_file,
+            &format!("WARN: relay: durable exec stays in the service's session: {reason}"),
+        );
+    }
+    let launcher = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .unwrap_or_else(|_| std::path::PathBuf::from("machine-service"));
+    machine.attach_relay(DurableRelay {
+        broker: relay.broker.clone(),
+        target: durable_target(machine),
+        expected_build,
+        launcher,
+        agent_wait: relay.settings.agent_wait,
+    });
 }
 
 /// Add a lease credential to a durable acquisition's answer. It is good

@@ -1,7 +1,8 @@
 #!/bin/sh
-# Build the guest console agent, the guest session agent and the relay agent for every guest
+# Build the guest console agent and the guest session agent for every guest
 # OS this host can serve, and install each build under the name the daemon
-# looks for.
+# looks for. The relay agent is not built here: an installation holds its
+# release archives, which scripts/build-relay-agent.sh makes (DC-140).
 #
 # The Python original shipped `guest-console-agent.py`: one artifact that runs
 # on any guest with an interpreter. The native port streams machine code, so a
@@ -16,9 +17,7 @@
 #   3. guest-console-agent beside the daemon        (host-native fallback)
 #
 # `guest_link::agent_path_for` resolves `guest-session-agent` the same way,
-# with $VM_GUEST_SESSION_AGENT as the override (docs/arch/guest-session.md),
-# and `relay::agent_path_for` resolves `relay-agent`, with
-# $MACHINE_SERVICE_RELAY_AGENT as the override (docs/arch/relay-agent.md).
+# with $VM_GUEST_SESSION_AGENT as the override (docs/arch/guest-session.md).
 #
 # Agents are release builds: each is uploaded to a guest, so its size is
 # transfer time (docs/arch/guest-session.md, GS-3).
@@ -32,12 +31,11 @@ out="${1:-target/guest-agents}"
 target_dir="${CARGO_TARGET_DIR:-target}"
 mkdir -p "$out"
 
-agents="guest-console-agent guest-session-agent relay-agent"
+agents="guest-console-agent guest-session-agent"
 
 echo "building host-native agents -> $out"
 cargo build --release -p guest-console-agent
 cargo build --release -p guest-session --bin guest-session-agent
-cargo build --release -p relay-agent --bin relay-agent
 for agent in $agents; do
     cp "$target_dir/release/$agent" "$out/$agent"
 done
@@ -68,7 +66,6 @@ if rustup target list --installed | grep -qx "$target"; then
     fi
     cargo build --release -p guest-console-agent --target "$target"
     cargo build --release -p guest-session --bin guest-session-agent --target "$target"
-    cargo build --release -p relay-agent --bin relay-agent --target "$target"
     for agent in $agents; do
         cp "$target_dir/$target/release/$agent" "$out/$agent-linux"
     done

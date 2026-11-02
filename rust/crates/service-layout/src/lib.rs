@@ -8,10 +8,15 @@
 //! up is an executable the installer requires and installs; a helper added to
 //! the daemon without an entry here has no way to be resolved.
 //!
+//! The relay agent is not built here: the installation holds its published
+//! release, a folder of signed archives, which [`release`] reads (DC-140).
+//!
 //! This crate is a leaf: `console` must not depend on `machine-service-core`,
 //! and both resolve through it.
 
 use std::path::{Path, PathBuf};
+
+pub mod release;
 
 /// When an installation needs an executable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -46,13 +51,10 @@ pub enum Executable {
     /// The guest firewall installer the operator runs with `sudo`; the daemon
     /// names its path in the fix it reports.
     GuestFirewall,
-    /// The relay agent uploaded into a guest whose image has none, or whose
-    /// build differs (RA-6, RA-7).
-    RelayAgent,
 }
 
 /// Every executable of the installation, in install order.
-pub const ALL: [Executable; 9] = [
+pub const ALL: [Executable; 8] = [
     Executable::Service,
     Executable::Cli,
     Executable::Installer,
@@ -61,7 +63,6 @@ pub const ALL: [Executable; 9] = [
     Executable::GuestSessionAgent,
     Executable::DotForwarder,
     Executable::GuestFirewall,
-    Executable::RelayAgent,
 ];
 
 impl Executable {
@@ -76,7 +77,6 @@ impl Executable {
             Executable::GuestSessionAgent => "guest-session-agent",
             Executable::DotForwarder => "vm-service-dot-forwarder",
             Executable::GuestFirewall => "vm-service-guest-firewall",
-            Executable::RelayAgent => "relay-agent",
         }
     }
 
@@ -88,8 +88,7 @@ impl Executable {
             | Executable::GuestConsoleAgent
             | Executable::GuestSessionAgent
             | Executable::DotForwarder
-            | Executable::GuestFirewall
-            | Executable::RelayAgent => Need::VirtualMachines,
+            | Executable::GuestFirewall => Need::VirtualMachines,
         }
     }
 
@@ -103,9 +102,7 @@ impl Executable {
     /// `Exec format error`). The forwarder serves macOS guests only.
     pub const fn guest_builds(self) -> &'static [&'static str] {
         match self {
-            Executable::GuestConsoleAgent
-            | Executable::GuestSessionAgent
-            | Executable::RelayAgent => &["linux"],
+            Executable::GuestConsoleAgent | Executable::GuestSessionAgent => &["linux"],
             Executable::Service
             | Executable::Cli
             | Executable::Installer
@@ -191,8 +188,6 @@ mod tests {
             "console-worker",
             "vm-service-dot-forwarder",
             "vm-service-guest-firewall",
-            "relay-agent",
-            "relay-agent-linux",
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }

@@ -631,6 +631,34 @@ pub fn relay_agent_bin() -> &'static PathBuf {
     PATH.get_or_init(|| sibling_bin("relay-agent", "relay-agent"))
 }
 
+/// A relay agent release in `folder`, in the form `build-relay-agent.sh`
+/// makes, whose archives for this host's macOS and Linux platforms hold
+/// `executable` (DC-140). Answers the folder.
+pub fn write_relay_release(folder: &Path, executable: &Path) -> PathBuf {
+    use machine_service_core::service_layout::release;
+    let _ = std::fs::remove_dir_all(folder);
+    std::fs::create_dir_all(folder).unwrap();
+    let stage = tempfile::tempdir().unwrap();
+    std::fs::copy(executable, stage.path().join(release::MEMBER)).unwrap();
+    let mut sums = String::new();
+    for kind in ["macos", "linux"] {
+        let file = format!("relay-agent-0.0.0-{}.tar.gz", release::platform_for(kind));
+        let status = Command::new("/usr/bin/tar")
+            .arg("-C")
+            .arg(stage.path())
+            .arg("-czf")
+            .arg(folder.join(&file))
+            .arg(release::MEMBER)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(folder.join(&file)).unwrap();
+        sums.push_str(&format!("{}  {file}\n", release::sha256_hex(&bytes)));
+    }
+    std::fs::write(folder.join(release::SUMS), sums).unwrap();
+    folder.to_path_buf()
+}
+
 /// Build `binary` of `package` into the daemon's target directory unless it
 /// is already there.
 fn sibling_bin(package: &str, binary: &str) -> PathBuf {

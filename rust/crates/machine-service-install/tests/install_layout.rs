@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{write_exec, Harness};
+use common::{release_executable, write_exec, write_release, Harness};
 use serde_json::json;
 use service_layout::Executable;
 
@@ -51,7 +51,20 @@ fn ac46_installs_exactly_the_layout_into_a_prefix() {
 
     let prefix = prefix(&harness);
     let expected: BTreeSet<String> = service_layout::required(true).into_iter().collect();
-    assert_eq!(files_in(&prefix), expected);
+    let mut with_release = expected.clone();
+    with_release.insert(service_layout::release::FOLDER.to_string());
+    assert_eq!(files_in(&prefix), with_release);
+    // DC-140: the relay agent release is the build's, verbatim.
+    let built = harness.bin.join(service_layout::release::FOLDER);
+    let installed = prefix.join(service_layout::release::FOLDER);
+    assert_eq!(files_in(&installed), files_in(&built));
+    for name in files_in(&built) {
+        assert_eq!(
+            fs::read(installed.join(&name)).unwrap(),
+            fs::read(built.join(&name)).unwrap(),
+            "{name}"
+        );
+    }
     for name in &expected {
         let installed = prefix.join(name);
         assert_eq!(
@@ -151,7 +164,9 @@ fn ac46_a_mac_without_tart_gets_the_core_only() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected: BTreeSet<String> = service_layout::required(false).into_iter().collect();
+    let mut expected: BTreeSet<String> = service_layout::required(false).into_iter().collect();
+    // Exposed, it needs the macOS relay agent of the release (IN-3).
+    expected.insert(service_layout::release::FOLDER.to_string());
     assert_eq!(files_in(&prefix), expected);
 }
 
@@ -221,4 +236,269 @@ fn in1_every_path_the_daemon_resolves_is_installed() {
     for path in resolved {
         assert!(installed.contains(&path), "{path} is not installed");
     }
+}
+
+// ------------------------------------------------------------- DC-140, IN-3
+
+fn relay_plist(harness: &Harness, label: &str) -> PathBuf {
+    harness
+        .home
+        .join(format!("Library/LaunchAgents/{label}.plist"))
+}
+
+fn assert_ok(output: std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn state_credential(state: &Path) -> String {
+    fs::read_to_string(state.join("relay/durable-agent.credential"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn agent_config(home: &Path) -> serde_json::Value {
+    let path = home.join(".config/relay-agent/config.json");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// DC-140: a release whose archive does not match its `SHA256SUMS`, or
+/// that has no archive for a platform the installation serves, refuses the
+/// installation by name before anything is written.
+#[test]
+fn dc140_a_broken_or_incomplete_release_refuses_the_installation() {
+    let folder_of = |harness: &Harness| harness.bin.join(service_layout::release::FOLDER);
+    // An archive that is not the one its sum names.
+    let harness = Harness::new();
+    let release = service_layout::release::Release::open(&folder_of(&harness)).unwrap();
+    let archive = folder_of(&harness).join(&release.archives[1].file);
+    fs::write(&archive, b"tampered").unwrap();
+    let stderr =
+        harness.assert_refused(&["install", "--prefix", prefix(&harness).to_str().unwrap()]);
+    assert!(stderr.contains("does not match SHA256SUMS"), "{stderr}");
+    assert!(!prefix(&harness).exists());
+    assert!(!harness.plist.exists());
+    // No release at all.
+    let harness = Harness::new();
+    fs::remove_dir_all(folder_of(&harness)).unwrap();
+    let stderr =
+        harness.assert_refused(&["install", "--prefix", prefix(&harness).to_str().unwrap()]);
+    assert!(stderr.contains("no relay agent release"), "{stderr}");
+    assert!(!prefix(&harness).exists());
+    // A release without the Linux archive.
+    let harness = Harness::new();
+    let sums = folder_of(&harness).join("SHA256SUMS");
+    let kept: String = fs::read_to_string(&sums)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains("-linux-"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&sums, kept).unwrap();
+    let stderr =
+        harness.assert_refused(&["install", "--prefix", prefix(&harness).to_str().unwrap()]);
+    assert!(stderr.contains("no archive for linux-"), "{stderr}");
+    assert!(!harness.plist.exists());
+}
+
+/// DC-140: builds of the relay agent from the earlier layout are removed
+/// from the install folder, because nothing reads them.
+#[test]
+fn dc140_the_earlier_layouts_relay_agent_builds_are_removed() {
+    let harness = Harness::new();
+    let prefix = prefix(&harness);
+    fs::create_dir_all(&prefix).unwrap();
+    for retired in service_layout::release::RETIRED {
+        write_exec(&prefix.join(retired), "#!/bin/sh\n");
+    }
+    assert_ok(install_into_prefix(&harness));
+    for retired in service_layout::release::RETIRED {
+        assert!(!prefix.join(retired).exists(), "{retired}");
+    }
+}
+
+/// IN-3, RA-2, RA-4: with exposure on, the installer installs the
+/// release's macOS relay agent as a LaunchAgent of the desktop session,
+/// with the machine's agent credential and a configuration for the Mac's
+/// own broker; without exposure it installs none.
+#[test]
+fn in3_exposure_on_installs_the_relay_agent_from_the_release() {
+    let harness = Harness::new();
+    assert_ok(install_into_prefix(&harness));
+    assert!(!relay_plist(&harness, "com.wezzard.relay-agent").exists());
+
+    assert_ok(harness.run(&[
+        "install",
+        "--expose-durable",
+        "on",
+        "--prefix",
+        prefix(&harness).to_str().unwrap(),
+    ]));
+    let plist = relay_plist(&harness, "com.wezzard.relay-agent");
+    let value = machine_service_install::plist::parse(&fs::read(&plist).unwrap()).unwrap();
+    assert_eq!(value["Label"], "com.wezzard.relay-agent");
+    assert_eq!(value["LimitLoadToSessionType"], "Aqua");
+    assert_eq!(value["RunAtLoad"], true);
+    assert_eq!(value["KeepAlive"], true);
+    let executable = harness.home.join(".local/libexec/relay-agent/relay-agent");
+    assert_eq!(
+        value["ProgramArguments"],
+        json!([executable.to_str().unwrap(), "run"])
+    );
+    // The executable is the installed release's, byte for byte.
+    assert_eq!(
+        fs::read(&executable).unwrap(),
+        release_executable(&prefix(&harness).join(service_layout::release::FOLDER))
+    );
+    let state = harness.home.join(".local/state/machine-service");
+    let config = agent_config(&harness.home);
+    assert_eq!(config["broker_url"], "wss://localhost:6241/relay");
+    assert_eq!(config["agent_credential"], state_credential(&state));
+    assert_eq!(
+        config["broker_ca_pem"].as_str().unwrap(),
+        fs::read_to_string(state.join("relay/tls/ca.pem")).unwrap()
+    );
+    let calls = fs::read_to_string(&harness.log).unwrap();
+    assert!(
+        calls.lines().any(|line| line.starts_with("bootstrap gui/")
+            && line.ends_with("com.wezzard.relay-agent.plist")),
+        "{calls}"
+    );
+
+    // A reinstall keeps the credential; a rotation replaces it.
+    let first = state_credential(&state);
+    assert_ok(harness.run(&["install", "--prefix", prefix(&harness).to_str().unwrap()]));
+    assert_eq!(state_credential(&state), first);
+    assert_ok(harness.run(&[
+        "install",
+        "--rotate-relay-credential",
+        "--prefix",
+        prefix(&harness).to_str().unwrap(),
+    ]));
+    let rotated = state_credential(&state);
+    assert_ne!(rotated, first);
+    assert_eq!(agent_config(&harness.home)["agent_credential"], rotated);
+
+    // Exposure off removes the relay agent, and so does `remove`.
+    assert_ok(harness.run(&[
+        "install",
+        "--expose-durable",
+        "off",
+        "--prefix",
+        prefix(&harness).to_str().unwrap(),
+    ]));
+    assert!(!plist.exists());
+    assert!(!executable.exists());
+    assert!(!harness
+        .home
+        .join(".config/relay-agent/config.json")
+        .exists());
+    let calls = fs::read_to_string(&harness.log).unwrap();
+    assert!(
+        calls.lines().any(|line| line.starts_with("bootout gui/")),
+        "{calls}"
+    );
+    assert_ok(harness.run(&[
+        "install",
+        "--expose-durable",
+        "on",
+        "--prefix",
+        prefix(&harness).to_str().unwrap(),
+    ]));
+    assert!(plist.exists());
+    assert_ok(harness.run(&["remove"]));
+    assert!(!plist.exists());
+}
+
+/// DC-135: a release whose macOS executable is not signed with the release
+/// identifier is refused on an exposed Mac before anything is written.
+#[test]
+fn dc135_an_unsigned_relay_agent_is_refused() {
+    let harness = Harness::new();
+    write_release(&harness.bin.join(service_layout::release::FOLDER), false);
+    let stderr = harness.assert_refused(&[
+        "install",
+        "--expose-durable",
+        "on",
+        "--prefix",
+        prefix(&harness).to_str().unwrap(),
+    ]);
+    assert!(stderr.contains("com.wezzard.relay-agent"), "{stderr}");
+    assert!(!prefix(&harness).exists());
+    assert!(!harness.plist.exists());
+}
+
+/// IN-3: a current durable lease refuses an installation that would
+/// restart its relay agent, which would end the lease's commands.
+#[test]
+fn in3_a_current_durable_lease_refuses_the_relay_agent() {
+    let harness = Harness::new();
+    let state = harness.home.join(".local/state/machine-service");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("durable.json"), r#"{"current": "lease"}"#).unwrap();
+    let stderr = harness.assert_refused(&["install", "--expose-durable", "on"]);
+    assert!(stderr.contains("a durable lease is current"), "{stderr}");
+    let stderr = harness.assert_refused(&["relay-agent"]);
+    assert!(stderr.contains("a durable lease is current"), "{stderr}");
+}
+
+/// TL-6: `relay-agent` installs a second instance's relay agent under its
+/// own label, state folder and session port, and never touches
+/// machine-service's own LaunchAgent; `remove-relay-agent` removes it.
+#[test]
+fn tl6_a_second_instance_gets_its_own_relay_agent() {
+    let mut harness = Harness::new();
+    let state = harness.home.join("second/state");
+    harness.set_env("MACHINE_SERVICE_STATE", state.to_str().unwrap());
+    harness.set_env("MACHINE_SERVICE_SESSION_PORT", "6299");
+    let label = "com.wezzard.relay-agent.test";
+    assert_ok(harness.run(&["relay-agent", "--label", label]));
+    assert!(relay_plist(&harness, label).exists());
+    assert!(!relay_plist(&harness, "com.wezzard.relay-agent").exists());
+    assert!(
+        !harness.plist.exists(),
+        "machine-service's agent is untouched"
+    );
+    let config = agent_config(&harness.home);
+    assert_eq!(config["broker_url"], "wss://localhost:6299/relay");
+    assert_eq!(config["agent_credential"], state_credential(&state));
+    let calls = fs::read_to_string(&harness.log).unwrap();
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.contains("com.wezzard.machine-service")),
+        "{calls}"
+    );
+
+    assert_ok(harness.run(&["remove-relay-agent", "--label", label]));
+    assert!(!relay_plist(&harness, label).exists());
+    assert!(!harness
+        .home
+        .join(".local/libexec/relay-agent/relay-agent")
+        .exists());
+    assert!(!harness.home.join(".local/state/relay-agent").exists());
+
+    let stderr = harness.assert_refused(&["install", "--label", label]);
+    assert!(stderr.contains("--label applies to"), "{stderr}");
+}
+
+/// IN-3: without a desktop session the relay agent cannot run in one, and
+/// the installer says so instead of loading it elsewhere.
+#[test]
+fn in3_no_desktop_session_refuses_the_relay_agent() {
+    let harness = Harness::new();
+    fs::write(harness.home.join("no-gui"), "").unwrap();
+    let stderr = harness.assert_refused(&["relay-agent"]);
+    assert!(stderr.contains("no desktop session"), "{stderr}");
+    assert!(!relay_plist(&harness, "com.wezzard.relay-agent").exists());
 }

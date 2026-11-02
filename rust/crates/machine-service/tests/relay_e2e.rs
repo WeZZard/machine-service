@@ -90,6 +90,8 @@ struct Lab {
     fixture: LegacyFixture,
     guest_home: PathBuf,
     _guest: tempfile::TempDir,
+    release: PathBuf,
+    _release: tempfile::TempDir,
     env: Vec<(String, String)>,
 }
 
@@ -102,6 +104,9 @@ impl Lab {
         write_exec(&fixture.bin, "ssh", RELAY_SSH);
         let guest = tempfile::tempdir().unwrap();
         let guest_home = guest.path().canonicalize().unwrap();
+        // DC-140: the daemon sends only a release's executable.
+        let release_dir = tempfile::tempdir().unwrap();
+        let release = write_relay_release(&release_dir.path().join("release"), relay_agent_bin());
         let env = vec![
             ("MACHINE_SERVICE_GUEST_LINK".into(), "relay".into()),
             (
@@ -119,8 +124,8 @@ impl Lab {
             ("MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT".into(), "30".into()),
             ("MACHINE_SERVICE_RELAY_AGENT_WAIT".into(), "30".into()),
             (
-                "MACHINE_SERVICE_RELAY_AGENT".into(),
-                relay_agent_bin().display().to_string(),
+                "MACHINE_SERVICE_RELAY_AGENT_RELEASE".into(),
+                release.display().to_string(),
             ),
             ("FAKE_GUEST_HOME".into(), guest_home.display().to_string()),
         ];
@@ -128,6 +133,8 @@ impl Lab {
             fixture,
             guest_home,
             _guest: guest,
+            release,
+            _release: release_dir,
             env,
         }
     }
@@ -238,7 +245,12 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
             .join(".local/libexec/relay-agent/relay-agent"),
     )
     .unwrap();
-    assert_eq!(uploaded, std::fs::read(relay_agent_bin()).unwrap());
+    // DC-140: the upload is exactly the release archive's executable.
+    let released = machine_service_core::service_layout::release::Release::open(&lab.release)
+        .unwrap()
+        .executable(&machine_service_core::service_layout::release::platform_for("linux"))
+        .unwrap();
+    assert_eq!(uploaded, released);
     assert!(
         std::fs::read_to_string(lab.guest_home.join(".relay-start-script"))
             .unwrap()
@@ -407,6 +419,40 @@ fn a_lease_whose_agent_never_registers_falls_back_to_ssh() {
         ran.body
     );
     assert!(ran.body["output"].as_str().unwrap().starts_with("ran: "));
+}
+
+/// DC-140: a release whose archive does not match its `SHA256SUMS` is never
+/// sent; the lease is served over SSH and its record says why, and nothing
+/// is uploaded into the guest.
+#[test]
+fn a_release_that_does_not_match_its_sums_is_never_sent() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    let sums = lab.release.join("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).unwrap();
+    let file = text
+        .lines()
+        .find(|line| line.contains("-linux-"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap()
+        .to_string();
+    let mut bytes = std::fs::read(lab.release.join(&file)).unwrap();
+    bytes.extend_from_slice(b"tampered");
+    std::fs::write(lab.release.join(&file), bytes).unwrap();
+    let _daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(answer["state"], "running");
+    assert_eq!(answer["link"], "ssh-fallback");
+    let reason = answer["link_reason"].as_str().unwrap();
+    assert!(reason.contains("does not match SHA256SUMS"), "{reason}");
+    assert!(!lab
+        .guest_home
+        .join(".local/libexec/relay-agent/relay-agent")
+        .exists());
+    assert!(!lab.relay_calls().contains("machine-service-relay-upload"));
 }
 
 #[test]

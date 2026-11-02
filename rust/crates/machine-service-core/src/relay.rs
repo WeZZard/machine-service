@@ -43,8 +43,9 @@ pub const GUEST_URL_VARIABLE: &str = "MACHINE_SERVICE_RELAY_GUEST_URL";
 pub const REGISTER_TIMEOUT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT";
 /// Seconds a call waits for a relay agent that has no session (RP-8).
 pub const AGENT_WAIT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_AGENT_WAIT";
-/// The relay agent build to upload, instead of the one beside the daemon.
-pub const AGENT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_AGENT";
+/// The relay agent release folder to use, instead of the one beside the
+/// daemon; it has the release's own form (DC-140).
+pub const RELEASE_VARIABLE: &str = "MACHINE_SERVICE_RELAY_AGENT_RELEASE";
 
 /// Where the image installs the relay agent, and where this service uploads
 /// it (pilot-images RA-I1).
@@ -135,26 +136,29 @@ impl RelaySettings {
     }
 }
 
-/// The path of the relay agent build for a guest of `kind`:
-/// `MACHINE_SERVICE_RELAY_AGENT`, else `relay-agent-<kind>` beside the
-/// daemon, else the host-native `relay-agent` there.
-pub fn agent_path_for(kind: &str) -> OpResult<PathBuf> {
-    if let Some(path) = std::env::var_os(AGENT_VARIABLE).filter(|p| !p.is_empty()) {
+/// The relay agent release this instance holds: `MACHINE_SERVICE_RELAY_AGENT_RELEASE`,
+/// else the release folder beside the daemon (DC-140, IN-1).
+pub fn release_dir() -> OpResult<PathBuf> {
+    if let Some(path) = std::env::var_os(RELEASE_VARIABLE).filter(|p| !p.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    service_layout::guest_build_beside_daemon(service_layout::Executable::RelayAgent, kind)
-        .ok_or_else(|| OpError::new("relay agent build unavailable"))
+    service_layout::release::beside_daemon()
+        .ok_or_else(|| OpError::new("relay agent release unavailable"))
 }
 
-/// Read the relay agent build for a guest of `kind`.
+/// The relay agent for `platform`: the executable of the release's archive
+/// for it, checked against the release's `SHA256SUMS`. It is the only build
+/// this service ever sends or expects (DC-140).
+pub fn release_executable(platform: &str) -> OpResult<Vec<u8>> {
+    let dir = release_dir()?;
+    service_layout::release::Release::open(&dir)
+        .and_then(|release| release.executable(platform))
+        .map_err(OpError::new)
+}
+
+/// The relay agent for a guest of `kind`, from the release.
 pub fn agent_bytes_for(kind: &str) -> OpResult<Vec<u8>> {
-    let path = agent_path_for(kind)?;
-    std::fs::read(&path).map_err(|error| {
-        OpError::new(format!(
-            "relay agent build unavailable at {}: {error}",
-            path.display()
-        ))
-    })
+    release_executable(&service_layout::release::platform_for(kind))
 }
 
 /// The broker and its listener.
@@ -266,8 +270,60 @@ impl Relay {
     }
 }
 
-/// The relay agent's configuration file for one lease.
-fn agent_config(broker_url: &str, credential: &str, ca_pem: &str) -> Vec<u8> {
+/// The per-machine agent credential of a durable Mac's relay agent, under
+/// the state folder (RA-4, DC-152).
+pub const DURABLE_AGENT_CREDENTIAL: &str = "relay/durable-agent.credential";
+/// The broker's authority under the state folder (BK-1).
+pub const AUTHORITY_DIR: &str = "relay/tls";
+/// The relay agent's configuration under its home (DC-126).
+pub const AGENT_CONFIG: &str = ".config/relay-agent/config.json";
+
+/// The broker URL a durable Mac's own relay agent dials: the loopback name
+/// and the session port, so neither a rename nor a network change moves it.
+pub fn durable_broker_url(session_port: u16) -> String {
+    format!(
+        "wss://localhost:{session_port}{}",
+        remote_session::RELAY_PATH
+    )
+}
+
+/// The durable machine's agent credential: read it, or make it mode 600;
+/// with `rotate`, always make a new one (RA-4).
+pub fn durable_agent_credential(state_dir: &Path, rotate: bool) -> Result<String, String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let path = state_dir.join(DURABLE_AGENT_CREDENTIAL);
+    if !rotate {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let credential = text.trim().to_string();
+            if !credential.is_empty() {
+                return Ok(credential);
+            }
+        }
+    }
+    let parent = path.parent().unwrap_or(state_dir);
+    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let credential = relay_broker::new_credential();
+    let mut file = tempfile::Builder::new()
+        .prefix(".durable-agent.credential.")
+        .tempfile_in(parent)
+        .map_err(|e| format!("{}: {e}", parent.display()))?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    writeln!(file, "{credential}").map_err(|e| format!("{}: {e}", path.display()))?;
+    file.persist(&path)
+        .map_err(|e| format!("{}: {}", path.display(), e.error))?;
+    Ok(credential)
+}
+
+/// The broker's authority, made on first use (BK-1, DC-143).
+pub fn authority(state_dir: &Path) -> Result<Authority, String> {
+    Authority::load_or_create(&state_dir.join(AUTHORITY_DIR))
+}
+
+/// The relay agent's configuration file.
+pub fn agent_config(broker_url: &str, credential: &str, ca_pem: &str) -> Vec<u8> {
     let mut text = serde_json::to_string_pretty(&json!({
         "broker_url": broker_url,
         "agent_credential": credential,
@@ -532,7 +588,7 @@ fn tail_chars(text: &str, max: usize) -> String {
 
 /// An execution ID for an HTTP request: the body's `execution_id`, else a
 /// new one.
-fn execution_of(body: &Value) -> OpResult<String> {
+pub(crate) fn execution_of(body: &Value) -> OpResult<String> {
     match body.get("execution_id") {
         None | Some(Value::Null) => Ok(uuid::Uuid::new_v4().to_string()),
         Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => Ok(id.clone()),
@@ -686,9 +742,12 @@ impl Service {
                 .ok_or_else(|| "ssh failed".to_string())
         };
 
-        // The build: the image's when it is the one this service holds,
-        // else this service's (RA-6).
-        let build = self.host.relay_agent(kind).map_err(|e| e.to_string())?;
+        // The build: the image's when it is the release's, else the
+        // release's executable, uploaded (RA-6, DC-140).
+        let build = self
+            .host
+            .relay_agent(kind)
+            .map_err(|e| format!("no relay agent to send: {e}"))?;
         let want = sha256_hex(&build);
         let (rc, have) = ssh(&inspect_command(), None, 60)?;
         let have = have.trim().lines().last().unwrap_or("").trim().to_string();

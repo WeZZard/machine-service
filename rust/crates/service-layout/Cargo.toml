@@ -9,5 +9,8 @@ publish.workspace = true
 name = "service_layout"
 path = "src/lib.rs"
 
+[dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

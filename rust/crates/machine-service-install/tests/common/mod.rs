@@ -22,7 +22,8 @@ home="$HOME"
 printf '%s\n' "$*" >> "$home/launchctl.log"
 op="$1"
 case "$op" in
-  print) label="${2##*/}" ;;
+  print|bootout) label="${2##*/}" ;;
+  bootstrap) label="$(basename "${3:-}" .plist)" ;;
   *) label="$(basename "${2:-}" .plist)" ;;
 esac
 if [ "$label" = com.wezzard.machine-service ]; then job="$home/loaded-job"; else job="$home/loaded-job-$label"; fi
@@ -34,6 +35,12 @@ case "$op" in
     fi
     if [ -e "$home/user-domain" ]; then expected="user/"; else expected="gui/"; fi
     target="${2:-}"
+    case "$target" in
+      gui/[0-9]*/*) ;;
+      gui/[0-9]*)
+        if [ -e "$home/no-gui" ]; then echo "Could not find domain" >&2; exit 113; fi
+        echo "domain = gui"; exit 0 ;;
+    esac
     case "$target" in
       "$expected"*) ;;
       *) echo "Could not find service \"$label\" in domain" >&2; exit 113 ;;
@@ -53,12 +60,76 @@ case "$op" in
   load)
     : > "$job"
     ;;
+  bootstrap)
+    if [ -e "$home/bootstrap-fails" ]; then echo "Bootstrap failed: 5" >&2; exit 5; fi
+    cp "$3" "$home/bootstrapped-$label.plist"
+    : > "$job"
+    ;;
+  bootout)
+    rm -f "$job"
+    ;;
   *)
     exit 99
     ;;
 esac
 exit 0
 "#;
+
+/// A relay agent release in `folder`, as `scripts/build-relay-agent.sh`
+/// makes it: the macOS archive holds a copy of a system executable signed
+/// ad hoc with the release identifier (DC-135), the Linux one a stand-in.
+pub fn write_release(folder: &Path, signed: bool) {
+    use service_layout::release;
+    let _ = fs::remove_dir_all(folder);
+    fs::create_dir_all(folder).unwrap();
+    let mut sums = String::new();
+    for kind in ["macos", "linux"] {
+        let platform = release::platform_for(kind);
+        let stage = tempfile::tempdir().unwrap();
+        let member = stage.path().join(release::MEMBER);
+        if kind == "macos" {
+            fs::copy("/usr/bin/true", &member).unwrap();
+            if signed {
+                let status = Command::new("/usr/bin/codesign")
+                    .args([
+                        "--force",
+                        "--sign",
+                        "-",
+                        "--identifier",
+                        "com.wezzard.relay-agent",
+                    ])
+                    .arg(&member)
+                    .output()
+                    .unwrap()
+                    .status;
+                assert!(status.success());
+            }
+        } else {
+            fs::write(&member, "ELF stand-in\n").unwrap();
+        }
+        let file = format!("relay-agent-9.9.9-{platform}.tar.gz");
+        let status = Command::new("/usr/bin/tar")
+            .arg("-C")
+            .arg(stage.path())
+            .arg("-czf")
+            .arg(folder.join(&file))
+            .arg(release::MEMBER)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = fs::read(folder.join(&file)).unwrap();
+        sums.push_str(&format!("{}  {file}\n", release::sha256_hex(&bytes)));
+    }
+    fs::write(folder.join(release::SUMS), sums).unwrap();
+}
+
+/// The macOS executable a release in `folder` holds.
+pub fn release_executable(folder: &Path) -> Vec<u8> {
+    service_layout::release::Release::open(folder)
+        .unwrap()
+        .executable(&service_layout::release::platform_for("macos"))
+        .unwrap()
+}
 
 pub fn write_exec(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
@@ -113,6 +184,7 @@ impl Harness {
             }
             write_exec(&bin.join(&name), &format!("#!/bin/sh\n# {name}\nexit 0\n"));
         }
+        write_release(&bin.join(service_layout::release::FOLDER), true);
         let viewer = bin.join("vncviewer");
         write_exec(&viewer, "#!/bin/sh\nexit 99\n");
 

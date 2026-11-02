@@ -34,6 +34,9 @@ use super::process::{self, LeaseSession};
 use super::session_env::{self, SessionEnv, WorkspacePaths};
 use crate::config::{log_to_file, unix_now};
 
+mod relay;
+pub use relay::{DurableRelay, LINK_IN_SESSION, LINK_RELAY};
+
 /// Fields a durable acquisition refuses, because none can be applied to a
 /// running Mac (DM-3).
 pub const REFUSED_FIELDS: [&str; 7] = [
@@ -100,6 +103,8 @@ pub struct DurableMachine {
     /// began (DM-7).
     gate: RwLock<()>,
     runtime: Mutex<Option<Runtime>>,
+    /// The broker, when this instance runs one (M4).
+    relay: std::sync::OnceLock<DurableRelay>,
 }
 
 impl DurableMachine {
@@ -126,6 +131,7 @@ impl DurableMachine {
             store: Mutex::new(()),
             gate: RwLock::new(()),
             runtime: Mutex::new(None),
+            relay: std::sync::OnceLock::new(),
         })
     }
 
@@ -262,7 +268,17 @@ impl DurableMachine {
         Self::write_json(&self.current_file(), &json!({"current": lease_id}))
     }
 
+    /// The sessions the lease started, and the process groups of its relay
+    /// commands (DM-7, HY-3).
     fn sessions(&self, lease_id: &str) -> Vec<LeaseSession> {
+        let mut sessions = self.stored_sessions(lease_id);
+        sessions.extend(super::launch::recorded_groups(
+            &self.config.lease_dir(lease_id),
+        ));
+        sessions
+    }
+
+    fn stored_sessions(&self, lease_id: &str) -> Vec<LeaseSession> {
         std::fs::read_to_string(self.sessions_file(lease_id))
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -279,7 +295,7 @@ impl DurableMachine {
             .lock()
             .map_err(|_| "durable state poisoned".to_string())?;
         let mut sessions: Vec<Value> = self
-            .sessions(lease_id)
+            .stored_sessions(lease_id)
             .iter()
             .map(LeaseSession::to_json)
             .collect();
@@ -571,6 +587,13 @@ impl DurableMachine {
             Ok(record) => {
                 let mut out = self.machine_record_from(Some(&record));
                 out["workspace"] = record["workspace"].clone();
+                // The link the lease's calls take now; each answer says
+                // which one served it (RA-8).
+                if let Value::Object(fields) = self.link_fields(&self.relay_route()) {
+                    for (key, value) in fields {
+                        out[key] = value;
+                    }
+                }
                 Reply::ok(out)
             }
             Err(error) => {
@@ -761,7 +784,7 @@ impl DurableMachine {
                 _ => return Reply::error(409, "timeout must be positive"),
             },
         };
-        let (running, runtime) = {
+        let (running, runtime, reason) = {
             let Ok(_gate) = self.gate.read() else {
                 return Reply::error(500, "durable gate poisoned");
             };
@@ -806,11 +829,26 @@ impl DurableMachine {
             if runtime.cancel.load(Ordering::SeqCst) {
                 return Reply::error(409, format!("command cancelled by release of {name}"));
             }
+            // The relay agent runs it in the desktop session when it can;
+            // else the service does, as DM-4 says (RA-8).
+            let reason = match self.relay_route() {
+                Ok(relay) => {
+                    let started = match self
+                        .relay_start(relay, &lease_id, &runtime, &request, timeout, body)
+                    {
+                        Ok(started) => started,
+                        Err(reply) => return reply,
+                    };
+                    drop(_gate);
+                    return self.relay_finish(relay, name, &runtime, started, timeout);
+                }
+                Err(reason) => reason,
+            };
             let started = exec::start(&request, self.config.uid, |session| {
                 self.append_session(&lease_id, session)
             });
             match started {
-                Ok(running) => (running, runtime),
+                Ok(running) => (running, runtime, reason),
                 Err(error) => return Reply::error(409, error),
             }
         };
@@ -822,6 +860,8 @@ impl DurableMachine {
                     "vm": name,
                     "rc": rc,
                     "output": tail_chars(&redacted, MAX_OUTPUT_CHARS),
+                    "link": LINK_IN_SESSION,
+                    "link_reason": reason,
                 }))
             }
             Ok(Outcome::TimedOut) => Reply::error(
@@ -903,6 +943,20 @@ impl DurableMachine {
                 return Reply::error(409, error);
             }
         }
+        // A file goes through the relay agent when it can; a folder, which
+        // the relay protocol does not move, goes by the service (DC-151).
+        let is_file = std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.is_file());
+        let route = if is_file {
+            self.relay_route()
+        } else {
+            Err("a folder is copied by the service; the relay link moves single files".into())
+        };
+        let reason = match route {
+            Ok(relay) => {
+                return self.relay_transfer(relay, name, body, push, &source, &destination)
+            }
+            Err(reason) => reason,
+        };
         match copy_into_place(&source, &destination) {
             Ok((target, bytes, digest)) => {
                 let mut out = json!({
@@ -910,6 +964,8 @@ impl DurableMachine {
                     "vm": name,
                     "bytes": bytes,
                     "sha256": digest,
+                    "link": LINK_IN_SESSION,
+                    "link_reason": reason,
                 });
                 if push {
                     out["pushed"] = json!(local);
@@ -1018,6 +1074,10 @@ impl DurableMachine {
             if let Some(runtime) = runtime.as_ref() {
                 runtime.cancel.store(true, Ordering::SeqCst);
             }
+        }
+        // A relay command not yet started finds nothing to run (DM-7).
+        if let Some(lease_id) = record["lease_id"].as_str() {
+            super::launch::withdraw_requests(&self.config.lease_dir(lease_id));
         }
         Ok(record)
     }
