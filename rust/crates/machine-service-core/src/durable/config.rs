@@ -127,7 +127,11 @@ impl DurableConfig {
             config_dir,
             lock_dir,
             login_shell: PathBuf::from("/bin/zsh"),
-            grace_hours: crate::ops::GRACE_HOURS as f64,
+            grace_hours: crate::ops::parse_grace_hours(
+                std::env::var(crate::ops::GRACE_HOURS_VARIABLE)
+                    .ok()
+                    .as_deref(),
+            )?,
             stop_grace: STOP_GRACE,
             inventory_timeout: INVENTORY_TIMEOUT,
             fact_timeout: FACT_TIMEOUT,

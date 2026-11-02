@@ -450,8 +450,14 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
     drop(agent);
 }
 
+/// RA-8: a lease whose relay agent never registers within its bound is
+/// served over SSH. The acquisition's answer and the lease record both say
+/// `link: ssh-fallback` with the reason; the answer carries no `relay`; the
+/// relay credentials the lease was given are revoked, so the agent
+/// credential written into the guest is refused; and exec, a script, push
+/// and pull all still work, over SSH and without a `link: relay`.
 #[test]
-fn a_lease_whose_agent_never_registers_falls_back_to_ssh() {
+fn ra8_a_lease_whose_agent_never_registers_falls_back_to_ssh() {
     let session_port = free_session_port();
     let lab = Lab::new(
         session_port,
@@ -464,23 +470,92 @@ fn a_lease_whose_agent_never_registers_falls_back_to_ssh() {
     let answer = acquire(&lab);
     assert_eq!(answer["state"], "running");
     assert_eq!(answer["link"], "ssh-fallback");
-    assert!(answer["link_reason"]
-        .as_str()
-        .unwrap()
-        .contains("did not register within 2s"));
+    let reason = answer["link_reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("did not register within 2s"), "{reason}");
     assert!(answer.get("relay").is_none());
-    let vm = answer["vm"].as_str().unwrap();
+    let vm = answer["vm"].as_str().unwrap().to_string();
+
+    // The lease record keeps the link and its reason, and no credential.
+    let record = http(
+        lab.fixture.port(),
+        "GET",
+        &format!("/machines/{vm}"),
+        None,
+        None,
+    );
+    assert_eq!(record.status, 200, "{}", record.body);
+    assert_eq!(record.body["link"], "ssh-fallback", "{}", record.body);
+    assert_eq!(record.body["link_reason"], json!(reason));
+    for field in ["relay_agent", "relay_agent_sha256", "relay_client_sha256"] {
+        assert!(record.body.get(field).is_none(), "{field}: {}", record.body);
+    }
+    let log =
+        std::fs::read_to_string(lab.fixture.state_dir.join("service.log")).unwrap_or_default();
+    assert!(log.contains("link ssh-fallback, RA-8"), "{log}");
+
+    // Bootstrap wrote an agent credential into the guest; it is revoked.
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(lab.guest_home.join(".config/relay-agent/config.json")).unwrap(),
+    )
+    .unwrap();
+    let pem = config["broker_ca_pem"].as_str().unwrap();
+    let mut hello = relay_common::client_config(
+        config["broker_url"].as_str().unwrap(),
+        config["agent_credential"].as_str().unwrap(),
+    );
+    hello.attributes = json!({"role": "agent"});
+    hello.tls = Some(remote_session::tls::client_config(&[pem.as_bytes()]).unwrap());
+    match remote_session::connect(hello) {
+        Err(remote_session::Error::Rejected { code, .. }) => {
+            assert_eq!(code, remote_session::RejectCode::Unauthorized)
+        }
+        Err(other) => panic!("expected a refusal, got {other}"),
+        Ok(_) => panic!("the fallen-back lease's agent credential was accepted"),
+    }
+
+    // Every operation still works, over SSH.
     let ran = lab.post(
         &format!("/machines/{vm}/exec"),
         &json!({"argv": ["echo", "hi"]}),
     );
-    assert_eq!(ran.status, 200);
+    assert_eq!(ran.status, 200, "{}", ran.body);
     assert!(
         ran.body.get("link").is_none(),
         "served over SSH: {}",
         ran.body
     );
     assert!(ran.body["output"].as_str().unwrap().starts_with("ran: "));
+    let script = lab.post(
+        &format!("/machines/{vm}/exec"),
+        &json!({"script": "echo from-script"}),
+    );
+    assert_eq!(script.status, 200, "{}", script.body);
+    assert!(script.body.get("link").is_none(), "{}", script.body);
+    let local = lab.fixture.root.join("fallback.bin");
+    let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&local, &bytes).unwrap();
+    let pushed = lab.post(
+        &format!("/machines/{vm}/push"),
+        &json!({"local_path": local, "remote_path": "fallback.bin"}),
+    );
+    assert_eq!(pushed.status, 200, "{}", pushed.body);
+    assert!(pushed.body.get("link").is_none(), "{}", pushed.body);
+    let back = lab.fixture.root.join("fallback-back.bin");
+    let pulled = lab.post(
+        &format!("/machines/{vm}/pull"),
+        &json!({"local_path": back, "remote_path": "fallback.bin"}),
+    );
+    assert_eq!(pulled.status, 200, "{}", pulled.body);
+    assert!(pulled.body.get("link").is_none(), "{}", pulled.body);
+    assert_eq!(std::fs::read(&back).unwrap(), bytes);
+    let scp =
+        std::fs::read_to_string(lab.fixture.tart_home.join("scp-calls.log")).unwrap_or_default();
+    assert!(
+        scp.contains("fallback.bin"),
+        "push and pull went by scp: {scp}"
+    );
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
 }
 
 /// DC-140: a release whose archive does not match its `SHA256SUMS` is never

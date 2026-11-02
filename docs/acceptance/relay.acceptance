@@ -44,6 +44,7 @@ Feature: Actions through the relay agent and the broker
     Then the lease reaches running only after its relay agent has registered within its bound
     When the client releases the lease
     Then the broker refuses the lease credential and the agent credential
+    And on a durable Mac the agent credential, which is the machine's, keeps its session
 
   @AC-61 @TL-7 @N1 @N2 @N3
   Scenario: A connection cut during an action does not run it twice
@@ -78,10 +79,15 @@ Feature: Actions through the relay agent and the broker
     When the guest reboots
     Then the relay agent registers again from the desktop session without a manual step
     And AC-55 passes again
+    When the target is a durable Mac, which is never rebooted
+    Then its relay agent's LaunchAgent job is started afresh as a new desktop session starts it
+    And the relay agent registers again without a manual step
+    And AC-55 passes again
 
   @AC-66 @TL-7 @N0 @N1 @N2 @N3
   Scenario: Credentials and ports are guarded
     Then the broker refuses a missing, wrong, expired or released credential
+    And a lease's credential is accepted until the end of its TTL plus its grace bounded by its TTL, and refused after it
     And the target has no listening port that the relay agent opened
     And every hop of the chain runs TLS
     And the credentials work when a proxy ends TLS on the way

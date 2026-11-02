@@ -87,6 +87,16 @@ pub(crate) struct Grant {
     pub role: Role,
     pub target: Target,
     pub valid: Option<Validity>,
+    /// The end of the credential, in seconds since the epoch: a hello at or
+    /// after it is refused, until the owner moves it (DC-1xx-DUR2-2).
+    pub until: Option<f64>,
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
 }
 
 /// The credentials the broker accepts, by SHA-256.
@@ -104,6 +114,9 @@ impl Grants {
     pub fn check(&self, credential: &str) -> Option<(String, Grant)> {
         let hash = credential_sha256(credential);
         let grant = self.by_hash.get(&hash)?.clone();
+        if grant.until.is_some_and(|until| now() >= until) {
+            return None;
+        }
         if let Some(valid) = &grant.valid {
             if !valid() {
                 return None;
@@ -118,6 +131,16 @@ impl Grants {
         self.by_hash
             .retain(|_, grant| !(grant.target == *target && roles.contains(&grant.role)));
         before - self.by_hash.len()
+    }
+
+    /// Set the end of every credential of `role` on `target`; `None` lifts
+    /// it. Returns how many credentials it applies to.
+    pub fn set_until(&mut self, target: &Target, role: Role, until: Option<f64>) -> usize {
+        self.by_hash
+            .values_mut()
+            .filter(|grant| grant.target == *target && grant.role == role)
+            .map(|grant| grant.until = until)
+            .count()
     }
 
     pub fn has(&self, target: &Target, role: Role) -> bool {
@@ -148,6 +171,7 @@ mod tests {
                 role: Role::Client,
                 target: target.clone(),
                 valid: None,
+                until: None,
             },
         );
         assert!(grants.check(&a).is_some());
@@ -170,11 +194,47 @@ mod tests {
                 valid: Some(Arc::new(move || {
                     seen.load(std::sync::atomic::Ordering::SeqCst)
                 })),
+                until: None,
             },
         );
         assert!(grants.check("t").is_some());
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(grants.check("t").is_none());
+    }
+
+    #[test]
+    fn a_credential_ends_at_its_end_and_a_later_end_takes_it_back() {
+        let mut grants = Grants::default();
+        let target = Target::Lease("vm-a".into());
+        for role in [Role::Agent, Role::Client] {
+            grants.admit(
+                credential_sha256(role.name()),
+                Grant {
+                    role,
+                    target: target.clone(),
+                    valid: None,
+                    until: None,
+                },
+            );
+        }
+        assert_eq!(
+            grants.set_until(&target, Role::Client, Some(now() - 1.0)),
+            1
+        );
+        assert!(grants.check("client").is_none(), "past its end");
+        assert!(
+            grants.check("agent").is_some(),
+            "another role keeps its own"
+        );
+        // A renewal moves the end, and the same credential is good again.
+        grants.set_until(&target, Role::Client, Some(now() + 60.0));
+        assert!(grants.check("client").is_some());
+        grants.set_until(&target, Role::Client, None);
+        assert!(grants.check("client").is_some());
+        assert_eq!(
+            grants.set_until(&Target::Lease("other".into()), Role::Client, None),
+            0
+        );
     }
 
     #[test]

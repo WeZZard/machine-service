@@ -133,6 +133,20 @@ impl Instance {
         )
     }
 
+    /// `POST /acquire` of a durable machine for `ttl_hours`.
+    pub fn acquire_durable_for(
+        &self,
+        machine: &str,
+        purpose: &str,
+        ttl_hours: f64,
+    ) -> Result<Value, String> {
+        self.json(
+            "POST",
+            "/acquire",
+            Some(json!({"purpose": purpose, "machine": machine, "ttl_hours": ttl_hours, "wait": true})),
+        )
+    }
+
     /// `GET /machines`.
     pub fn machines(&self) -> Result<Value, String> {
         self.json("GET", "/machines", None)

@@ -53,6 +53,9 @@ pub struct DurableRelay {
     /// lease's records (DC-173): [`PURGE_WAIT`], or the agent wait when
     /// that is shorter.
     pub purge_wait: Duration,
+    /// Which relay agent is this instance's own, as its state folder names
+    /// it (DC-1xx-DUR2-1).
+    pub agent: crate::durable::relay_agent::Identity,
 }
 
 /// How long a durable release waits for the relay agent to confirm that
@@ -381,6 +384,8 @@ impl DurableMachine {
                 "link": LINK_RELAY,
                 "relay_agent": relay.broker.agent(&relay.target).map(|agent| json!({
                     "os": agent.os, "arch": agent.arch, "build": agent.build,
+                    "label": relay.agent.label,
+                    "home": relay.agent.home.to_string_lossy(),
                 })),
             }),
             Err(reason) => json!({"link": LINK_IN_SESSION, "link_reason": reason}),

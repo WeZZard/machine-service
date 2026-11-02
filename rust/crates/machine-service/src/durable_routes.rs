@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 
 use machine_service_core::durable::lease::DurableRelay;
+use machine_service_core::durable::relay_agent;
 use machine_service_core::durable::{DurableConfig, DurableMachine, Reply};
 use machine_service_core::relay::Relay;
 use machine_service_core::relay_broker::{Role, Target};
@@ -32,8 +33,9 @@ fn durable_target(machine: &DurableMachine) -> Target {
 }
 
 /// Accept the durable machine's relay agent on the broker, when exposure is
-/// on (RA-4), and route the lease's exec, push and pull through it while it
-/// has a session and runs the installed release's build (M4, RA-8).
+/// on (RA-4), route the lease's exec, push and pull through it while it has
+/// a session and runs the installed release's build (M4, RA-8), and bring
+/// this instance's own agent up (DC-1xx-DUR2-1).
 pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
     let Some(machine) = machine() else { return };
     if !machine.exposed() {
@@ -66,6 +68,7 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
     let launcher = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .unwrap_or_else(|_| std::path::PathBuf::from("machine-service"));
+    let agent = relay_agent::identity(state_dir, &machine.config.home);
     machine.attach_relay(DurableRelay {
         broker: relay.broker.clone(),
         target: durable_target(machine),
@@ -75,6 +78,65 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
         // An instance told to wait less for its agents waits less for a
         // purge too (MACHINE_SERVICE_RELAY_AGENT_WAIT).
         purge_wait: machine_service_core::durable::lease::PURGE_WAIT.min(relay.settings.agent_wait),
+        agent: agent.clone(),
+    });
+    provision_agent(machine, relay, state_dir, agent);
+}
+
+/// Bring this instance's own relay agent to the state it wants, on a thread
+/// of its own (DC-1xx-DUR2-1): the release's build, the machine's
+/// credential and this broker's URL, loaded in the desktop session. The
+/// agent's label and home derive from the state folder, so a second
+/// instance gets an agent of its own exactly as the installed one does and
+/// never touches the installed one's. A running agent is restarted only
+/// when its executable or LaunchAgent changed and no durable lease is
+/// current (DC-118).
+fn provision_agent(
+    machine: &Arc<DurableMachine>,
+    relay: &Arc<Relay>,
+    state_dir: &std::path::Path,
+    agent: relay_agent::Identity,
+) {
+    let log_file = machine.config.log_file.clone();
+    let log = move |message: &str| machine_service_core::config::log_to_file(&log_file, message);
+    let release_dir = match machine_service_core::relay::release_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            log(&format!(
+                "WARN: relay: the relay agent {} is not provisioned: {}",
+                agent.label, error.message
+            ));
+            return;
+        }
+    };
+    let spec = relay_agent::Spec {
+        identity: agent,
+        state_dir: state_dir.to_path_buf(),
+        session_port: relay.settings.session_port,
+        release_dir,
+        rotate: false,
+    };
+    std::thread::spawn(move || {
+        let may_restart = !relay_agent::durable_lease_current(&spec.state_dir);
+        let label = &spec.identity.label;
+        match relay_agent::ensure(&spec, may_restart) {
+            Ok(relay_agent::Ensured::Unchanged) => {
+                log(&format!("relay: the relay agent {label} runs as wanted"))
+            }
+            Ok(relay_agent::Ensured::Configured) => log(&format!(
+                "relay: the relay agent {label}'s configuration was updated; it dials {}",
+                spec.broker_url()
+            )),
+            Ok(relay_agent::Ensured::Started { build }) => log(&format!(
+                "relay: the relay agent {label} was started from {} (build {}; broker {})",
+                spec.identity.home.display(),
+                build.get(..12).unwrap_or(&build),
+                spec.broker_url()
+            )),
+            Err(reason) => log(&format!(
+                "WARN: relay: the relay agent {label} is not provisioned: {reason}"
+            )),
+        }
     });
 }
 
@@ -89,10 +151,20 @@ fn with_relay_credential(machine: &Arc<DurableMachine>, mut body: Value) -> Valu
     ) else {
         return body;
     };
+    // The credential is good while its lease is the machine's current one,
+    // up to the end of its TTL plus its grace bounded by its TTL, read from
+    // the record at every hello, so a renewal moves it (RP-3).
     let current = Arc::clone(machine);
     let valid: machine_service_core::relay_broker::Validity = Arc::new(move || {
         current.current_record().is_some_and(|record| {
-            record["lease_id"].as_str() == Some(lease_id.as_str()) && record["state"] != "released"
+            let until = machine_service_core::ops::relay_credential_until(
+                record["ttl_expires_at"].as_f64().unwrap_or_default(),
+                record["ttl_hours"].as_f64().unwrap_or_default(),
+                current.config.grace_hours,
+            );
+            record["lease_id"].as_str() == Some(lease_id.as_str())
+                && record["state"] != "released"
+                && machine_service_core::config::unix_now() < until
         })
     });
     let credential = relay

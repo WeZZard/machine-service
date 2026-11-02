@@ -1923,3 +1923,34 @@ fn test_resolvers_that_cannot_be_set_fail_the_acquisition() {
         "{err}"
     );
 }
+
+/// DM-6, DC-1xx-DUR2-2: the reclamation grace is the instance's setting,
+/// `MACHINE_SERVICE_GRACE_HOURS`, 6 hours unless set; anything but a
+/// number of hours, 0 or more, is refused.
+#[test]
+fn the_grace_period_is_an_instance_setting() {
+    use machine_service_core::ops::parse_grace_hours;
+    assert_eq!(parse_grace_hours(None), Ok(6.0));
+    assert_eq!(parse_grace_hours(Some("")), Ok(6.0));
+    assert_eq!(parse_grace_hours(Some("0")), Ok(0.0));
+    assert_eq!(parse_grace_hours(Some(" 0.5 ")), Ok(0.5));
+    for bad in ["-1", "six", "inf", "NaN"] {
+        let error = parse_grace_hours(Some(bad)).unwrap_err();
+        assert!(error.contains("MACHINE_SERVICE_GRACE_HOURS"), "{error}");
+    }
+}
+
+/// RP-3, DC-1xx-DUR2-2: a lease's relay credentials end at the end of its
+/// TTL plus its grace, and the grace is bounded by the TTL itself, so a
+/// 6-minute lease's credentials end at most 6 minutes after it.
+#[test]
+fn relay_credentials_end_within_one_ttl_of_the_lease() {
+    use machine_service_core::ops::relay_credential_until;
+    assert_eq!(relay_credential_until(1_000.0, 0.1, 6.0), 1_360.0);
+    assert_eq!(
+        relay_credential_until(1_000.0, 24.0, 6.0),
+        1_000.0 + 21_600.0
+    );
+    assert_eq!(relay_credential_until(1_000.0, 0.1, 0.0), 1_000.0);
+    assert_eq!(relay_credential_until(1_000.0, 1.0, 0.25), 1_900.0);
+}

@@ -87,7 +87,8 @@ pub enum Action {
     /// Install or replace only the durable Mac's relay agent and its
     /// LaunchAgent, for the instance the environment names (IN-3).
     RelayAgent,
-    /// Remove only the relay agent named by `--label` (IN-3).
+    /// Remove only the relay agent of the instance the environment names
+    /// (IN-3).
     RemoveRelayAgent,
 }
 
@@ -131,11 +132,6 @@ pub struct Cli {
     /// beside the installer is the install folder.
     #[arg(long, value_name = "DIR")]
     pub prefix: Option<PathBuf>,
-    /// The relay agent's LaunchAgent label, for `relay-agent` and
-    /// `remove-relay-agent`; a second instance's test agent uses its own
-    /// (TL-6).
-    #[arg(long, value_name = "LABEL")]
-    pub label: Option<String>,
     /// Make a new agent credential for the durable Mac's relay agent (RA-4).
     #[arg(long)]
     pub rotate_relay_credential: bool,
@@ -279,17 +275,8 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
         }
     }
 
-    let relay_label = match (&cli.label, action) {
-        (Some(_), Action::Install | Action::Remove) => {
-            return Err(InstallError::refused(
-                "--label applies to relay-agent and remove-relay-agent only",
-            ))
-        }
-        (Some(label), _) => label.clone(),
-        (None, _) => crate::relay_agent::DEFAULT_LABEL.to_string(),
-    };
     if matches!(action, Action::RelayAgent | Action::RemoveRelayAgent) {
-        return relay_agent_only(cli, action, &env, source, home, &relay_label, readonly);
+        return relay_agent_only(cli, action, &env, source, home, readonly);
     }
     let exposed = env.get(EXPOSE_KEY).map(String::as_str) == Some("on");
     if action == Action::Install
@@ -424,7 +411,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
         }
         println!("removed {}", plist.display());
         migration::remove_link(home, source)?;
-        crate::relay_agent::remove(home, crate::relay_agent::DEFAULT_LABEL)?;
+        crate::relay_agent::remove(home, &state_root(&env, home)?)?;
         return Ok(());
     }
 
@@ -456,14 +443,13 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     if exposed {
         crate::relay_agent::install(&crate::relay_agent::Spec {
             home: home.to_path_buf(),
-            label: crate::relay_agent::DEFAULT_LABEL.to_string(),
             state_dir: state_root(&env, home)?,
             session_port: session_port(&env)?,
             release_dir: deployed.join(service_layout::release::FOLDER),
             rotate: cli.rotate_relay_credential,
         })?;
     } else {
-        crate::relay_agent::remove(home, crate::relay_agent::DEFAULT_LABEL)?;
+        crate::relay_agent::remove(home, &state_root(&env, home)?)?;
     }
     let parent = plist
         .parent()
@@ -802,7 +788,6 @@ fn relay_agent_only(
     env: &BTreeMap<String, String>,
     source: &Path,
     home: &Path,
-    label: &str,
     readonly: bool,
 ) -> Result<(), InstallError> {
     let state_dir = state_root(env, home)?;
@@ -816,14 +801,13 @@ fn relay_agent_only(
             println!("Check passed; no files written and no launchctl calls (remove-relay-agent).");
             return Ok(());
         }
-        crate::relay_agent::remove(home, label)?;
+        crate::relay_agent::remove(home, &state_dir)?;
         return Ok(());
     }
     let release_dir = source.join(service_layout::release::FOLDER);
     crate::relay_agent::release_executable(&release_dir)?;
     let spec = crate::relay_agent::Spec {
         home: home.to_path_buf(),
-        label: label.to_string(),
         state_dir,
         session_port: session_port(env)?,
         release_dir,

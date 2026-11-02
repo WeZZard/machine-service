@@ -61,7 +61,8 @@ The remote session ([RS](remote-session.md)) makes one logical session survive a
 - `attributes` may also carry `"lease": "<machine name>"`; when it does and names another lease than the credential's, the hello is refused with `unauthorized`.
 - Credentials are opaque bearer tokens of 43 URL-safe base64 characters (32 random bytes). The broker stores only their SHA-256.
 - A virtual machine's lease gets a new client credential and a new agent credential at acquisition. The broker refuses both from the moment the lease starts releasing or expires ([RP-10](#rp-10-revocation)).
-- A durable machine's relay agent holds one agent credential per machine, which the installer writes and the operator rotates. A durable lease's client credential is valid while that lease is the machine's current lease.
+- A durable machine's relay agent holds one agent credential per machine, which its instance writes and the operator rotates; it outlives every lease. A durable lease's client credential is valid while that lease is the machine's current lease.
+- A lease's credentials, a virtual machine's both and a durable lease's client credential, take their lifetime from the lease. They are good until the lease's `ttl_expires_at` plus its grace, where the grace is the instance's reclamation grace (`MACHINE_SERVICE_GRACE_HOURS`, 6 hours by default) bounded by the lease's own TTL: a 6-minute lease's credentials end at most 6 minutes after its TTL, a 24-hour lease's 6 hours after it. A renewal moves the TTL and with it that end. A `hello` after the end gets `unauthorized`, as for a revoked credential; a renewal before the lease is reclaimed makes the same credential good again. Release and reclamation revoke the credentials for good, before that end at the latest (DC-1xx-DUR2-2).
 - The broker routes a client only to the relay agent of its own lease (BK-2), and one broker never routes to another broker's machines (DC-30).
 
 ## RP-4: Relay messages
@@ -225,7 +226,7 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 
 ## RP-10: Revocation
 
-- When a lease starts releasing or expires, the broker refuses its credentials at once: every later `hello`, resumes included, gets `error` with code `unauthorized`.
+- When a lease starts releasing or expires, the broker refuses its credentials at once: every later `hello`, resumes included, gets `error` with code `unauthorized`. A lease expires when it is reclaimed; its credentials end at their own end before that, without closing a session that is open then ([RP-3](#rp-3-roles-and-credentials)).
 - Each live client session of the lease first receives `revoked` with the reason, `released` or `expired`, and is then closed with `bye`. Calls still waiting end with `failed`, code `revoked`.
 - The relay agent's session is closed the same way. Release then stops the virtual machine, which stops every command in it.
 

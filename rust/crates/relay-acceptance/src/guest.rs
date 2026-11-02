@@ -27,13 +27,15 @@ impl Os {
         }
     }
 
-    /// Print the relay agent's process ID.
-    pub fn agent_pid(self) -> &'static str {
+    /// Print the process ID of the relay agent labelled `label` (a
+    /// LaunchAgent label on macOS; Linux has the one user unit).
+    pub fn agent_pid(self, label: &str) -> String {
         match self {
-            Os::Macos => {
-                "launchctl print gui/$(id -u)/com.wezzard.relay-agent | awk '$1 == \"pid\" && $2 == \"=\" {print $3; exit}'"
-            }
-            Os::Linux => "systemctl --user show -p MainPID --value relay-agent.service",
+            Os::Macos => format!(
+                "launchctl print gui/$(id -u)/{} | awk '$1 == \"pid\" && $2 == \"=\" {{print $3; exit}}'",
+                shell_quote(label)
+            ),
+            Os::Linux => "systemctl --user show -p MainPID --value relay-agent.service".into(),
         }
     }
 
@@ -107,8 +109,19 @@ for i in 1 2 3 4 5 6 7 8 9 10; do ss -H -ltn 'sport = :22' | grep -q . || { echo
     /// Restart the relay agent the way its service manager would after a
     /// crash: a stop signal to its process, which launchd or systemd starts
     /// again.
-    pub fn kill_agent(self) -> String {
-        format!("kill -TERM $({})", self.agent_pid())
+    pub fn kill_agent(self, label: &str) -> String {
+        format!("kill -TERM $({})", self.agent_pid(label))
+    }
+
+    /// Restart the relay agent's job as its service manager starts it in a
+    /// new desktop session: `launchctl kickstart -k` of its LaunchAgent, or a
+    /// restart of its user unit. This is a durable Mac's stand-in for a
+    /// reboot (DC-1xx-DUR2-4).
+    pub fn restart_agent_job(self, label: &str) -> String {
+        match self {
+            Os::Macos => format!("launchctl kickstart -k gui/$(id -u)/{}", shell_quote(label)),
+            Os::Linux => "systemctl --user restart relay-agent.service".into(),
+        }
     }
 
     /// Reboot the guest.
@@ -142,5 +155,12 @@ mod tests {
         assert!(Os::Linux
             .detached("echo 'x'")
             .contains("systemd-run --user"));
+        let label = "com.wezzard.relay-agent.0123456789ab";
+        assert!(Os::Macos
+            .agent_pid(label)
+            .contains("gui/$(id -u)/'com.wezzard.relay-agent.0123456789ab'"));
+        assert!(Os::Macos
+            .restart_agent_job(label)
+            .starts_with("launchctl kickstart -k gui/$(id -u)/'com.wezzard"));
     }
 }

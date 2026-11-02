@@ -77,7 +77,8 @@ sequenceDiagram
 
 - `POST /machines/<name>/heartbeat` with `lease_id` keeps the lease semantics of a virtual machine ([V5](../lifecycle-fixes.md#v5-a-heartbeat-without-ttl_hours)): it renews the TTL for `ttl_hours`, or for the lease's own initial TTL when it is omitted.
 - The TTL defaults to 24 hours and is capped at 720 hours, as for virtual machines.
-- Past its TTL a durable lease is warned. Past its TTL plus the grace period, the GC loop releases it as [DM-7](#dm-7-release) describes. The grace period is the same setting as for virtual machines, `MACHINE_SERVICE_GRACE_HOURS`, 6 hours by default.
+- Past its TTL a durable lease is warned. Past its TTL plus the grace period, the GC loop releases it as [DM-7](#dm-7-release) describes. The grace period is the same instance setting as for virtual machines, `MACHINE_SERVICE_GRACE_HOURS`, a number of hours, 0 or more, 6 by default.
+- The lease's relay client credential ends at its TTL plus the grace bounded by its TTL ([RP-3](relay-protocol.md#rp-3-roles-and-credentials)); the Mac's agent credential is the machine's and does not end with the lease.
 
 ## DM-7: Release
 

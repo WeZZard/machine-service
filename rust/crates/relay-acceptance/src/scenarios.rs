@@ -1012,6 +1012,26 @@ fn ac60(ctx: &mut Ctx<'_>) -> Verdict {
         refused(crate::client::try_hello(&options)),
     );
     match agent_credential {
+        // A durable Mac's agent credential is the machine's, not the
+        // lease's (RA-4): the agent keeps its session through the release,
+        // and the record says the next lease's calls take it.
+        _ if durable => {
+            let mut seen = Value::Null;
+            let kept = wait_for(Duration::from_secs(60), || {
+                seen = ctx.target.instance().record(&name).unwrap_or(Value::Null);
+                Ok(seen["link"] == "relay" && seen["relay_agent"].is_object())
+            });
+            ctx.check(
+                "the machine's agent credential outlives the lease",
+                kept.map_err(|_| {
+                    Stop::Failed(format!(
+                        "after the release the record says link {:?}, {}",
+                        seen.get("link"),
+                        seen.get("link_reason").cloned().unwrap_or(Value::Null)
+                    ))
+                }),
+            );
+        }
         Some(credential) => {
             let options = ctx.target.options_for(&ctx.client, &credential, "agent");
             ctx.check(
@@ -1308,8 +1328,9 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
     }
     let agent = restart_case(ctx, "agent", &|ctx| {
         let os = ctx.target.os();
+        let label = ctx.target.agent().label;
         let client = lease_client(ctx)?;
-        Ok(client.run(&os.detached(&format!("sleep 1; {}", os.kill_agent())))?)
+        Ok(client.run(&os.detached(&format!("sleep 1; {}", os.kill_agent(&label))))?)
     });
     if let Err(stop) = agent {
         ctx.check("the relay agent restart", Err(stop));
@@ -1317,12 +1338,54 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
     Ok(())
 }
 
+// AC-65 on a durable Mac: the operator's machine, with a CI runner that is
+// never paused (DC-25), is not rebooted, nor logged out, which would end the
+// runner too. Its stand-in is what launchd does in a new desktop session:
+// the agent's LaunchAgent job started afresh (`launchctl kickstart -k`),
+// after which the agent registers again by itself (DC-1xx-DUR2-4).
+fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_client(ctx)?;
+    let os = ctx.target.os();
+    let label = ctx.target.agent().label;
+    let before = client.run(&os.agent_pid(&label))?.trim().to_string();
+    client.run(&os.detached(&format!("sleep 2; {}", os.restart_agent_job(&label))))?;
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(5));
+    let mut after = None;
+    while started.elapsed() < Duration::from_secs(300) {
+        let client = lease_client(ctx)?;
+        match client.exec(&os.agent_pid(&label), 60.0, Duration::from_secs(300)) {
+            Ok(answer) if answer.rc() == Ok(Some(0)) => {
+                let pid = answer.text().trim().to_string();
+                if !pid.is_empty() && pid != before {
+                    after = Some(pid);
+                    break;
+                }
+            }
+            Ok(other) => eprintln!("AC-65: {:?}", other.outcome()),
+            Err(error) => {
+                eprintln!("AC-65: {error}; a new session");
+                ctx.target.new_session();
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    ctx.record("agent_pid_before", json!(before));
+    ctx.record("agent_pid_after", json!(after));
+    ctx.record("back_after_s", json!(started.elapsed().as_secs_f64()));
+    let after =
+        after.ok_or("the relay agent did not answer in 5 minutes after its job restarted")?;
+    ctx.check(
+        "the relay agent registered again without a manual step",
+        expect(after != before, || format!("pid {before} -> {after}")),
+    );
+    desktop_session_checks(ctx, "after the agent's job restarted: ")
+}
+
 // AC-65: the relay agent returns after a reboot.
 fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     if ctx.cell.target == network_rig::cell::TargetKind::DurableMac {
-        return Err(Stop::Blocked(
-            "a durable Mac is not rebooted by the suite".into(),
-        ));
+        return ac65_durable(ctx);
     }
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
@@ -1405,15 +1468,8 @@ fn ac66(ctx: &mut Ctx<'_>) -> Verdict {
             ))),
         ),
     }
-    ctx.check(
-        "an expired credential is refused",
-        Err(Stop::Blocked(
-            "a lease expires only after its TTL (at least 6 minutes) and machine-service's fixed \
-             6-hour grace (GRACE_HOURS), which no instance setting shortens; the broker refuses \
-             an expired lease's credentials through the same revocation as a release"
-                .into(),
-        )),
-    );
+    let expired = expired_credential(ctx);
+    ctx.check("an expired credential is refused", expired);
     let facts = ctx.target.facts.clone();
     ctx.record("facts", Value::Object(facts.clone()));
     match facts.get("agent_listening").and_then(Value::as_str) {
@@ -1475,6 +1531,55 @@ fn ac66(ctx: &mut Ctx<'_>) -> Verdict {
         },
     );
     Ok(())
+}
+
+/// The longest AC-66 waits for a short lease's credentials to end.
+const LONGEST_EXPIRY_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// AC-66's expired credential: a lease of the shortest TTL, whose relay
+/// credentials end at the end of its TTL plus the instance's grace bounded
+/// by the TTL (RP-3). Its credential is accepted before that end and
+/// refused after it.
+fn expired_credential(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
+    let short = ctx.target.short_lease()?;
+    let result = (|| {
+        let credential = short.credential.clone().ok_or_else(|| {
+            Stop::Failed(format!(
+                "the short lease is not served by the relay link: link {}",
+                short.link
+            ))
+        })?;
+        let until = short.until.ok_or("the short lease has no ttl_expires_at")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default();
+        let wait = Duration::from_secs_f64((until - now).max(0.0) + 5.0);
+        ctx.record("short_lease_wait_s", json!(wait.as_secs_f64()));
+        if wait > LONGEST_EXPIRY_WAIT {
+            return Err(Stop::Blocked(format!(
+                "the instance's grace makes a 6-minute lease's credentials end in {} minutes; \
+                 the acceptance host runs its instance with MACHINE_SERVICE_GRACE_HOURS=0 \
+                 (RELAY_HOST_GRACE_HOURS)",
+                wait.as_secs() / 60
+            )));
+        }
+        let options = ctx.target.options_for(&ctx.client, &credential, "client");
+        crate::client::try_hello(&options).map_err(|error| {
+            Stop::Failed(format!("before its end the credential is refused: {error}"))
+        })?;
+        std::thread::sleep(wait);
+        match crate::client::try_hello(&options) {
+            Err(SessionError::Rejected {
+                code: RejectCode::Unauthorized,
+                ..
+            }) => Ok(()),
+            Err(other) => Err(Stop::Failed(format!("refused otherwise: {other}"))),
+            Ok(_) => Err(Stop::Failed("accepted after its end".into())),
+        }
+    })();
+    ctx.target.release_short(&short);
+    result
 }
 
 /// Send a plain-text WebSocket upgrade to the broker's port, and return what

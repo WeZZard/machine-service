@@ -452,24 +452,32 @@ fn in3_a_current_durable_lease_refuses_the_relay_agent() {
     assert!(stderr.contains("a durable lease is current"), "{stderr}");
 }
 
-/// TL-6: `relay-agent` installs a second instance's relay agent under its
-/// own label, state folder and session port, and never touches
-/// machine-service's own LaunchAgent; `remove-relay-agent` removes it.
+/// TL-6, DC-1xx-DUR2-1: `relay-agent` installs a second instance's relay
+/// agent under the label and home its state folder names, with its own
+/// session port, and never touches machine-service's LaunchAgent or the
+/// installed instance's agent in the operator's home; `remove-relay-agent`
+/// removes it whole.
 #[test]
 fn tl6_a_second_instance_gets_its_own_relay_agent() {
     let mut harness = Harness::new();
     let state = harness.home.join("second/state");
     harness.set_env("MACHINE_SERVICE_STATE", state.to_str().unwrap());
     harness.set_env("MACHINE_SERVICE_SESSION_PORT", "6299");
-    let label = "com.wezzard.relay-agent.test";
-    assert_ok(harness.run(&["relay-agent", "--label", label]));
-    assert!(relay_plist(&harness, label).exists());
+    assert_ok(harness.run(&["relay-agent"]));
+    let identity = machine_service_install::relay_agent::identity(&state, &harness.home);
+    assert!(identity.label.starts_with("com.wezzard.relay-agent."));
+    let agent_home = state.canonicalize().unwrap().join("relay/agent");
+    assert_eq!(identity.home, agent_home);
+    let plist = agent_home.join(format!("Library/LaunchAgents/{}.plist", identity.label));
+    assert!(plist.exists());
     assert!(!relay_plist(&harness, "com.wezzard.relay-agent").exists());
     assert!(
         !harness.plist.exists(),
         "machine-service's agent is untouched"
     );
-    let config = agent_config(&harness.home);
+    assert!(!harness.home.join(".config/relay-agent").exists());
+    assert!(!harness.home.join(".local/libexec/relay-agent").exists());
+    let config = agent_config(&agent_home);
     assert_eq!(config["broker_url"], "wss://localhost:6299/relay");
     assert_eq!(config["agent_credential"], state_credential(&state));
     let calls = fs::read_to_string(&harness.log).unwrap();
@@ -479,17 +487,19 @@ fn tl6_a_second_instance_gets_its_own_relay_agent() {
             .any(|line| line.contains("com.wezzard.machine-service")),
         "{calls}"
     );
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.starts_with("bootstrap gui/") && line.ends_with(".plist")),
+        "{calls}"
+    );
 
-    assert_ok(harness.run(&["remove-relay-agent", "--label", label]));
-    assert!(!relay_plist(&harness, label).exists());
-    assert!(!harness
-        .home
-        .join(".local/libexec/relay-agent/relay-agent")
-        .exists());
-    assert!(!harness.home.join(".local/state/relay-agent").exists());
+    assert_ok(harness.run(&["remove-relay-agent"]));
+    assert!(!agent_home.exists());
+    assert!(state.join("relay/durable-agent.credential").exists());
 
-    let stderr = harness.assert_refused(&["install", "--label", label]);
-    assert!(stderr.contains("--label applies to"), "{stderr}");
+    let stderr = harness.assert_refused(&["relay-agent", "--label", "x"]);
+    assert!(stderr.contains("--label"), "{stderr}");
 }
 
 /// IN-3: without a desktop session the relay agent cannot run in one, and

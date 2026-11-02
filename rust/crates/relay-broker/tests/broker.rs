@@ -67,6 +67,37 @@ fn a_client_reaches_only_its_own_leases_agent() {
     drop((agent_a, agent_b));
 }
 
+/// RP-3, DC-1xx-DUR2-2: a lease's credentials end at the end the lease
+/// gives them; a hello after it is refused like a revoked credential's, a
+/// renewal that moves the end takes it back, and the end of one role leaves
+/// the other's alone.
+#[test]
+fn a_credential_is_refused_after_its_end_until_a_renewal_moves_it() {
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!(TestClient::connect(&h.url("ws"), &a.client).is_ok());
+    h.broker
+        .credentials_until(&a.target, Role::Client, Some(now - 1.0));
+    match TestClient::connect(&h.url("ws"), &a.client) {
+        Err(remote_session::Error::Rejected { code, .. }) => {
+            assert_eq!(code, RejectCode::Unauthorized)
+        }
+        Err(other) => panic!("expected a rejection, got {other}"),
+        Ok(_) => panic!("a credential past its end was accepted"),
+    }
+    // The agent's credential has its own end.
+    let agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    assert!(h.broker.wait_for_agent(&a.target, WAIT).is_some());
+    h.broker
+        .credentials_until(&a.target, Role::Client, Some(now + 3600.0));
+    assert!(TestClient::connect(&h.url("ws"), &a.client).is_ok());
+    drop(agent);
+}
+
 #[test]
 fn credentials_roles_and_leases_are_checked_on_every_hello() {
     let h = Harness::start(Options::default());

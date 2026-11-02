@@ -81,12 +81,78 @@ struct Lab {
     port: u16,
     daemon: Option<Child>,
     agent: Option<Child>,
+    /// The fake launchd's folder, when the daemon is given a `launchctl`
+    /// that runs the LaunchAgents it loads.
+    launchd: Option<PathBuf>,
+}
+
+/// A `launchctl` that runs a LaunchAgent's program as launchd would, with
+/// its `HOME`, and keeps its process ID by label, so a test sees the daemon
+/// bring its own relay agent up without loading anything into this Mac's
+/// desktop session.
+const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
+dir="$FAKE_LAUNCHD"
+printf '%s\n' "$*" >> "$dir/calls.log"
+alive() { [ -f "$dir/$1.pid" ] && kill -0 "$(cat "$dir/$1.pid")" 2>/dev/null; }
+case "$1" in
+  print)
+    case "$2" in
+      gui/*/*) label="${2##*/}"
+        if alive "$label"; then echo "pid = $(cat "$dir/$label.pid")"; exit 0; fi
+        echo "Could not find service" >&2; exit 113 ;;
+      gui/*) echo "domain = gui"; exit 0 ;;
+    esac ;;
+  bootstrap)
+    plist="$3"; label="$(basename "$plist" .plist)"
+    value() { /usr/bin/plutil -extract "$1" raw -o - "$plist"; }
+    HOME="$(value EnvironmentVariables.HOME)" SHELL=/bin/sh \
+      nohup "$(value ProgramArguments.0)" run >>"$(value StandardErrorPath)" 2>&1 </dev/null &
+    echo $! > "$dir/$label.pid"
+    exit 0 ;;
+  bootout)
+    label="${2##*/}"
+    if alive "$label"; then kill "$(cat "$dir/$label.pid")"; fi
+    rm -f "$dir/$label.pid"
+    exit 0 ;;
+esac
+exit 0
+"#;
+
+/// A copy of `executable` signed ad hoc with the release identifier, as
+/// `build-relay-agent.sh` signs a release build (DC-135).
+fn signed_copy(executable: &Path, folder: &Path) -> PathBuf {
+    std::fs::create_dir_all(folder).unwrap();
+    let copy = folder.join("relay-agent");
+    std::fs::copy(executable, &copy).unwrap();
+    let status = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--sign",
+            "-",
+            "--identifier",
+            "com.wezzard.relay-agent",
+        ])
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    copy
 }
 
 impl Lab {
     /// A second instance and its relay agent; `release_of` is the
     /// executable the instance's release holds.
     fn new(release_of: &Path) -> Lab {
+        Lab::with_launchd(release_of, false)
+    }
+
+    /// A second instance whose `launchctl` is the fake launchd, so it
+    /// brings its own relay agent up (DC-1xx-DUR2-1).
+    fn provisioning(release_of: &Path) -> Lab {
+        Lab::with_launchd(release_of, true)
+    }
+
+    fn with_launchd(release_of: &Path, launchd: bool) -> Lab {
         let dir = tempfile::tempdir().unwrap();
         let root = canonical_dir(dir.path());
         let home = root.join("home");
@@ -130,24 +196,51 @@ impl Lab {
             port: 0,
             daemon: None,
             agent: None,
+            launchd: None,
         };
+        if launchd {
+            let folder = lab.root.join("launchd");
+            std::fs::create_dir_all(&folder).unwrap();
+            let fake = folder.join("launchctl");
+            std::fs::write(&fake, FAKE_LAUNCHCTL).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            lab.launchd = Some(folder);
+        }
         lab.start_daemon(&config);
         lab
     }
 
+    /// The fake launchd's calls.
+    fn launchctl_calls(&self) -> String {
+        self.launchd
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join("calls.log")).ok())
+            .unwrap_or_default()
+    }
+
     fn start_daemon(&mut self, config: &Path) {
         std::fs::create_dir_all(&self.state).unwrap();
-        for _ in 0..16 {
-            let port = free_port();
-            let session_port = free_port();
+        // A restart takes the instance's ports again, as an installed
+        // instance always has the same ones; a first start takes free ones.
+        let again = (self.port != 0).then_some((self.port, self.session_port));
+        for attempt in 0..16 {
+            let (port, session_port) = match again {
+                Some(ports) if attempt < 8 => ports,
+                _ => (free_port(), free_port()),
+            };
             let err = self.root.join(format!("daemon-{port}.err"));
+            let path = match &self.launchd {
+                Some(dir) => format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", dir.display()),
+                None => "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+            };
             let mut child = Command::new(DAEMON)
                 .env_clear()
                 .env("HOME", &self.home)
                 .env("USER", user())
                 .env("LOGNAME", user())
                 .env("SHELL", "/bin/zsh")
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("PATH", path)
+                .env("FAKE_LAUNCHD", self.launchd.clone().unwrap_or_default())
                 .env("MACHINE_SERVICE_STATE", &self.state)
                 .env("MACHINE_SERVICE_PORT", port.to_string())
                 .env("MACHINE_SERVICE_HOST", "127.0.0.1")
@@ -350,7 +443,90 @@ impl Drop for Lab {
             unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
             let _ = daemon.wait();
         }
+        // The agents the fake launchd started.
+        if let Some(dir) = &self.launchd {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                if entry.path().extension().is_some_and(|e| e == "pid") {
+                    if let Some(pid) = std::fs::read_to_string(entry.path())
+                        .ok()
+                        .and_then(|text| text.trim().parse::<i32>().ok())
+                    {
+                        // SAFETY: only PIDs the fake launchd started are named.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+        }
     }
+}
+
+/// DC-1xx-DUR2-1: a second instance with durable exposure on and the relay
+/// link brings its own relay agent up, without an installer: the release's
+/// build, the machine's credential, its own broker, under a label and a home
+/// its state folder names. Nothing of it lies in the operator's home, where
+/// the installed instance's agent lives, and a restart of the instance
+/// leaves an agent that runs as wanted alone.
+#[test]
+fn an_exposed_instance_brings_up_its_own_relay_agent() {
+    let scratch = tempfile::tempdir().unwrap();
+    let signed = signed_copy(relay_agent_bin(), scratch.path());
+    let mut lab = Lab::provisioning(&signed);
+    let (name, lease, acquired) = lab.acquire("none");
+    lab.wait_for_relay(&name, &lease);
+    let record = lab.request("GET", &format!("/machines/{name}"), None).body;
+    assert_eq!(record["link"], "relay", "{record}");
+    let agent = &record["relay_agent"];
+    let label = agent["label"].as_str().unwrap().to_string();
+    assert!(
+        label.starts_with("com.wezzard.relay-agent.") && label.len() == 36,
+        "{label}"
+    );
+    let home = PathBuf::from(agent["home"].as_str().unwrap());
+    assert_eq!(home, lab.state.canonicalize().unwrap().join("relay/agent"));
+    assert!(acquired.get("link").is_some(), "{acquired}");
+    // Its files are its own: under its state folder, none in the operator's
+    // home, and its LaunchAgent is outside ~/Library/LaunchAgents.
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(home.join(".config/relay-agent/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config["broker_url"],
+        format!("wss://localhost:{}/relay", lab.session_port)
+    );
+    assert_eq!(
+        config["agent_credential"].as_str().unwrap(),
+        std::fs::read_to_string(lab.state.join("relay/durable-agent.credential"))
+            .unwrap()
+            .trim()
+    );
+    assert!(home
+        .join(format!("Library/LaunchAgents/{label}.plist"))
+        .is_file());
+    assert!(!lab.home.join(".config/relay-agent").exists());
+    assert!(!lab.home.join(".local/libexec/relay-agent").exists());
+    assert!(!lab.home.join("Library/LaunchAgents").exists());
+    let calls = lab.launchctl_calls();
+    assert_eq!(calls.matches("bootstrap gui/").count(), 1, "{calls}");
+    assert!(lab
+        .log()
+        .contains(&format!("relay agent {label} was started")));
+    assert_eq!(lab.release_lease(&name, &lease).status, 200);
+
+    // A restart finds the agent running as wanted and leaves it alone.
+    lab.restart_daemon();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lab
+        .log()
+        .contains(&format!("relay agent {label} runs as wanted"))
+    {
+        assert!(Instant::now() < deadline, "{}", lab.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(lab.launchctl_calls().matches("bootstrap gui/").count(), 1);
+    let (name, lease, _) = lab.acquire("none");
+    lab.wait_for_relay(&name, &lease);
+    assert_eq!(lab.release_lease(&name, &lease).status, 200);
 }
 
 /// Everything under `root`, as text.

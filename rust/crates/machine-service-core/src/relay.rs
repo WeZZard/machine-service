@@ -627,6 +627,17 @@ fn tail_chars(text: &str, max: usize) -> String {
     text.chars().skip(count - max).collect()
 }
 
+/// The end of a virtual machine lease's relay credentials, from its record
+/// (DC-1xx-DUR2-2); `None` for a record without a TTL.
+fn credential_until(record: &Value) -> Option<f64> {
+    let ttl = record.get("ttl_expires_at").and_then(Value::as_f64)?;
+    Some(crate::ops::relay_credential_until(
+        ttl,
+        crate::ops::lease_initial_ttl_hours(record),
+        crate::ops::grace_hours(),
+    ))
+}
+
 /// An execution ID for an HTTP request: the body's `execution_id`, else a
 /// new one.
 pub(crate) fn execution_of(body: &Value) -> OpResult<String> {
@@ -661,6 +672,9 @@ impl Service {
                 ] {
                     if let Some(hash) = record.get(field).and_then(Value::as_str) {
                         relay.broker.admit(&target, role, hash, None);
+                        relay
+                            .broker
+                            .credentials_until(&target, role, credential_until(record));
                     }
                 }
                 self.log(&format!(
@@ -838,6 +852,27 @@ impl Service {
             &want[..12]
         ));
         Ok(())
+    }
+
+    /// Set the end of the relay credentials of `vm` from its record: the end
+    /// of its TTL plus its grace bounded by its TTL (RP-3,
+    /// [`crate::ops::relay_credential_until`]). Called when the lease starts
+    /// running and when it is renewed.
+    pub(crate) fn relay_credentials_until(&self, vm: &str) {
+        let Some(relay) = self.relay() else {
+            return;
+        };
+        let Ok(record) = self.get_record(vm) else {
+            return;
+        };
+        if record.get("link").and_then(Value::as_str) != Some(LINK_RELAY) {
+            return;
+        }
+        let target = Target::Lease(vm.to_string());
+        let until = credential_until(&record);
+        for role in [Role::Agent, Role::Client] {
+            relay.broker.credentials_until(&target, role, until);
+        }
     }
 
     /// Revoke a lease's relay credentials and end its sessions.

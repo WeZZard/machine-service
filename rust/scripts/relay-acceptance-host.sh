@@ -17,6 +17,14 @@
 # chain's port on the host's address on their network, as machine-service
 # derives it (BK-5), and the chain's edge serves those addresses.
 #
+# With durable exposure on, the instance brings up its own relay agent, as
+# every exposed instance does (IN-3): its label and home derive from the
+# instance's state folder, so it never touches the installed instance's
+# agent, and its LaunchAgent lies under the state folder, outside
+# ~/Library/LaunchAgents, so launchd never loads it at a later login. The
+# agent outlives `stop` and `restart`, as the installed agent outlives a
+# restart of its instance; `clean` unloads it and removes it with the state.
+#
 # Usage: relay-acceptance-host.sh start | stop | restart | status | clean
 #        relay-acceptance-host.sh rig-start <profile> <seed> | rig-stop | rig-ctl <json> | rig-status
 #
@@ -28,6 +36,9 @@
 #                            host's addresses (default: <LocalHostName>.local)
 #   RELAY_HOST_RELAY_URL     the relay_url to advertise instead of the default
 #   RELAY_HOST_DURABLE       1 to turn durable exposure on (TL-6)
+#   RELAY_HOST_GRACE_HOURS   the instance's lease grace, MACHINE_SERVICE_GRACE_HOURS
+#                            (default 0: a lease and its relay credentials end
+#                            at the end of its TTL, which AC-66 waits for)
 #   PILOT_REPO               the image source, as the installed instance has it
 set -eu
 
@@ -38,6 +49,7 @@ port="${RELAY_HOST_PORT:-6262}"
 session_port="${RELAY_HOST_SESSION_PORT:-6263}"
 agent_port="${RELAY_HOST_AGENT_PORT:-6264}"
 agent_name="${RELAY_HOST_AGENT_NAME:-$(scutil --get LocalHostName 2>/dev/null || hostname -s).local}"
+grace="${RELAY_HOST_GRACE_HOURS:-0}"
 state="$dir/state"
 pidfile="$dir/daemon.pid"
 rigs="$dir/agent-rig"
@@ -63,6 +75,7 @@ start_instance() {
         MACHINE_SERVICE_STATE="$state" MACHINE_SERVICE_CONFIG_DIR="$dir/config" \
         MACHINE_SERVICE_GUEST_LINK=relay MACHINE_SERVICE_SESSION_PORT="$session_port" \
         MACHINE_SERVICE_RELAY_GUEST_PORT="$agent_port" \
+        MACHINE_SERVICE_GRACE_HOURS="$grace" \
         ${RELAY_HOST_RELAY_URL:+MACHINE_SERVICE_RELAY_URL="$RELAY_HOST_RELAY_URL"} \
         ${durable:+MACHINE_SERVICE_EXPOSE_DURABLE=on} \
         MACHINE_SERVICE_DISCOVERY_SCOPE=local-only \
@@ -91,6 +104,24 @@ stop_instance() {
         echo "stopped: pid $pid"
     fi
     rm -f "$pidfile"
+}
+
+# The instance's own relay agents: the LaunchAgents under its state folder.
+agent_plists() {
+    for plist in "$state"/relay/agent/Library/LaunchAgents/*.plist; do
+        [ -f "$plist" ] && printf '%s\n' "$plist"
+    done
+    return 0
+}
+
+agent_stop() {
+    agent_plists | while IFS= read -r plist; do
+        label="$(basename "$plist" .plist)"
+        if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+            launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+            echo "relay agent unloaded: $label"
+        fi
+    done
 }
 
 current_rig() {
@@ -156,6 +187,14 @@ restart)
 status)
     if running; then echo "instance: running, pid $(cat "$pidfile")"; else echo "instance: stopped"; fi
     if rig_running; then echo "agent chain: running, $(current_rig)"; else echo "agent chain: stopped"; fi
+    agent_plists | while IFS= read -r plist; do
+        label="$(basename "$plist" .plist)"
+        if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+            echo "relay agent: loaded, $label"
+        else
+            echo "relay agent: not loaded, $label"
+        fi
+    done
     ;;
 rig-start) rig_start "${2:-}" "${3:-}" ;;
 rig-stop) rig_stop ;;
@@ -169,6 +208,7 @@ rig-ctl)
 clean)
     rig_stop
     stop_instance
+    agent_stop
     rm -rf "$state" "$dir/config" "$rigs" "$dir/cache" "$dir/daemon.out" "$dir/daemon.err"
     echo "cleaned $dir"
     ;;

@@ -394,6 +394,15 @@ impl DurableMachine {
         if let Some(reason) = unavailable {
             out["unavailable_reason"] = json!(reason);
         }
+        // The link a lease's calls take now, with or without a lease: the
+        // Mac's relay agent keeps its session across leases (RA-4, RA-8).
+        if self.relay.get().is_some() {
+            if let Value::Object(fields) = self.link_fields(&self.relay_route()) {
+                for (key, value) in fields {
+                    out[key] = value;
+                }
+            }
+        }
         if let Some(ttl) = lease.and_then(|record| record["ttl_expires_at"].as_f64()) {
             out["ttl_hours_remaining"] =
                 json!(((ttl - unix_now()) / 3600.0 * 100.0).round() / 100.0);
@@ -604,14 +613,9 @@ impl DurableMachine {
         match self.prepare(record) {
             Ok(record) => {
                 let mut out = self.machine_record_from(Some(&record));
+                // The record carries the link the lease's calls take now;
+                // each answer says which one served it (RA-8).
                 out["workspace"] = record["workspace"].clone();
-                // The link the lease's calls take now; each answer says
-                // which one served it (RA-8).
-                if let Value::Object(fields) = self.link_fields(&self.relay_route()) {
-                    for (key, value) in fields {
-                        out[key] = value;
-                    }
-                }
                 Reply::ok(out)
             }
             Err(error) => {

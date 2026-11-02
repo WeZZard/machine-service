@@ -233,8 +233,18 @@ impl Broker {
                 role,
                 target: target.clone(),
                 valid,
+                until: None,
             },
         );
+    }
+
+    /// End every credential of `role` on `target` at `until`, in seconds
+    /// since the epoch: from then on a hello with one is refused with
+    /// `unauthorized`, as for a revoked one. Unlike a revocation it ends no
+    /// session and can be moved, as a lease's renewal moves its end
+    /// (RP-3, DC-1xx-DUR2-2). `None` lifts the end.
+    pub fn credentials_until(&self, target: &Target, role: Role, until: Option<f64>) {
+        self.inner.grants().set_until(target, role, until);
     }
 
     /// Refuse every credential of `target` from now on, end its client and

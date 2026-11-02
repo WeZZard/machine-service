@@ -31,7 +31,7 @@ flowchart LR
 
 - On macOS, the relay agent is a per-user LaunchAgent with `LimitLoadToSessionType` set to `Aqua`, so launchd starts it in the desktop session of the user who logs in automatically and keeps it running with `KeepAlive`.
 - On Ubuntu, the relay agent is a systemd user service that is wanted by `graphical-session.target`, so it starts in the desktop session of the user who logs in automatically.
-- On a durable Mac, the relay agent is a LaunchAgent of the operator's account, and it replaces machine-service's own in-session exec of [DM-4](durable-machine.md#dm-4-exec).
+- On a durable Mac, the relay agent is a LaunchAgent of the operator's account, and it replaces machine-service's own in-session exec of [DM-4](durable-machine.md#dm-4-exec). Each instance with exposure on has its own, named by the instance's state folder, which the daemon brings up at startup ([IN-3](installation.md#in-3-the-durable-macs-relay-agent), DC-1xx-DUR2-1).
 - Every action runs as a child process of the relay agent, so it inherits the desktop session: the unlocked login keychain, the window server, the session bus on Ubuntu, and the environment that launchd or systemd gives the session.
 - macOS attributes the TCC permissions of an action to the relay agent's signed executable, so the image grants permissions to the relay agent once instead of to `sshd-keygen-wrapper`.
 - The relay agent never listens on a network port.
@@ -48,8 +48,9 @@ flowchart LR
 
 - Each relay agent holds an agent credential, which is a bearer token that the broker checks in the session's first message.
 - A virtual machine's relay agent gets a new agent credential for each lease, which machine-service generates at acquisition and writes into the clone during bootstrap ([RA-7](#ra-7-bootstrap)).
-- A durable Mac's relay agent holds one agent credential per machine, which the installer writes and the operator can rotate.
+- A durable Mac's relay agent holds one agent credential per machine, which the instance writes into the agent's configuration and the operator can rotate. It outlives every lease.
 - A client authenticates with the lease credential that the acquisition returns, and the broker routes a client only to the relay agent of that lease.
+- A lease's credentials last as long as the lease is current: until the end of its TTL plus a grace that is the instance's reclamation grace bounded by the TTL itself, which a renewal moves, and at the latest until release or reclamation revokes them ([RP-3](relay-protocol.md#rp-3-roles-and-credentials), DC-1xx-DUR2-2).
 - The broker refuses an agent credential or a lease credential after release, after expiry, or after rotation.
 - Every credential travels inside the protocol over TLS, and none depends on a client certificate, because a proxy may end TLS on the way ([TC-5](transport-contract.md#tc-5-tls-may-end-in-the-middle)).
 
@@ -75,9 +76,9 @@ flowchart LR
   1. It writes its build over `~/.local/libexec/relay-agent/relay-agent` with `write`, atomically; the running agent keeps its own file until it restarts.
   2. It waits until no call of the lease is out, then holds new calls back and sends `restart`. The relay agent takes it only while nothing runs (otherwise `busy`, and machine-service waits and asks again), records it, answers, and executes its own path again in the same process, so launchd and systemd see no exit and the new build runs.
   3. The agent's next session says hello with the new build; the held calls go to it, and the lease record's `relay_agent.build` is updated. No execution is lost: none runs at the restart, and the records outlive it. A replacement that fails is logged and is not tried again for the same build.
-- A durable Mac's relay agent is the installer's to replace, not the lease's.
+- A durable Mac's relay agent is its instance's to replace, at startup or installation, not the lease's.
 - machine-service holds the relay agent's release beside itself, `relay-agent-release/` ([IN-1](installation.md#in-1-one-layout)), and sends a guest exactly the executable of the archive for the guest's platform, after checking the archive against `SHA256SUMS`; it never builds one (DC-140). A release that does not check out serves the lease over SSH with the reason (RA-8). `MACHINE_SERVICE_RELAY_AGENT_RELEASE` names another release folder.
-- The machine-service installer installs the release's relay agent and its LaunchAgent on a durable Mac ([IN-3](installation.md#in-3-the-durable-macs-relay-agent)).
+- Every instance with durable exposure on brings the release's relay agent and its LaunchAgent up on its Mac, from the daemon at startup and from the installer ([IN-3](installation.md#in-3-the-durable-macs-relay-agent)).
 - A release tag `v<version>` publishes the relay agent's archives with the GitHub release: `relay-agent-<version>-<platform>.tar.gz` for `darwin-arm64`, `linux-arm64` and `linux-x86_64`, each holding the one executable `relay-agent`, and `SHA256SUMS` over them. `rust/scripts/build-relay-agent.sh` builds them; the Linux executables are static (musl), so one build serves every distribution.
 - The macOS executable is signed with the identifier `com.wezzard.relay-agent`, the LaunchAgent's label, not with the per-build identifier that the linker gives it. An image grants privacy permissions to the code requirement `identifier "com.wezzard.relay-agent"`, so every build signed this way keeps the grants, including the build that machine-service sends at lease time. The signature is ad hoc; a Developer ID signature with the same identifier would satisfy the same requirement.
 

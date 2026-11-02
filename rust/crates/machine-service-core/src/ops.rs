@@ -22,8 +22,46 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum concurrent macOS guests on the whole host.
 pub const MAX_MACOS_RUNNING: usize = 2;
-/// The reclamation grace period after TTL expiry, in hours.
+/// The reclamation grace period after TTL expiry, in hours, unless the
+/// instance sets `MACHINE_SERVICE_GRACE_HOURS` (DM-6).
 pub const GRACE_HOURS: i64 = 6;
+/// The instance setting of the reclamation grace period, in hours.
+pub const GRACE_HOURS_VARIABLE: &str = "MACHINE_SERVICE_GRACE_HOURS";
+
+/// Parse `MACHINE_SERVICE_GRACE_HOURS`: a finite number of hours, 0 or
+/// more; unset or empty is [`GRACE_HOURS`].
+pub fn parse_grace_hours(value: Option<&str>) -> Result<f64, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(GRACE_HOURS as f64),
+        Some(text) => text
+            .parse::<f64>()
+            .ok()
+            .filter(|hours| hours.is_finite() && *hours >= 0.0)
+            .ok_or_else(|| {
+                format!("{GRACE_HOURS_VARIABLE}={text:?} is not a number of hours, 0 or more")
+            }),
+    }
+}
+
+/// The instance's reclamation grace period, in hours, read once from its
+/// environment; an invalid setting stops the daemon at startup, so here it
+/// is only ever valid.
+pub fn grace_hours() -> f64 {
+    static GRACE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        parse_grace_hours(std::env::var(GRACE_HOURS_VARIABLE).ok().as_deref())
+            .unwrap_or(GRACE_HOURS as f64)
+    })
+}
+
+/// The end of a lease's relay credentials (RP-3, DC-1xx-DUR2-2): the end of
+/// its TTL plus a grace that is the instance's reclamation grace bounded by
+/// the TTL itself, so a short lease's credentials never outlive it by more
+/// than its own length. A renewal moves the TTL, and with it this end;
+/// release and reclamation revoke the credentials before it.
+pub fn relay_credential_until(ttl_expires_at: f64, ttl_hours: f64, grace_hours: f64) -> f64 {
+    ttl_expires_at + grace_hours.min(ttl_hours).max(0.0) * 3600.0
+}
 /// Consecutive GC passes a `running` record's VM may be missing from Tart's
 /// running set before GC reclaims the lease. Two passes tolerate a record
 /// that became `running` between the `tart list` snapshot and the state read.
@@ -687,6 +725,7 @@ impl Service {
             },
             Option::<fn(&Map<String, Value>)>::None,
         )?;
+        self.relay_credentials_until(vm);
         self.log(&format!(
             "acquired {vm} (key-only SSH verified, env={}, ip={ip})",
             chosen.as_deref().unwrap_or("none")
@@ -1181,6 +1220,8 @@ release it and acquire a new lease"
                 }
             }),
         )?;
+        // The renewal moves the end of the lease's relay credentials too.
+        self.relay_credentials_until(vm);
         if let Some((ttl, expires)) = renewal.get() {
             self.log(&format!(
                 "heartbeat {vm}: TTL renewed for {ttl}h (until {})",
@@ -1595,7 +1636,7 @@ release it and acquire a new lease"
                         let grace = record.get("grace_until").and_then(Value::as_f64);
                         match grace {
                             None => {
-                                let until = now + GRACE_HOURS as f64 * 3600.0;
+                                let until = now + grace_hours() * 3600.0;
                                 record["grace_until"] = number(until);
                                 record["warned"] = Value::Bool(true);
                                 actions.push((vm.clone(), "warn", Some(until)));
@@ -1759,7 +1800,7 @@ const DEFAULT_TTL_HOURS: f64 = 24.0;
 
 /// The lease's own initial TTL: its resolved `initial_ttl_hours`, or the
 /// acquisition default for a legacy record without a configuration report.
-fn lease_initial_ttl_hours(record: &Value) -> f64 {
+pub(crate) fn lease_initial_ttl_hours(record: &Value) -> f64 {
     record
         .get("configuration")
         .and_then(|config| config.get("effective"))

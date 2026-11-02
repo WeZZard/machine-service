@@ -100,6 +100,48 @@ pub struct Lease {
     pub agent_credential: Option<String>,
     /// The guest's system.
     pub os: Os,
+    /// Which relay agent serves the lease.
+    pub agent: AgentPlace,
+}
+
+/// Where a lease's relay agent is: its LaunchAgent label and its home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPlace {
+    /// The LaunchAgent label (macOS).
+    pub label: String,
+    /// The agent's home, as a shell word: `~` in a guest, the path the
+    /// instance reports on a durable Mac.
+    pub home: String,
+}
+
+impl AgentPlace {
+    /// A guest's agent: the image's label under the guest user's home
+    /// (pilot-images RA-I1, RA-I2).
+    pub fn guest() -> AgentPlace {
+        AgentPlace {
+            label: "com.wezzard.relay-agent".into(),
+            home: "~".into(),
+        }
+    }
+
+    /// The agent a lease record names in `relay_agent` (`label`, `home`), as
+    /// a durable Mac's instance derives it from its state folder
+    /// (DC-1xx-DUR2-1); a record without them names a guest's agent.
+    pub fn of_record(record: &Value) -> AgentPlace {
+        let agent = &record["relay_agent"];
+        match (agent["label"].as_str(), agent["home"].as_str()) {
+            (Some(label), Some(home)) => AgentPlace {
+                label: label.into(),
+                home: shell_quote(home),
+            },
+            _ => AgentPlace::guest(),
+        }
+    }
+
+    /// The agent's configuration file, as a shell word.
+    pub fn config(&self) -> String {
+        format!("{}/.config/relay-agent/config.json", self.home)
+    }
 }
 
 /// The real target.
@@ -219,6 +261,13 @@ impl RealTarget {
         }
     }
 
+    /// Where the lease's relay agent is.
+    pub fn agent(&self) -> AgentPlace {
+        self.lease
+            .as_ref()
+            .map_or_else(AgentPlace::guest, |lease| lease.agent.clone())
+    }
+
     /// The lease's guest system.
     pub fn os(&self) -> Os {
         self.lease.as_ref().map_or(Os::Macos, |lease| lease.os)
@@ -284,6 +333,7 @@ impl RealTarget {
                 acquired_in,
                 agent_credential: None,
                 os: Os::Macos,
+                agent: AgentPlace::guest(),
             });
             return Err(Stop::Failed(format!(
                 "the lease is not served by the relay link: link {:?}, {}",
@@ -291,6 +341,11 @@ impl RealTarget {
                 record.get("link_reason").cloned().unwrap_or(Value::Null)
             )));
         };
+        let agent = AgentPlace::of_record(&record);
+        let link = (
+            record.get("link").cloned(),
+            record.get("link_reason").cloned(),
+        );
         self.lease = Some(Lease {
             name: name.clone(),
             record,
@@ -300,6 +355,7 @@ impl RealTarget {
             acquired_in,
             agent_credential: None,
             os: Os::Macos,
+            agent,
         });
         let options = self.options(rig)?;
         let client = RelayClient::connect(&options)?;
@@ -308,15 +364,14 @@ impl RealTarget {
         let client = Arc::new(client);
         let Some(agent) = agent else {
             self.client = Some(client);
-            return Err(if durable {
-                Stop::Blocked(
-                    "the durable Mac's relay agent has no session with the broker: the installer \
-                     does not install it yet (M4, durable install and routing)"
-                        .into(),
-                )
-            } else {
-                Stop::Failed("the lease's relay agent has no session with the broker".into())
-            });
+            // Every instance with durable exposure on brings its own relay
+            // agent up (DC-1xx-DUR2-1), so a missing one is a failure, with
+            // the instance's own reason.
+            return Err(Stop::Failed(format!(
+                "the lease's relay agent has no session with the broker: link {:?}, {}",
+                link.0,
+                link.1.unwrap_or(Value::Null)
+            )));
         };
         let os = Os::from_agent(&agent.os);
         if let Some(lease) = self.lease.as_mut() {
@@ -340,10 +395,11 @@ impl RealTarget {
             }
             self.facts.insert("sshd".into(), json!("off"));
         }
-        let pid = client.run(os.agent_pid())?.trim().to_string();
+        let place = self.agent();
+        let pid = client.run(&os.agent_pid(&place.label))?.trim().to_string();
         let listening = client.run(&format!("pid={pid}; {}", os.listening_of_pid()))?;
         let config = client.exec(
-            "cat ~/.config/relay-agent/config.json",
+            &format!("cat {}", place.config()),
             60.0,
             Duration::from_secs(300),
         )?;
@@ -372,9 +428,102 @@ impl RealTarget {
             .instance
             .release(&lease.name, release_body(&lease.record));
         self.note("released", json!({"name": lease.name, "answer": answer}));
-        self.released = Some((lease.credential.clone(), lease.agent_credential.clone()));
+        // A durable Mac's agent credential is the machine's and outlives
+        // the lease (RA-4); only a virtual machine's ends with it.
+        let agent = (self.kind != Some(TargetKind::DurableMac))
+            .then(|| lease.agent_credential.clone())
+            .flatten();
+        self.released = Some((lease.credential.clone(), agent));
         answer
     }
+
+    /// Whether the target is a durable Mac.
+    pub fn durable(&self) -> bool {
+        self.kind == Some(TargetKind::DurableMac)
+    }
+
+    /// Acquire a lease of the shortest TTL, 0.1 hours, beside the suite's
+    /// own, and return it with the end of its relay credentials as the
+    /// instance derives it: the end of the TTL plus the instance's grace
+    /// bounded by the TTL (RP-3, DC-1xx-DUR2-2).
+    pub fn short_lease(&mut self) -> Result<ShortLease, Stop> {
+        let grace = self.instance.machines()?["limits"]["grace_hours"]
+            .as_f64()
+            .ok_or("GET /machines names no limits.grace_hours")?;
+        let purpose = format!("{}-short", self.settings.purpose);
+        let answer = if self.durable() {
+            let name = self
+                .discovery
+                .as_ref()
+                .and_then(|d| d.health.get("instance"))
+                .and_then(Value::as_str)
+                .ok_or("discovery names no machine")?
+                .to_string();
+            self.instance
+                .acquire_durable_for(&name, &purpose, SHORT_TTL_HOURS)?
+        } else {
+            let image = self
+                .settings
+                .image
+                .clone()
+                .ok_or("a virtual machine target needs --image")?;
+            self.instance.acquire(&image, &purpose, SHORT_TTL_HOURS)?
+        };
+        let name = answer
+            .get("vm")
+            .or_else(|| answer.get("machine"))
+            .or_else(|| answer.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let short = ShortLease {
+            name,
+            release: release_body(&answer),
+            credential: answer["relay"]["credential"].as_str().map(str::to_string),
+            until: answer["ttl_expires_at"]
+                .as_f64()
+                .map(|ttl| credential_until(ttl, SHORT_TTL_HOURS, grace)),
+            link: answer.get("link").cloned().unwrap_or(Value::Null),
+        };
+        self.note(
+            "short lease acquired",
+            json!({"name": short.name, "until": short.until, "grace_hours": grace, "link": short.link}),
+        );
+        Ok(short)
+    }
+
+    /// Release a lease [`RealTarget::short_lease`] acquired; one that GC
+    /// reclaimed at its expiry is already gone.
+    pub fn release_short(&mut self, short: &ShortLease) {
+        let answer = self.instance.release(&short.name, short.release.clone());
+        self.note(
+            "short lease released",
+            json!({"name": short.name, "answer": format!("{answer:?}")}),
+        );
+    }
+}
+
+/// The TTL of AC-66's short lease, the shortest an acquisition takes.
+pub const SHORT_TTL_HOURS: f64 = 0.1;
+
+/// A lease of the shortest TTL, for AC-66's expired credential.
+pub struct ShortLease {
+    /// The machine's name.
+    pub name: String,
+    /// Its release request.
+    pub release: Value,
+    /// Its client credential, when the relay link serves it.
+    pub credential: Option<String>,
+    /// When its relay credentials end, in seconds since the epoch.
+    pub until: Option<f64>,
+    /// Its `link`.
+    pub link: Value,
+}
+
+/// The end of a lease's relay credentials: the end of its TTL plus the
+/// instance's grace, bounded by the TTL (RP-3).
+pub fn credential_until(ttl_expires_at: f64, ttl_hours: f64, grace_hours: f64) -> f64 {
+    ttl_expires_at + grace_hours.min(ttl_hours).max(0.0) * 3600.0
 }
 
 /// A release request: a durable lease names its `lease_id` (DM).
@@ -471,9 +620,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_durable_record_names_its_relay_agent() {
+        let durable = AgentPlace::of_record(&json!({"relay_agent": {
+            "label": "com.wezzard.relay-agent.0123456789ab",
+            "home": "/state dir/relay/agent",
+        }}));
+        assert_eq!(durable.label, "com.wezzard.relay-agent.0123456789ab");
+        assert_eq!(
+            durable.config(),
+            "'/state dir/relay/agent'/.config/relay-agent/config.json"
+        );
+        let guest = AgentPlace::of_record(&json!({"relay_agent": {"os": "linux"}}));
+        assert_eq!(guest, AgentPlace::guest());
+        assert_eq!(guest.config(), "~/.config/relay-agent/config.json");
+    }
+
+    #[test]
     fn a_release_names_the_lease_id_when_the_lease_has_one() {
         let body = release_body(&json!({"lease_id": "abc"}));
         assert_eq!(body["lease_id"], "abc");
         assert!(release_body(&json!({"vm": "x"})).get("lease_id").is_none());
+    }
+
+    #[test]
+    fn a_credential_ends_within_one_ttl_of_its_lease() {
+        // The grace is the instance's, bounded by the TTL.
+        assert_eq!(credential_until(1000.0, 0.1, 6.0), 1000.0 + 360.0);
+        assert_eq!(credential_until(1000.0, 24.0, 6.0), 1000.0 + 6.0 * 3600.0);
+        assert_eq!(credential_until(1000.0, 0.1, 0.0), 1000.0);
     }
 }

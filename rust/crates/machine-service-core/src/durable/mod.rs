@@ -18,6 +18,7 @@ pub mod inventory;
 pub mod launch;
 pub mod lease;
 pub mod process;
+pub mod relay_agent;
 pub mod session_env;
 
 pub use config::DurableConfig;
