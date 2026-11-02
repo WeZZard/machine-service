@@ -74,6 +74,8 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
                 call,
                 execution,
                 op,
+                // The broker names the lease itself (RA-5).
+                lease: _,
             }) => {
                 let in_use = call == 0
                     || uploads.contains_key(&call)
@@ -88,6 +90,18 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
                         &execution,
                         "bad_request",
                         "the call number is in use",
+                    );
+                    continue;
+                }
+                if let Op::Purge { .. } = op {
+                    // Only machine-service purges a lease's records, at
+                    // release (DC-173).
+                    refuse(
+                        &session,
+                        call,
+                        &execution,
+                        "forbidden",
+                        "purge is machine-service's own operation",
                     );
                     continue;
                 }

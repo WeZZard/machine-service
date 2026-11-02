@@ -72,6 +72,9 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
         expected_build,
         launcher,
         agent_wait: relay.settings.agent_wait,
+        // An instance told to wait less for its agents waits less for a
+        // purge too (MACHINE_SERVICE_RELAY_AGENT_WAIT).
+        purge_wait: machine_service_core::durable::lease::PURGE_WAIT.min(relay.settings.agent_wait),
     });
 }
 

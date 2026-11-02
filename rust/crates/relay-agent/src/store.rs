@@ -7,6 +7,11 @@
 //! written to the disk before the operation takes effect, so an agent that
 //! restarts finds every execution it started and runs none of them again.
 //!
+//! Each record names the lease its call belonged to. A record lives until
+//! the broker purges its lease at release (DC-173), and at most the safety
+//! bound that [`Store::prune`] applies, for a lease whose purge never came,
+//! such as after a crash of machine-service.
+//!
 //! A command's record also names who owns its processes (DC-139): its
 //! systemd scope, or its process group and the group leader's start time.
 //! An agent that opens the records of one that stopped while a command ran
@@ -44,6 +49,10 @@ pub struct Record {
     /// Who owns a command's processes, once it has some.
     #[serde(default)]
     pub owner: Option<Owner>,
+    /// The lease the call belonged to; `None` for a call the broker sent
+    /// without one, which only the safety bound removes.
+    #[serde(default)]
+    pub lease: Option<String>,
 }
 
 /// The records of one state directory, kept in memory and written through.
@@ -145,7 +154,7 @@ impl Store {
 
     /// Record that `execution` passed its commit point. This reaches the
     /// disk before the operation may take effect.
-    pub fn begin(&mut self, execution: &str, op: OpKind) -> io::Result<()> {
+    pub fn begin(&mut self, execution: &str, op: OpKind, lease: Option<&str>) -> io::Result<()> {
         let directory = self.directory(execution);
         DirBuilder::new()
             .mode(0o700)
@@ -165,6 +174,7 @@ impl Store {
             finished_ms: None,
             reported: false,
             owner: None,
+            lease: lease.map(str::to_string),
         };
         self.save(&record)?;
         self.records.insert(execution.to_string(), record);
@@ -195,6 +205,34 @@ impl Store {
                 self.records.insert(execution.to_string(), record);
             }
         }
+    }
+
+    /// Remove every completed record of `lease`, with its output, and
+    /// return how many records and bytes of output went. A record whose
+    /// directory cannot be removed stays and fails the purge, so a caller
+    /// never hears that a lease's output is gone while some of it is left.
+    pub fn purge(&mut self, lease: &str) -> io::Result<(u64, u64)> {
+        let doomed: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| record.outcome.is_some() && record.lease.as_deref() == Some(lease))
+            .map(|record| record.execution.clone())
+            .collect();
+        let mut removed = 0u64;
+        let mut bytes = 0u64;
+        for execution in doomed {
+            let directory = self.directory(&execution);
+            let size = fs::metadata(directory.join("output")).map_or(0, |meta| meta.len());
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            self.records.remove(&execution);
+            removed += 1;
+            bytes += size;
+        }
+        Ok((removed, bytes))
     }
 
     /// Drop completed records older than `retention`, with their output.

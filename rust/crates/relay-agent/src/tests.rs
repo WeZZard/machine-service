@@ -195,16 +195,19 @@ fn every_message_survives_encoding() {
         }),
         Message::Heartbeat,
         Message::Call(Call {
+            lease: None,
             call: 1,
             execution: "e".into(),
             op: exec("true"),
         }),
         Message::Call(Call {
+            lease: None,
             call: 2,
             execution: "e".into(),
             op: Op::Script { timeout_s: 1.5 },
         }),
         Message::Call(Call {
+            lease: None,
             call: 3,
             execution: "e".into(),
             op: Op::Write {
@@ -214,21 +217,25 @@ fn every_message_survives_encoding() {
             },
         }),
         Message::Call(Call {
+            lease: None,
             call: 4,
             execution: "e".into(),
             op: Op::Read { path: "p".into() },
         }),
         Message::Call(Call {
+            lease: None,
             call: 5,
             execution: "e".into(),
             op: Op::Cancel { target: "t".into() },
         }),
         Message::Call(Call {
+            lease: None,
             call: 6,
             execution: "e".into(),
             op: Op::Status,
         }),
         Message::Call(Call {
+            lease: None,
             call: 8,
             execution: "e".into(),
             op: Op::WriteTree {
@@ -237,9 +244,18 @@ fn every_message_survives_encoding() {
             },
         }),
         Message::Call(Call {
+            lease: None,
             call: 9,
             execution: "e".into(),
             op: Op::ReadTree { path: "p".into() },
+        }),
+        Message::Call(Call {
+            lease: Some("lease-1".into()),
+            call: 10,
+            execution: "e".into(),
+            op: Op::Purge {
+                lease: "lease-1".into(),
+            },
         }),
         Message::Chunk {
             call: u64::MAX,
@@ -305,6 +321,11 @@ fn every_message_survives_encoding() {
             running: vec!["a".into()],
             ownership: "scope".into(),
         }),
+        Outcome::Purged {
+            lease: "l".into(),
+            records: 2,
+            bytes: 7,
+        },
         Outcome::refused("checksum_mismatch", "m"),
         Outcome::Interrupted {
             message: "m".into(),
@@ -526,6 +547,7 @@ fn an_upload_that_does_not_match_its_end_never_runs_and_is_not_recorded() {
     let call = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "m1".into(),
             op: exec("touch ran"),
@@ -563,6 +585,7 @@ fn an_exec_without_its_end_never_runs() {
     let call = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "n1".into(),
             op: exec("touch ran"),
@@ -580,6 +603,7 @@ fn a_call_resent_before_its_end_supersedes_the_first() {
     let first = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call: first,
             execution: "r1".into(),
             op: exec("echo run >> runs"),
@@ -614,6 +638,7 @@ fn an_end_for_another_execution_never_commits_a_pending_call() {
     let call = rig.driver.next_call();
     let write = |execution: &str| {
         Message::Call(Call {
+            lease: None,
             call,
             execution: execution.into(),
             op: Op::Write {
@@ -681,6 +706,7 @@ fn a_call_number_in_use_is_refused() {
     let send = |driver: &Driver, execution: &str| {
         driver
             .send(&Message::Call(Call {
+                lease: None,
                 call,
                 execution: execution.into(),
                 op: exec("true"),
@@ -761,6 +787,7 @@ fn cancel_reports_completed_unknown_and_discarded_targets() {
     let call = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "waiting".into(),
             op: exec("touch ran"),
@@ -847,6 +874,7 @@ fn a_write_that_fails_its_check_or_loses_its_link_leaves_nothing() {
     };
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "w1".into(),
             op: op.clone(),
@@ -873,6 +901,7 @@ fn a_write_that_fails_its_check_or_loses_its_link_leaves_nothing() {
     let call = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "w2".into(),
             op,
@@ -1074,7 +1103,7 @@ fn a_record_left_running_by_a_crash_opens_as_interrupted() {
     let options = options(home.path());
     {
         let mut store = crate::store::Store::open(&options.state, options.retention).unwrap();
-        store.begin("crashed", OpKind::Exec).unwrap();
+        store.begin("crashed", OpKind::Exec, None).unwrap();
     }
     let agent = Agent::open(options).unwrap();
     assert!(matches!(
@@ -1084,6 +1113,178 @@ fn a_record_left_running_by_a_crash_opens_as_interrupted() {
             ..
         }
     ));
+}
+
+/// RA-5: a call without a lease leaves the field out on the wire, so a
+/// client written before DC-173 sends the same bytes, and a call with one
+/// carries it.
+#[test]
+fn a_call_names_its_lease_only_when_it_has_one() {
+    let call = |lease: Option<&str>| {
+        String::from_utf8(
+            Message::Call(Call {
+                call: 1,
+                execution: "e".into(),
+                op: Op::Status,
+                lease: lease.map(str::to_string),
+            })
+            .encode(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        call(None),
+        r#"{"call":{"call":1,"execution":"e","op":"status"}}"#
+    );
+    assert_eq!(
+        call(Some("l")),
+        r#"{"call":{"call":1,"execution":"e","op":"status","lease":"l"}}"#
+    );
+    let purge = Op::Purge { lease: "l".into() };
+    assert_eq!(
+        serde_json::to_string(&purge).unwrap(),
+        r#"{"purge":{"lease":"l"}}"#
+    );
+}
+
+fn purge(rig: &mut Rig, execution: &str, lease: &str) -> Outcome {
+    let answer = rig.run(
+        execution,
+        Op::Purge {
+            lease: lease.into(),
+        },
+        b"",
+    );
+    outcome(&answer).clone()
+}
+
+fn record_count(rig: &Rig) -> usize {
+    std::fs::read_dir(rig.path(".state/executions"))
+        .unwrap()
+        .count()
+}
+
+/// DC-173: a purge removes the records of its lease with their output, and
+/// only those; the purged IDs are unknown afterwards, and the purge keeps
+/// no record of its own.
+#[test]
+fn a_purge_removes_only_its_leases_records_and_their_output() {
+    let mut rig = Rig::new();
+    rig.driver.lease = Some("one".into());
+    rig.exec("one-a", "echo secret-one");
+    rig.run("one-b", Op::Status, b"");
+    rig.driver.lease = Some("two".into());
+    rig.exec("two-a", "echo two");
+    rig.driver.lease = None;
+    rig.exec("none-a", "echo none");
+    assert_eq!(record_count(&rig), 4);
+
+    rig.driver.lease = Some("one".into());
+    assert_eq!(
+        purge(&mut rig, "purge-1", "one"),
+        Outcome::Purged {
+            lease: "one".into(),
+            records: 2,
+            bytes: "secret-one\n".len() as u64,
+        }
+    );
+    assert_eq!(record_count(&rig), 2);
+    assert_eq!(rig.driver.query("one-a").unwrap(), ExecutionState::Unknown);
+    assert_eq!(
+        rig.driver.query("purge-1").unwrap(),
+        ExecutionState::Unknown
+    );
+    assert!(matches!(
+        rig.driver.query("two-a").unwrap(),
+        ExecutionState::Completed { .. }
+    ));
+    assert!(matches!(
+        rig.driver.query("none-a").unwrap(),
+        ExecutionState::Completed { .. }
+    ));
+    // Purging again finds nothing more, under the same ID or another.
+    for execution in ["purge-1", "purge-2"] {
+        assert!(matches!(
+            purge(&mut rig, execution, "one"),
+            Outcome::Purged { records: 0, .. }
+        ));
+    }
+    // The records stay purged across a restart of the agent.
+    rig.restart();
+    assert_eq!(rig.driver.query("one-a").unwrap(), ExecutionState::Unknown);
+    assert_eq!(record_count(&rig), 2);
+}
+
+/// DC-173: the agent takes a purge only as a call of the lease it purges,
+/// as the broker sends it, and refuses it while an operation of that lease
+/// runs.
+#[test]
+fn a_purge_is_refused_for_another_lease_and_while_the_lease_runs() {
+    let mut rig = Rig::new();
+    rig.driver.lease = Some("one".into());
+    rig.exec("kept", "true");
+    for caller in [None, Some("two")] {
+        rig.driver.lease = caller.map(str::to_string);
+        assert!(matches!(
+            purge(&mut rig, "p", "one"),
+            Outcome::Failed { ref code, committed: false, .. } if code == "forbidden"
+        ));
+    }
+    rig.driver.lease = Some("one".into());
+    let running = rig.driver.start("slow", exec("sleep 30"), b"").unwrap();
+    assert!(matches!(
+        wait_running(&mut rig.driver, "slow"),
+        ExecutionState::Running { .. }
+    ));
+    assert!(matches!(
+        purge(&mut rig, "p", "one"),
+        Outcome::Failed { ref code, committed: false, .. } if code == "busy"
+    ));
+    // Another lease's purge does not wait for this one.
+    rig.driver.lease = Some("two".into());
+    assert!(matches!(
+        purge(&mut rig, "p2", "two"),
+        Outcome::Purged { records: 0, .. }
+    ));
+    rig.driver.lease = Some("one".into());
+    rig.run(
+        "stop",
+        Op::Cancel {
+            target: "slow".into(),
+        },
+        b"",
+    );
+    rig.driver.finish(running).unwrap();
+    assert!(matches!(
+        purge(&mut rig, "p3", "one"),
+        Outcome::Purged { records: 3, .. }
+    ));
+}
+
+/// The safety bound outlasts any resend: the broker keeps its records for
+/// an hour and an agent session's grace is ten minutes (DC-1xx-PUR-2).
+#[test]
+fn the_safety_bound_outlasts_the_brokers_records_by_far() {
+    assert_eq!(
+        crate::agent::MAX_RETENTION,
+        Duration::from_secs(7 * 24 * 3600)
+    );
+    assert_eq!(
+        AgentOptions::from_environment().retention,
+        crate::agent::MAX_RETENTION
+    );
+}
+
+fn wait_running(driver: &mut Driver, execution: &str) -> ExecutionState {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = driver.query(execution).unwrap();
+        if !matches!(state, ExecutionState::Unknown) {
+            return state;
+        }
+        assert!(Instant::now() < deadline, "{execution} never started");
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -1236,6 +1437,7 @@ fn plan(rng: &mut Rng, index: usize) -> Planned {
 /// The messages of one call, with its upload split at random sizes.
 fn messages(rng: &mut Rng, call: u64, planned: &Planned) -> Vec<Message> {
     let mut messages = vec![Message::Call(Call {
+        lease: None,
         call,
         execution: planned.execution.clone(),
         op: planned.op.clone(),
@@ -1665,7 +1867,7 @@ fn dc139_a_restarted_agent_stops_only_groups_whose_start_time_matches() {
         let mut store =
             crate::store::Store::open(&home.path().join(".state"), Duration::from_secs(3600))
                 .unwrap();
-        store.begin("left-running", OpKind::Exec).unwrap();
+        store.begin("left-running", OpKind::Exec, None).unwrap();
         store
             .set_owner(
                 "left-running",
@@ -1675,7 +1877,7 @@ fn dc139_a_restarted_agent_stops_only_groups_whose_start_time_matches() {
                 },
             )
             .unwrap();
-        store.begin("id-reused", OpKind::Exec).unwrap();
+        store.begin("id-reused", OpKind::Exec, None).unwrap();
         store
             .set_owner(
                 "id-reused",
@@ -1849,6 +2051,7 @@ fn a_bad_folder_upload_never_lands_and_is_not_recorded() {
     let call = rig.driver.next_call();
     rig.driver
         .send(&Message::Call(Call {
+            lease: None,
             call,
             execution: "bad".into(),
             op: Op::WriteTree {

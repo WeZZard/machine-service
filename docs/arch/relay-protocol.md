@@ -80,6 +80,8 @@ The same rule, one key naming the variant or a bare string for a variant without
 | `query` | `{"query":{"call":<u64>,"execution":"<id>"}}` |
 | `heartbeat` | `"heartbeat"` (optional, ignored; the session's `ack` already keeps the link alive) |
 
+A client's `call` names no lease. On the agent's side of the broker, every `call` also carries `"lease":"<lease>"`, the lease the call belongs to, which the relay agent keeps in the call's record ([RP-14](#rp-14-records-belong-to-their-lease)): `{"call":{"call":<u64>,"execution":"<id>","op":<op>,"lease":"<lease>"}}`. The broker sets it itself and replaces any `lease` a client sends; a call without the field has no lease.
+
 ### Broker → client
 
 | Message | JSON |
@@ -107,12 +109,14 @@ The same rule, one key naming the variant or a bare string for a variant without
 | cancel | `{"cancel":{"target":"<execution ID>"}}` | no | `result` with `cancel` |
 | status | `"status"` | no | `result` with `status` |
 | restart | `"restart"` | no | `result` with `status`, the state before the restart |
+| purge | `{"purge":{"lease":"<lease>"}}` | no | `result` with `purged` ([RP-14](#rp-14-records-belong-to-their-lease)) |
 
 - exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group, and on Linux with its systemd scope, which also holds the processes that left the group, after `timeout_s` seconds, which must be positive.
 - write resolves `path` against the home folder; when `path` names a folder, the file is `name` inside it. The bytes go to a temporary sibling, are checked against the `end`, and are renamed into place. `mode` is an integer file mode, such as `420` for `0644`.
 - read resolves `path` against the home folder. A folder is refused with code `is_directory`; read it with read_tree.
 - write_tree and read_tree move a folder as one tar stream ([RP-13](#rp-13-folders)).
 - restart replaces the relay agent's process with the executable at its path, which may hold a new build (RA-6). It is taken only while no other operation runs or waits for its end, else refused with `busy`; an agent that cannot replace itself refuses it with `unsupported`. Its record keeps the answer, so a repeated ID never restarts twice. The agent's session ends and its next session says hello with the build now running. machine-service sends it; a client has no need to.
+- purge removes the relay agent's records of a lease, with the output they keep. Only machine-service sends it, at release; the broker refuses it from a client with `forbidden` ([RP-14](#rp-14-records-belong-to-their-lease)).
 - cancel kills the target's process group (and scope) when it runs, discards it when its upload has not ended, and has its own execution ID like any operation.
 
 ### Outcomes (`outcome`)
@@ -123,6 +127,7 @@ The same rule, one key naming the variant or a bare string for a variant without
 | written | `{"written":{"size":<u64>,"sha256":"<hex>"}}` |
 | read | `{"read":{"size":<u64>,"sha256":"<hex>"}}` |
 | cancel | `{"cancel":{"target":"<id>","found":"signalled" \| "discarded" \| "completed" \| "unknown"}}` |
+| purged | `{"purged":{"lease":"<lease>","records":<u64>,"bytes":<u64>}}`: the records removed and the bytes of output that went with them |
 | status | `{"status":{"protocol":1,"build":"<hex>","os":"macos" \| "linux","running":["<id>", …],"ownership":"<text>"}}`; `ownership` is `scope` when each command runs in its own systemd scope, else `process-group (<why not scopes>)` |
 | failed | `{"failed":{"code":"<code>","message":"<text>","committed":<bool>}}` |
 | interrupted | `{"interrupted":{"message":"<text>"}}`: the relay agent stopped while the operation ran; its effect is uncertain and it never runs again. A restarted agent stops what such a command left running, and the message says so |
@@ -131,7 +136,7 @@ The same rule, one key naming the variant or a bare string for a variant without
 
 | State | JSON |
 | --- | --- |
-| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status" \| "restart","outcome":<outcome>}}` |
+| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status" \| "restart","outcome":<outcome>}}`; a purge keeps no record, so its ID is never `completed` |
 | running | `{"running":{"op":"<op kind>"}}` |
 | unknown | `"unknown"` |
 
@@ -165,7 +170,7 @@ broker ← {"result":{"call":1,"execution":"7d3c…","replayed":false,"outcome":
 ## RP-7: Execution IDs, records and query
 
 - `execution` is the client's execution ID: 1 to 256 bytes, unique per operation the client means to happen once, within the lease. A random UUID is the usual choice. A repeated ID means "the same operation", never "do it again".
-- The broker records every execution ID it handed on, with its outcome once it has one, for at least 1 hour. The relay agent records it as well, on disk, for 24 hours.
+- The broker records every execution ID it handed on, with its outcome once it has one, for at least 1 hour. The relay agent records it as well, on disk, until the lease ends ([RP-14](#rp-14-records-belong-to-their-lease)). Within a lease, an ID is never forgotten sooner than 7 days after it completed.
 - A `call` with a known execution ID never runs again. The answer has `"replayed": true` and is:
   - for a completed exec or script: its whole output from the first byte, its `end` and its recorded `result`;
   - for a running one: its output so far, then the rest as it comes, then its `end` and `result`;
@@ -199,7 +204,9 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | `invalid_request` | agent | false | a bad execution ID or `timeout_s` |
 | `call_in_use`, `superseded`, `end_mismatch`, `cancelled` | agent | false | the agent refused the call before its commit point |
 | `stopping`, `record_failed` | agent | false | the agent cannot run it now; the broker sends a call refused with `stopping` again to the agent's next session instead of answering it |
-| `busy`, `unsupported` | agent | false | a restart was refused: an operation runs, or the agent cannot replace itself |
+| `forbidden` | broker or agent | false | a purge from a client, or one whose call does not belong to the lease it names ([RP-14](#rp-14-records-belong-to-their-lease)) |
+| `busy`, `unsupported` | agent | false | a restart was refused: an operation runs, or the agent cannot replace itself; or a purge was refused because an operation of the lease runs |
+| `purge_failed` | agent | true | some of the lease's records could not be removed; a purge may be sent again |
 | `not_found`, `is_directory`, `write_failed`, `read_failed` | agent | false before the end, true after | a file operation failed |
 | `not_a_directory`, `bad_archive`, `unsupported_entry` | agent | false | a folder operation was refused: the path is a file, the uploaded tar stream is not a folder of files and folders, or the folder to read holds a link or a device ([RP-13](#rp-13-folders)) |
 
@@ -246,7 +253,7 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | reconnect backoff | base 250 ms doubling to 5 s, uniform jitter in the upper half |
 | session grace | 10 min by default (`grace_ms`) |
 | broker record retention | at least 1 h |
-| relay agent record retention | 24 h |
+| relay agent record retention | until the lease's purge; at most 7 days after completion |
 
 ## RP-13: Folders
 
@@ -267,3 +274,13 @@ client → 0x01 00 00 00 00 00 00 00 05 <2,048 bytes: a 512-byte header for "a.t
 client → {"end":{"call":5,"execution":"9a1f…","size":2048,"sha256":"<SHA-256 of the 2,048 bytes>"}}
 broker ← {"result":{"call":5,"execution":"9a1f…","replayed":false,"outcome":{"written":{"size":2048,"sha256":"…"}}}}
 ```
+
+## RP-14: Records belong to their lease
+
+A relay agent's records, and the command output that they keep for a replay, belong to the lease whose call made them (DC-173).
+
+- **Tagging.** The broker names the lease on every call it hands to a relay agent (RP-4): a virtual machine's lease by its machine name, a durable machine's lease by its lease ID. The relay agent keeps the name in the call's record.
+- **Purge.** At release machine-service has the broker send the relay agent `purge` with the lease, as a call of that lease. The relay agent takes it only when the call's `lease` is the one it names, else `forbidden`; while an operation of the lease runs it answers `busy`, and the broker asks again. It then removes every record of the lease with its output and answers `purged` with the counts. A purge keeps no record of its own, so sending it again is safe and finds nothing more. The broker drops its own records of the lease when the agent confirms.
+- **Release.** A durable lease's release waits up to 60 seconds for the confirmation, or the instance's agent wait when that is shorter. A purge that is not confirmed fails the hygiene record's `relay-records` step with the reason, and the Mac is still freed ([DM-7](durable-machine.md#dm-7-release)). A lease none of whose calls reached the relay agent is skipped. A virtual machine's release sends no purge, because the records are deleted with the VM; its answer says so in `relay_records`.
+- **Safety bound.** A record whose purge never comes, such as after machine-service crashed during a release, is removed 7 days after it completed. A record without a lease, from a broker that named none, is removed only by this bound.
+- After a purge, `query` of a purged ID answers `unknown`, and a `call` with it runs as a new operation; the lease has ended, so no client of it is left to send one.

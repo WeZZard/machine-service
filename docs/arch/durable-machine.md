@@ -84,6 +84,7 @@ sequenceDiagram
 - `POST /machines/<name>/release` with `lease_id` ends the session. It preempts any running exec, push or pull, as for virtual machines.
 - Release then sends `SIGTERM` to every process group the lease started, waits 10 seconds, and sends `SIGKILL` to the groups that remain.
 - Release then runs the sweep of leftover processes ([HY-3](hygiene.md#hy-3-leftover-process-sweep)) and takes the inventory after the lease ([HY-4](hygiene.md#hy-4-inventory-before-and-after)).
+- After the sweep, release has the Mac's relay agent purge the lease's execution records, whose kept output may hold agent keys unredacted ([AK-5](agent-keys.md#ak-5-never-printed-logged-or-returned)), and waits up to 60 seconds for its confirmation. The hygiene record's `relay_records` says `purged` with the counts, or why the purge was skipped or failed; an unconfirmed purge is the failure of the step `relay-records` ([RP-14](relay-protocol.md#rp-14-records-belong-to-their-lease), DC-173).
 - Release removes the workspace, unless the request sets `keep_workspace: true`. A kept workspace is listed in the lease record and removed by GC after 7 days.
 - Release returns the hygiene record and keeps the lease record for 30 days, so a client can read what happened after the lease ended.
 - Release never reboots the Mac, logs a user out, uninstalls software or reverts a change outside the workspace. Those changes are recorded, not undone ([HY-1](hygiene.md#hy-1-best-effort-not-isolation)).

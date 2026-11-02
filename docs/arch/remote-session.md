@@ -26,7 +26,7 @@
 ## RS-3: Operations and execution IDs
 
 - Operations travel as relay messages in the envelope bodies ([RP-4](relay-protocol.md#rp-4-relay-messages)): `call {call, execution, op}` asks for one operation (`exec`, `script`, `write`, `read`, `cancel`, `status`), and `result {call, execution, replayed, outcome}` answers it. `execution` is the client's execution ID. Bytes travel in binary chunks, each prefixed with the byte `0x01` and the 8-byte call number, and end with the size and SHA-256 of all of them (DC-122).
-- The broker records every execution ID it has accepted, with the outcome when it has one, for at least 1 hour, and the relay agent records it for 24 hours (DC-121). A call with a recorded execution ID never runs again: the answer is the recorded outcome, or the call attaches to the operation still running ([RP-7](relay-protocol.md#rp-7-execution-ids-records-and-query)).
+- The broker records every execution ID it has accepted, with the outcome when it has one, for at least 1 hour, and the relay agent records it until its lease is purged at release (DC-121, DC-173). A call with a recorded execution ID never runs again: the answer is the recorded outcome, or the call attaches to the operation still running ([RP-7](relay-protocol.md#rp-7-execution-ids-records-and-query)).
 - `query {call, execution}` returns `completed` with the outcome, `running`, or `unknown`. The broker answers from its record, else asks the relay agent, so a query answers after a broker restart too. `unknown` means neither has a record; the client reports the operation as uncertain.
 
 ## RS-4: Heartbeat and dead-connection detection

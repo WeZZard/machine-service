@@ -499,7 +499,12 @@ fn m4_without_the_release_agent_exec_falls_back_to_the_session() {
         .as_str()
         .unwrap()
         .contains("no session"));
-    assert_eq!(lab.release_lease(&name, &lease).status, 200);
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200);
+    // DC-173: no call reached a relay agent, so there is nothing to purge.
+    let records = &released.body["hygiene"]["relay_records"];
+    assert_eq!(records["purged"], false, "{records}");
+    assert!(records["skipped"].as_str().unwrap().contains("no call"));
     drop(lab);
 
     // An agent that is not the release's build (DC-140).
@@ -519,4 +524,85 @@ fn m4_without_the_release_agent_exec_falls_back_to_the_session() {
     };
     assert!(reason.contains("not the installed release"), "{reason}");
     assert_eq!(lab.release_lease(&name, &lease).status, 200);
+}
+
+/// The relay agent's record of every execution of `lease`.
+fn agent_records(lab: &Lab) -> String {
+    tree_text(&lab.agent_home.join(".local/state/relay-agent/executions"))
+}
+
+fn relay_records_failure(hygiene: &Value) -> Option<String> {
+    hygiene["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|failure| failure["step"] == "relay-records")
+        .map(|failure| failure["reason"].as_str().unwrap().to_string())
+}
+
+/// DC-173, AK-5: the relay agent's records keep a command's output as the
+/// agent saw it, keys and all; release has the agent purge the lease's
+/// records, and completes only after the agent confirms.
+#[test]
+fn m4_release_purges_the_relay_agents_records_of_the_lease() {
+    let mut lab = Lab::new(relay_agent_bin());
+    let agent = lab.start_agent();
+    let (name, lease, _) = lab.acquire("default");
+    lab.wait_for_relay(&name, &lease);
+    let answer = lab.exec(
+        &name,
+        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY\"\n"}),
+    );
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body["link"], "relay");
+    assert_eq!(answer.body["output"], "key=[redacted]\n");
+    assert!(
+        agent_records(&lab).contains(CLAUDE_KEY),
+        "the agent's record keeps the output unredacted"
+    );
+
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+    let hygiene = &released.body["hygiene"];
+    let records = &hygiene["relay_records"];
+    assert_eq!(records["purged"], true, "{hygiene}");
+    assert!(records["records"].as_u64().unwrap() >= 2, "{records}");
+    assert!(records["bytes"].as_u64().unwrap() > 0, "{records}");
+    assert_eq!(relay_records_failure(hygiene), None, "{hygiene}");
+    assert!(!agent_records(&lab).contains(CLAUDE_KEY));
+    assert!(alive(agent), "a purge never ends the relay agent");
+
+    // The next lease's calls are its own; its release purges them too.
+    let (_, next, _) = lab.acquire("none");
+    lab.wait_for_relay(&name, &next);
+    let released = lab.release_lease(&name, &next);
+    assert_eq!(released.body["hygiene"]["relay_records"]["purged"], true);
+}
+
+/// DC-173: a release whose relay agent cannot confirm the purge still frees
+/// the Mac (HY-1), and its hygiene record fails the `relay-records` step
+/// with the reason; the agent's safety bound removes the records later.
+#[test]
+fn m4_release_records_a_purge_the_agent_cannot_confirm() {
+    let mut lab = Lab::new(relay_agent_bin());
+    lab.start_agent();
+    let (name, lease, _) = lab.acquire("none");
+    lab.wait_for_relay(&name, &lease);
+    lab.stop_agent();
+
+    let begun = Instant::now();
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+    assert!(begun.elapsed() < Duration::from_secs(60));
+    let hygiene = &released.body["hygiene"];
+    assert_eq!(hygiene["relay_records"]["purged"], false, "{hygiene}");
+    let reason = relay_records_failure(hygiene).expect("the step failed");
+    assert!(reason.contains("relay agent"), "{reason}");
+    assert!(
+        !agent_records(&lab).is_empty(),
+        "the records stay until the safety bound"
+    );
+    // The Mac is free again.
+    let (_, again, _) = lab.acquire("none");
+    assert_eq!(lab.release_lease(&name, &again).status, 200);
 }

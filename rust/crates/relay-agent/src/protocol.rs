@@ -167,6 +167,12 @@ pub struct Call {
     pub execution: String,
     /// The operation.
     pub op: Op,
+    /// The lease the call belongs to, which the agent keeps in the call's
+    /// record so that [`Op::Purge`] can remove a lease's records (RA-5).
+    /// The broker sets it on every call it hands on and replaces whatever a
+    /// client sent; a client omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 /// The operations of RA-5.
@@ -230,6 +236,15 @@ pub enum Op {
     /// Restart the agent onto the executable at its path, which may hold a
     /// new build (RA-6). Refused with `busy` while any operation runs.
     Restart,
+    /// Remove the records of every execution of `lease`, with the output
+    /// they keep for replay (DC-173). Only the broker sends it, and the
+    /// agent takes it only when the call itself belongs to `lease`. Refused
+    /// with `busy` while an operation of the lease runs. It keeps no record
+    /// of its own: a repeated purge finds nothing more to remove.
+    Purge {
+        /// The lease whose records go.
+        lease: String,
+    },
 }
 
 impl Op {
@@ -245,6 +260,7 @@ impl Op {
             Op::Cancel { .. } => OpKind::Cancel,
             Op::Status => OpKind::Status,
             Op::Restart => OpKind::Restart,
+            Op::Purge { .. } => OpKind::Purge,
         }
     }
 }
@@ -271,6 +287,8 @@ pub enum OpKind {
     Status,
     /// [`Op::Restart`].
     Restart,
+    /// [`Op::Purge`].
+    Purge,
 }
 
 impl OpKind {
@@ -341,6 +359,15 @@ pub enum Outcome {
     },
     /// The agent's state.
     Status(Status),
+    /// A lease's records were removed.
+    Purged {
+        /// The lease.
+        lease: String,
+        /// How many execution records were removed.
+        records: u64,
+        /// How many bytes of kept output went with them.
+        bytes: u64,
+    },
     /// The operation failed. When `committed` is false nothing ran, nothing
     /// was recorded, and the execution ID may be sent again.
     Failed {

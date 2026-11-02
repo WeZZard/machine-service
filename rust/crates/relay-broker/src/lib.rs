@@ -80,6 +80,16 @@ struct Links {
     /// Targets whose relay agent is restarting: no call is handed to them
     /// until the agent's next session registers.
     held: HashSet<Target>,
+    /// The lease each target's calls belong to, when machine-service bound
+    /// one, and whether any of its calls reached the agent.
+    leases: HashMap<Target, Binding>,
+}
+
+/// A lease bound to a target (DC-173).
+#[derive(Clone, Debug)]
+struct Binding {
+    lease: String,
+    handed: bool,
 }
 
 /// Called with every relay agent that registers.
@@ -370,6 +380,60 @@ impl Broker {
     pub fn query(&self, target: &Target, execution: &str) -> ExecutionState {
         self.inner.query(target, execution, &|_| {})
     }
+
+    /// Name `lease` as the lease of every later call to `target`, which the
+    /// relay agent keeps in the call's record. A durable machine binds each
+    /// lease as it starts; a virtual machine's calls name its machine name
+    /// without a binding. `handed` says whether calls of the lease may
+    /// already have reached the agent, as after a restart of the broker.
+    pub fn bind_lease(&self, target: &Target, lease: &str, handed: bool) {
+        self.inner.links().leases.insert(
+            target.clone(),
+            Binding {
+                lease: lease.to_string(),
+                handed,
+            },
+        );
+    }
+
+    /// Drop the binding of `lease` to `target`, if it is still bound.
+    pub fn unbind_lease(&self, target: &Target, lease: &str) {
+        let mut links = self.inner.links();
+        if links.leases.get(target).is_some_and(|b| b.lease == lease) {
+            links.leases.remove(target);
+        }
+    }
+
+    /// Whether a call of `lease`, bound to `target`, may have reached the
+    /// relay agent; true when the lease is not the bound one, since then
+    /// the broker cannot tell.
+    pub fn lease_reached_agent(&self, target: &Target, lease: &str) -> bool {
+        self.inner
+            .links()
+            .leases
+            .get(target)
+            .filter(|binding| binding.lease == lease)
+            .is_none_or(|binding| binding.handed)
+    }
+
+    /// Ask the relay agent of `target` to remove the records of `lease`,
+    /// with the output they keep (DC-173), and drop the broker's own
+    /// finished records of the lease. Waits up to `wait` for the agent to
+    /// have a session and for operations of the lease to end; returns the
+    /// number of records and bytes removed, or why the agent did not
+    /// confirm.
+    pub fn purge(&self, target: &Target, lease: &str, wait: Duration) -> Result<Purged, String> {
+        self.inner.purge(target, lease, wait)
+    }
+}
+
+/// What a purge removed (DC-173).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Purged {
+    /// Execution records the relay agent removed.
+    pub records: u64,
+    /// Bytes of kept output that went with them.
+    pub bytes: u64,
 }
 
 impl Inner {
@@ -553,6 +617,7 @@ impl Inner {
     ) -> std::sync::mpsc::Receiver<JobEvent> {
         let key = (target.clone(), execution.to_string());
         let max_kept = self.config.max_kept_output;
+        let lease = self.lease_of(target);
         let mut jobs = self.jobs();
         let now = Instant::now();
         jobs.retain(|_, job| !job.expired(now, self.config.retention));
@@ -567,6 +632,7 @@ impl Inner {
                 // replays it from its own record.
                 let replay = Arc::new(Job::new(
                     target.clone(),
+                    existing.lease.clone(),
                     execution.to_string(),
                     existing.op.clone(),
                     upload,
@@ -581,6 +647,7 @@ impl Inner {
             None => {
                 let job = Arc::new(Job::new(
                     target.clone(),
+                    lease,
                     execution.to_string(),
                     op,
                     upload,
@@ -637,6 +704,93 @@ impl Inner {
         }
     }
 
+    /// The lease of a new call to `target`: the bound one, else the
+    /// target's machine name.
+    pub(crate) fn lease_of(&self, target: &Target) -> String {
+        self.links()
+            .leases
+            .get(target)
+            .map_or_else(|| target.name().to_string(), |b| b.lease.clone())
+    }
+
+    /// Note that a call of `lease` was handed to the agent of `target`.
+    pub(crate) fn mark_handed(&self, target: &Target, lease: &str) {
+        if let Some(binding) = self.links().leases.get_mut(target) {
+            if binding.lease == lease {
+                binding.handed = true;
+            }
+        }
+    }
+
+    fn purge(&self, target: &Target, lease: &str, wait: Duration) -> Result<Purged, String> {
+        let deadline = Instant::now() + wait;
+        let mut last = String::from("the relay agent has no session");
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let conn = match self.wait_agent(target, left, &|_| {}) {
+                Ok(conn) => conn,
+                Err(Unavailable::Revoked(reason)) => {
+                    return Err(format!("the relay agent's lease was {reason}"))
+                }
+                Err(Unavailable::Timeout) => {
+                    return Err(format!("{last} within {}s", wait.as_secs()))
+                }
+            };
+            let execution = format!("purge:{}", guest_actions::hex(&rand::random::<[u8; 16]>()));
+            let events = conn.start(
+                &execution,
+                &Op::Purge {
+                    lease: lease.into(),
+                },
+                &[],
+                lease,
+            );
+            let answered = loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match events.recv_timeout(left) {
+                    Ok(AgentEvent::Result(result)) => break Some(result.outcome),
+                    Ok(AgentEvent::Lost) | Err(RecvTimeoutError::Disconnected) => break None,
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(format!(
+                            "the relay agent did not answer the purge within {}s",
+                            wait.as_secs()
+                        ))
+                    }
+                }
+            };
+            match answered {
+                Some(Outcome::Purged { records, bytes, .. }) => {
+                    self.jobs().retain(|(t, _), job| {
+                        !(t == target && job.lease == lease && job.is_done())
+                    });
+                    (self.log)(&format!(
+                        "relay: {target}: purged {records} records ({bytes} bytes) of lease {lease}"
+                    ));
+                    return Ok(Purged { records, bytes });
+                }
+                // An operation of the lease is still ending, or the agent is
+                // restarting: ask again until the bound.
+                Some(Outcome::Failed { code, message, .. })
+                    if code == "busy" || code == "stopping" =>
+                {
+                    last = format!("the relay agent stayed {code}: {message}");
+                }
+                Some(Outcome::Failed { code, message, .. }) => {
+                    return Err(format!(
+                        "the relay agent refused the purge: {code}: {message}"
+                    ))
+                }
+                Some(other) => return Err(format!("unexpected answer to a purge: {other:?}")),
+                None => last = "the relay agent's session ended during the purge".into(),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{last} within {}s", wait.as_secs()));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     fn restart_agent(
         &self,
         target: &Target,
@@ -678,7 +832,7 @@ impl Inner {
             "restart:{}",
             guest_actions::hex(&rand::random::<[u8; 16]>())
         );
-        let events = conn.start(&execution, &Op::Restart, &[]);
+        let events = conn.start(&execution, &Op::Restart, &[], &self.lease_of(target));
         let answered = loop {
             match events.recv_timeout(Duration::from_secs(30)) {
                 Ok(AgentEvent::Result(result)) => break Some(result.outcome),

@@ -35,8 +35,11 @@ use crate::store::Store;
 
 /// How often the agent sends a heartbeat; well under TC-3's 30 seconds.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
-/// How long the agent keeps a completed execution's record.
-pub const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest the agent keeps a completed execution's record. A record
+/// goes when the broker purges its lease at release (DC-173); this bound
+/// only removes the records of a lease whose purge never came, such as
+/// after a crash of machine-service (DC-1xx-PUR-2).
+pub const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The largest standard input or script a call may upload.
 pub const MAX_UPLOAD: usize = 256 << 20;
 /// The longest execution ID.
@@ -57,7 +60,7 @@ pub struct AgentOptions {
     pub build: String,
     /// The interval of heartbeats.
     pub heartbeat: Duration,
-    /// How long completed records are kept.
+    /// The longest a completed record is kept when no purge removes it.
     pub retention: Duration,
     /// How the operating system owns the agent's commands (DC-139).
     pub ownership: Ownership,
@@ -69,7 +72,7 @@ pub struct AgentOptions {
 impl AgentOptions {
     /// Options from the process environment: `$SHELL`, `$HOME`, the state
     /// directory `~/.local/state/relay-agent`, the hash of the running
-    /// executable, [`HEARTBEAT`], [`RETENTION`], and the ownership this
+    /// executable, [`HEARTBEAT`], [`MAX_RETENTION`], and the ownership this
     /// machine supports ([`Ownership::detect`]).
     pub fn from_environment() -> AgentOptions {
         let home = guest_actions::user_home();
@@ -79,7 +82,7 @@ impl AgentOptions {
             home,
             build: guest_actions::executable_sha256(),
             heartbeat: HEARTBEAT,
-            retention: RETENTION,
+            retention: MAX_RETENTION,
             ownership: Ownership::detect(),
             executable: std::env::current_exe().unwrap_or_default(),
         }
@@ -175,6 +178,7 @@ impl State {
 struct Pending {
     execution: String,
     op: Op,
+    lease: Option<String>,
     upload: Upload,
 }
 
@@ -470,6 +474,7 @@ impl Session {
             call,
             execution,
             op,
+            lease,
         }: Call,
     ) {
         if execution.is_empty() || execution.len() > MAX_EXECUTION_ID {
@@ -548,8 +553,9 @@ impl Session {
             | Op::ReadTree { .. }
             | Op::Cancel { .. }
             | Op::Status
-            | Op::Restart => {
-                return self.commit(call, execution, op, Committed::Nothing);
+            | Op::Restart
+            | Op::Purge { .. } => {
+                return self.commit(call, execution, op, lease, Committed::Nothing);
             }
         };
         self.pending.insert(
@@ -557,6 +563,7 @@ impl Session {
             Pending {
                 execution,
                 op,
+                lease,
                 upload,
             },
         );
@@ -596,6 +603,7 @@ impl Session {
         let Some(Pending {
             execution,
             op,
+            lease,
             upload,
         }) = self.pending.remove(&call)
         else {
@@ -631,11 +639,18 @@ impl Session {
                 Err(error) => return self.refuse(call, &execution, error.code, error.message),
             },
         };
-        self.commit(call, execution, op, committed);
+        self.commit(call, execution, op, lease, committed);
     }
 
     /// Pass the commit point: record the execution, then start it.
-    fn commit(&mut self, call: u64, execution: String, op: Op, committed: Committed) {
+    fn commit(
+        &mut self,
+        call: u64,
+        execution: String,
+        op: Op,
+        lease: Option<String>,
+        committed: Committed,
+    ) {
         let inner = Arc::clone(&self.inner);
         let mut state = inner.lock();
         if let Some(known) = state.known(&execution) {
@@ -647,9 +662,14 @@ impl Session {
             return self.refuse(call, &execution, "stopping", "the relay agent is stopping");
         }
         if let Op::Restart = op {
-            return self.restart(state, call, execution);
+            return self.restart(state, call, execution, lease);
         }
-        if let Err(error) = state.store.begin(&execution, op.kind()) {
+        if let Op::Purge { lease: purged } = op {
+            let outcome = purge(&mut state, &purged, lease.as_deref());
+            drop(state);
+            return send_result(&inner, &*self.link, call, &execution, false, outcome);
+        }
+        if let Err(error) = state.store.begin(&execution, op.kind(), lease.as_deref()) {
             drop(state);
             return self.refuse(
                 call,
@@ -742,7 +762,13 @@ impl Session {
     /// replaced; otherwise it is refused with `busy` and not recorded. Its
     /// record holds the status before the restart, so the agent that
     /// starts answers a repeated ID from it and never restarts twice.
-    fn restart(&mut self, mut state: MutexGuard<'_, State>, call: u64, execution: String) {
+    fn restart(
+        &mut self,
+        mut state: MutexGuard<'_, State>,
+        call: u64,
+        execution: String,
+        lease: Option<String>,
+    ) {
         let inner = Arc::clone(&self.inner);
         let Some(restart) = inner.restart.lock().unwrap().clone() else {
             drop(state);
@@ -767,7 +793,7 @@ impl Session {
         let outcome = Outcome::Status(inner.status(&state));
         let recorded = state
             .store
-            .begin(&execution, OpKind::Restart)
+            .begin(&execution, OpKind::Restart, lease.as_deref())
             .and_then(|()| state.store.complete(&execution, outcome.clone()));
         if let Err(error) = recorded {
             drop(state);
@@ -994,6 +1020,45 @@ impl Session {
             }
             active.lock().unwrap().remove(&call);
         });
+    }
+}
+
+/// Remove the records of `lease` (DC-173), when the call that asks belongs
+/// to that lease and none of the lease's operations still runs. The purge
+/// keeps no record: purging again finds nothing more.
+fn purge(state: &mut State, lease: &str, caller: Option<&str>) -> Outcome {
+    if caller != Some(lease) {
+        return Outcome::refused(
+            "forbidden",
+            "a purge must belong to the lease whose records it removes",
+        );
+    }
+    let running = state
+        .live
+        .keys()
+        .filter(|execution| {
+            state
+                .store
+                .get(execution)
+                .is_some_and(|record| record.lease.as_deref() == Some(lease))
+        })
+        .count();
+    if running > 0 {
+        return Outcome::refused(
+            "busy",
+            format!("{running} operations of the lease still run; purge when none does"),
+        );
+    }
+    match state.store.purge(lease) {
+        Ok((records, bytes)) => Outcome::Purged {
+            lease: lease.to_string(),
+            records,
+            bytes,
+        },
+        Err(error) => Outcome::failed(
+            "purge_failed",
+            format!("the lease's records could not all be removed: {error}"),
+        ),
     }
 }
 

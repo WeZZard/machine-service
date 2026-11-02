@@ -383,6 +383,7 @@ fn uploads_are_checked_and_files_round_trip() {
     // An upload that does not match its end is refused before it is handed on.
     client.send(&relay_agent::protocol::Message::Call(
         relay_agent::protocol::Call {
+            lease: None,
             call: 4,
             execution: "bad".into(),
             op: write,
@@ -651,4 +652,89 @@ fn a_restart_that_cannot_happen_releases_the_hold() {
     let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
     client.call(1, "after", exec("echo after"), b"");
     assert_eq!(client.wait(1, WAIT).bytes, b"after\n");
+}
+
+/// DC-173: the broker names a bound lease on every call it hands on, and a
+/// purge removes that lease's records from the relay agent and from the
+/// broker, leaving the next lease's records alone.
+#[test]
+fn a_purge_removes_one_leases_records_from_the_agent_and_the_broker() {
+    let h = Harness::start(Options::default());
+    let target = Target::Durable("mac".into());
+    let credential = h.broker.issue(&target, Role::Agent, None);
+    let agent = TestAgent::start(&h.url("ws"), &credential, None);
+    assert!(h.broker.wait_for_agent(&target, WAIT).is_some());
+    let run = |execution: &str| {
+        h.broker
+            .run(&target, execution, exec("echo out"), Vec::new(), WAIT)
+            .unwrap()
+    };
+
+    h.broker.bind_lease(&target, "lease-1", false);
+    assert!(!h.broker.lease_reached_agent(&target, "lease-1"));
+    assert_eq!(run("first").bytes, b"out\n");
+    assert!(h.broker.lease_reached_agent(&target, "lease-1"));
+    h.broker.bind_lease(&target, "lease-2", false);
+    assert_eq!(run("second").bytes, b"out\n");
+
+    let purged = h.broker.purge(&target, "lease-1", WAIT).unwrap();
+    assert_eq!(
+        purged,
+        relay_broker::Purged {
+            records: 1,
+            bytes: 4
+        }
+    );
+    // Neither the broker nor the agent knows the purged ID any more.
+    assert_eq!(h.broker.query(&target, "first"), ExecutionState::Unknown);
+    assert_eq!(agent.agent.query("first"), ExecutionState::Unknown);
+    assert!(matches!(
+        agent.agent.query("second"),
+        ExecutionState::Completed { .. }
+    ));
+    assert!(h.logged("purged 1 records (4 bytes) of lease lease-1"));
+}
+
+/// DC-173: a client never purges; only machine-service does, at release.
+#[test]
+fn a_client_cannot_purge() {
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let _agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    client.call(
+        1,
+        "p",
+        Op::Purge {
+            lease: "vm-a".into(),
+        },
+        b"",
+    );
+    let answer = client.wait(1, WAIT);
+    assert_eq!(
+        failed_code(&answer.result.unwrap().outcome),
+        ("forbidden", false)
+    );
+}
+
+/// DC-173: without an agent that answers, a purge fails within its bound
+/// and says why, and a revoked lease's purge fails at once.
+#[test]
+fn a_purge_the_agent_cannot_confirm_fails_within_its_bound() {
+    let h = Harness::start(Options::default());
+    let target = Target::Durable("mac".into());
+    h.broker.issue(&target, Role::Agent, None);
+    h.broker.bind_lease(&target, "lease-1", true);
+    let begun = std::time::Instant::now();
+    let refused = h
+        .broker
+        .purge(&target, "lease-1", Duration::from_millis(500))
+        .unwrap_err();
+    assert!(refused.contains("no session"), "{refused}");
+    assert!(begun.elapsed() < Duration::from_secs(5));
+
+    let a = lease(&h.broker, "vm-a");
+    h.broker.revoke(&a.target, "released");
+    let refused = h.broker.purge(&a.target, "vm-a", WAIT).unwrap_err();
+    assert!(refused.contains("released"), "{refused}");
 }

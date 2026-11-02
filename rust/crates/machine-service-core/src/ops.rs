@@ -1088,7 +1088,15 @@ the next GC pass retries"
             Option::<fn(&Map<String, Value>)>::None,
         )?;
         self.consoles.forget(vm);
-        Ok(serde_json::json!({"vm": vm, "released": true, "reason": reason}))
+        let mut answer = serde_json::json!({"vm": vm, "released": true, "reason": reason});
+        // A VM's relay agent keeps its records inside the clone, so they
+        // went with it; release asks for no purge (DC-173).
+        if record_before.get("link").and_then(Value::as_str) == Some(crate::relay::LINK_RELAY) {
+            let skipped = "the relay agent's records were deleted with the VM";
+            self.log(&format!("{vm}: relay records not purged: {skipped}"));
+            answer["relay_records"] = serde_json::json!({"purged": false, "skipped": skipped});
+        }
+        Ok(answer)
     }
 
     /// Renew a lease TTL and clear the grace warning.

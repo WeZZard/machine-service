@@ -70,6 +70,8 @@ struct State {
 
 pub(crate) struct Job {
     pub target: Target,
+    /// The lease the call belongs to, which the agent's record keeps.
+    pub lease: String,
     pub execution: String,
     pub op: Op,
     /// A replay for one late caller, kept out of the records.
@@ -85,6 +87,7 @@ fn send_all(subscribers: &mut Vec<Subscriber>, event: &JobEvent, bytes_only: boo
 impl Job {
     pub fn new(
         target: Target,
+        lease: String,
         execution: String,
         op: Op,
         upload: Vec<u8>,
@@ -93,6 +96,7 @@ impl Job {
     ) -> Job {
         Job {
             target,
+            lease,
             execution,
             op,
             transient,
@@ -311,7 +315,8 @@ the outcome is uncertain: query it later",
             }
         };
         let (handed_before, upload) = job.hand_on();
-        let events = conn.start(&job.execution, &job.op, &upload);
+        inner.mark_handed(&job.target, &job.lease);
+        let events = conn.start(&job.execution, &job.op, &upload, &job.lease);
         drop(upload);
         let mut seen = 0u64;
         let result = loop {

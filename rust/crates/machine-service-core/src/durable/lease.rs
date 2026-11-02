@@ -35,7 +35,7 @@ use super::session_env::{self, SessionEnv, WorkspacePaths};
 use crate::config::{log_to_file, unix_now};
 
 mod relay;
-pub use relay::{DurableRelay, LINK_IN_SESSION, LINK_RELAY};
+pub use relay::{DurableRelay, LINK_IN_SESSION, LINK_RELAY, PURGE_WAIT};
 
 /// Fields a durable acquisition refuses, because none can be applied to a
 /// running Mac (DM-3).
@@ -578,6 +578,9 @@ impl DurableMachine {
             }
         }
         drop(current_name);
+        // The relay agent's records of this lease's calls name it, so
+        // release can purge them (DC-173).
+        self.bind_relay_lease(&lease_id, false);
         self.log(&format!(
             "durable acquire {} for purpose {purpose} (lease {lease_id}, ttl {ttl}h)",
             self.name()
@@ -1178,6 +1181,14 @@ impl DurableMachine {
             }
         }
 
+        // 2b. The relay agent's records of the lease, with the command
+        // output they keep, which may hold agent keys (DC-173, AK-5). Its
+        // commands were stopped above, so none of them still runs.
+        let (relay_records, unconfirmed) = self.purge_relay_records(&lease_id);
+        if let Some(reason) = unconfirmed {
+            failures.push(json!({"step": "relay-records", "reason": reason}));
+        }
+
         // 3. The expensive facts and the inventory after (MM-4, HY-4).
         let login = match self.login_environment() {
             Ok(login) => login,
@@ -1256,6 +1267,7 @@ impl DurableMachine {
             },
             "changes": changes,
             "workspace": workspace_report,
+            "relay_records": relay_records,
             "ci_busy_intervals": ci["intervals"],
             "ci_sampling": {"interval_s": ci["interval_s"], "samples": ci["samples"]},
             "failures": failures,

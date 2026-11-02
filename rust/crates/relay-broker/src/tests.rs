@@ -10,6 +10,7 @@ use crate::job::{Job, JobEvent};
 fn exec_job() -> Job {
     Job::new(
         Target::Lease("vm".into()),
+        "vm".into(),
         "e".into(),
         Op::Exec {
             command: "true".into(),

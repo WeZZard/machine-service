@@ -45,7 +45,17 @@ pub struct DurableRelay {
     pub launcher: PathBuf,
     /// How long a call waits for an agent without a session (RP-8).
     pub agent_wait: Duration,
+    /// How long release waits for the agent to confirm the purge of the
+    /// lease's records (DC-173): [`PURGE_WAIT`], or the agent wait when
+    /// that is shorter.
+    pub purge_wait: Duration,
 }
+
+/// How long a durable release waits for the relay agent to confirm that
+/// the lease's records are gone: long enough for an agent to dial again
+/// after a lost connection (its backoff stops at 5 s) and for the lease's
+/// stopped commands to record their end (DC-1xx-PUR-3).
+pub const PURGE_WAIT: Duration = Duration::from_secs(60);
 
 /// One relay call's events, gathered as they come.
 struct Call {
@@ -95,9 +105,64 @@ fn failure(outcome: &Outcome) -> String {
 }
 
 impl DurableMachine {
-    /// Attach this instance's broker, once (M4).
+    /// Attach this instance's broker, once (M4). A lease that is current
+    /// across a restart is bound again; its calls may have reached the
+    /// agent before the restart, so its release purges (DM-8, DC-173).
     pub fn attach_relay(&self, relay: DurableRelay) {
         let _ = self.relay.set(relay);
+        if let Some(record) = self.current_record() {
+            if let Some(lease_id) = record["lease_id"].as_str() {
+                if record["state"] != "released" {
+                    self.bind_relay_lease(lease_id, true);
+                }
+            }
+        }
+    }
+
+    /// Name `lease_id` as the lease of every later relay call to this Mac.
+    pub(super) fn bind_relay_lease(&self, lease_id: &str, handed: bool) {
+        if let Some(relay) = self.relay.get() {
+            relay.broker.bind_lease(&relay.target, lease_id, handed);
+        }
+    }
+
+    /// Ask the relay agent to remove the lease's execution records, with
+    /// the output they keep (DC-173). Returns the hygiene record's
+    /// `relay_records` and, when the agent did not confirm, why: that fails
+    /// the release's `relay-records` step, and the agent's safety bound
+    /// removes the records later (RA-5).
+    pub(super) fn purge_relay_records(&self, lease_id: &str) -> (Value, Option<String>) {
+        let Some(relay) = self.relay.get() else {
+            return (
+                json!({"purged": false, "skipped": "this instance runs no broker, so no call of the lease went through the relay agent"}),
+                None,
+            );
+        };
+        let skipped = !relay.broker.lease_reached_agent(&relay.target, lease_id);
+        let answer = if skipped {
+            (
+                json!({"purged": false, "skipped": "no call of the lease reached the relay agent"}),
+                None,
+            )
+        } else {
+            match relay
+                .broker
+                .purge(&relay.target, lease_id, relay.purge_wait)
+            {
+                Ok(purged) => (
+                    json!({"purged": true, "records": purged.records, "bytes": purged.bytes}),
+                    None,
+                ),
+                Err(reason) => {
+                    self.log(&format!(
+                        "WARN: durable lease {lease_id}: the relay agent's records were not purged: {reason}"
+                    ));
+                    (json!({"purged": false, "reason": reason}), Some(reason))
+                }
+            }
+        };
+        relay.broker.unbind_lease(&relay.target, lease_id);
+        answer
     }
 
     /// The relay link for the next call, or why the call runs in the

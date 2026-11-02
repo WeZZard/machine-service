@@ -433,6 +433,12 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
     // Release revokes the credentials at once (RP-10).
     let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
     assert_eq!(released.status, 200, "{}", released.body);
+    // DC-173: the VM's records went with the VM; release says so.
+    assert_eq!(released.body["relay_records"]["purged"], false);
+    assert!(released.body["relay_records"]["skipped"]
+        .as_str()
+        .unwrap()
+        .contains("deleted with the VM"));
     assert!(client.wait_end(WAIT));
     assert_eq!(client.revoked.lock().unwrap().as_deref(), Some("released"));
     let mut refused = client_config(&url, &credential);

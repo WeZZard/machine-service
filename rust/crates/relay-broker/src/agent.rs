@@ -80,15 +80,23 @@ impl AgentConn {
         self.session.send(message.encode()).is_ok()
     }
 
-    /// Send one call with its upload. Events for it arrive on the returned
-    /// receiver, which ends with a result or [`AgentEvent::Lost`].
-    pub fn start(&self, execution: &str, op: &Op, upload: &[u8]) -> Receiver<AgentEvent> {
+    /// Send one call of `lease` with its upload. Events for it arrive on
+    /// the returned receiver, which ends with a result or
+    /// [`AgentEvent::Lost`].
+    pub fn start(
+        &self,
+        execution: &str,
+        op: &Op,
+        upload: &[u8],
+        lease: &str,
+    ) -> Receiver<AgentEvent> {
         let (call, rx) = self.route();
         let uploads = op.kind().uploads();
         let mut sent = self.send(&Message::Call(Call {
             call,
             execution: execution.to_string(),
             op: op.clone(),
+            lease: Some(lease.to_string()),
         }));
         if uploads {
             for data in upload.chunks(MAX_CHUNK) {

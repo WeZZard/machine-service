@@ -285,6 +285,7 @@ impl TestClient {
     pub fn call(&self, call: u64, execution: &str, op: Op, upload: &[u8]) {
         let uploads = op.kind().uploads();
         self.send(&Message::Call(relay_agent::protocol::Call {
+            lease: None,
             call,
             execution: execution.into(),
             op,

@@ -42,6 +42,8 @@ pub struct Driver {
     /// Hellos received after the first: an agent that replaced itself on
     /// the same link (`relay-agent stdio` after a restart).
     pub restarts: u64,
+    /// The lease every call names, as the broker sets it (RA-5).
+    pub lease: Option<String>,
 }
 
 impl Driver {
@@ -67,6 +69,7 @@ impl Driver {
             queries: HashMap::new(),
             heartbeats: 0,
             restarts: 0,
+            lease: None,
         })
     }
 
@@ -101,6 +104,7 @@ impl Driver {
             call,
             execution: execution.to_string(),
             op,
+            lease: self.lease.clone(),
         }))?;
         if uploads {
             for data in upload.chunks(MAX_CHUNK) {
