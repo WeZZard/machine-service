@@ -943,6 +943,7 @@ dependencies = [
 name = "relay-acceptance"
 version = "0.2.0-rc.3"
 dependencies = [
+ "byte-transfer",
  "network-rig",
  "rand",
  "relay-agent",

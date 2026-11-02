@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::link::{Link, LinkError};
-use crate::protocol::{Call, CallResult, Digest, ExecutionState, Hello, Message, Op, MAX_CHUNK};
+use crate::protocol::{
+    Call, CallResult, Digest, ExecutionState, Hello, Message, Op, Ready, MAX_CHUNK,
+};
 
 /// Everything the agent sent for one call.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -18,6 +20,8 @@ pub struct Answer {
     pub end: Option<Digest>,
     /// The result.
     pub result: Option<CallResult>,
+    /// Every committed offset the agent reported for the call (protocol 2).
+    pub progress: Vec<u64>,
 }
 
 impl Answer {
@@ -95,32 +99,93 @@ impl Driver {
         self.link.send(message.encode())
     }
 
+    /// Speak `protocol` on this link, as a broker's `ready` says.
+    pub fn ready(&self, protocol: u32) -> Result<(), LinkError> {
+        self.send(&Message::Ready(Ready {
+            protocol,
+            lease: String::new(),
+            agent: None,
+        }))
+    }
+
     /// Send a call, and for an operation that uploads, `upload` in chunks
     /// and its end. Returns the call's number.
     pub fn start(&mut self, execution: &str, op: Op, upload: &[u8]) -> Result<u64, LinkError> {
-        let call = self.next_call();
         let uploads = op.kind().uploads();
+        let call = self.call(execution, op, false, 0)?;
+        if uploads {
+            self.chunks(call, upload)?;
+            self.end(call, execution, upload)?;
+        }
+        Ok(call)
+    }
+
+    /// Send only a call: `resume` continues the upload the agent holds, and
+    /// `offset` starts the answer's stream at that byte.
+    pub fn call(
+        &mut self,
+        execution: &str,
+        op: Op,
+        resume: bool,
+        offset: u64,
+    ) -> Result<u64, LinkError> {
+        let call = self.next_call();
         self.send(&Message::Call(Call {
             call,
             execution: execution.to_string(),
             op,
             lease: self.lease.clone(),
+            resume,
+            offset,
         }))?;
-        if uploads {
-            for data in upload.chunks(MAX_CHUNK) {
-                self.send(&Message::Chunk {
-                    call,
-                    data: data.to_vec(),
-                })?;
-            }
-            self.send(&Message::End {
+        Ok(call)
+    }
+
+    /// Send `bytes` as chunks of `call`.
+    pub fn chunks(&self, call: u64, bytes: &[u8]) -> Result<(), LinkError> {
+        for data in bytes.chunks(MAX_CHUNK) {
+            self.send(&Message::Chunk {
                 call,
-                execution: execution.to_string(),
-                size: upload.len() as u64,
-                sha256: guest_actions::sha256_hex(upload),
+                data: data.to_vec(),
             })?;
         }
-        Ok(call)
+        Ok(())
+    }
+
+    /// Send the end of `call`'s upload, naming the size and SHA-256 of
+    /// `whole`, the whole stream.
+    pub fn end(&self, call: u64, execution: &str, whole: &[u8]) -> Result<(), LinkError> {
+        self.send(&Message::End {
+            call,
+            execution: execution.to_string(),
+            size: whole.len() as u64,
+            sha256: guest_actions::sha256_hex(whole),
+        })
+    }
+
+    /// Acknowledge `committed` bytes of `call`'s stream (protocol 2).
+    pub fn ack(&self, call: u64, execution: &str, committed: u64) -> Result<(), LinkError> {
+        self.send(&Message::Progress {
+            call,
+            execution: execution.to_string(),
+            committed,
+        })
+    }
+
+    /// Wait until the agent reported progress for `call`, and return the
+    /// latest offset, or the result when the call ended first.
+    pub fn first_progress(&mut self, call: u64) -> Result<Result<u64, CallResult>, LinkError> {
+        loop {
+            if let Some(answer) = self.answers.get(&call) {
+                if let Some(result) = &answer.result {
+                    return Ok(Err(result.clone()));
+                }
+                if let Some(committed) = answer.progress.last() {
+                    return Ok(Ok(*committed));
+                }
+            }
+            self.pump()?;
+        }
     }
 
     /// What has arrived for `call` so far.
@@ -185,6 +250,14 @@ impl Driver {
             Message::QueryResult { call, state, .. } => {
                 self.queries.insert(call, state);
             }
+            Message::Progress {
+                call, committed, ..
+            } => self
+                .answers
+                .entry(call)
+                .or_default()
+                .progress
+                .push(committed),
             Message::Heartbeat => self.heartbeats += 1,
             Message::Hello(hello) => {
                 self.hello = hello;

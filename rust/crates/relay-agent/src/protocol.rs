@@ -12,12 +12,29 @@
 //! command's output streams back as chunks and ends with its own
 //! [`Message::End`] before the [`Message::Result`]; a read streams the
 //! file's bytes the same way.
+//!
+//! Protocol 2 makes every stream resumable (`docs/arch/relay-protocol.md`,
+//! RP-15). An upload is a stream into the agent's spool for its execution
+//! ID: the agent reports the bytes it holds with [`Message::Progress`], a
+//! sender keeps at most [`UPLOAD_WINDOW`] bytes beyond them, and after any
+//! loss it sends the call again with `resume`, takes the agent's committed
+//! offset from the first progress, and continues from there. A stream the
+//! agent sends back is acknowledged with progress the same way, and a call's
+//! `offset` starts its answer at any byte. The SHA-256 of the whole stream
+//! in the end, and the rename at the commit point, are unchanged.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The version of this protocol, announced in [`Hello`].
-pub const PROTOCOL: u32 = 1;
+/// The version of this protocol, announced in [`Hello`] and [`Ready`].
+/// Each side speaks the lower of its own and its peer's version.
+pub const PROTOCOL: u32 = 2;
+/// The most bytes of one stream a sender keeps beyond the receiver's last
+/// [`Message::Progress`] (protocol 2). It bounds what a stream holds in the
+/// broker, whatever the stream's size.
+pub const UPLOAD_WINDOW: u64 = 32 << 20;
+/// How often a receiver reports progress: at least every this many bytes.
+pub const PROGRESS_STEP: u64 = 4 << 20;
 /// The largest message a link must carry (TC-8).
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// The most data a chunk carries. It leaves room under [`MAX_MESSAGE`] for
@@ -89,6 +106,19 @@ pub enum Message {
     Revoked {
         /// `released` or `expired`.
         reason: String,
+    },
+    /// Either way, protocol 2: how many bytes of a call's stream the
+    /// receiver holds. The agent reports an upload's committed offset, first
+    /// when it takes the call and then at least every [`PROGRESS_STEP`]
+    /// bytes; the broker acknowledges what it passed on of the agent's own
+    /// stream. A sender keeps at most [`UPLOAD_WINDOW`] bytes beyond it.
+    Progress {
+        /// The call whose stream it counts.
+        call: u64,
+        /// The call's execution ID.
+        execution: String,
+        /// Bytes of the stream from its first byte.
+        committed: u64,
     },
 }
 
@@ -173,6 +203,21 @@ pub struct Call {
     /// client sent; a client omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<String>,
+    /// Protocol 2, for an upload: continue the upload the agent holds for
+    /// this execution ID instead of starting it again. The agent answers
+    /// with [`Message::Progress`] naming its committed offset, and the
+    /// chunks that follow start there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
+    /// Protocol 2, for a call whose answer is a stream (a read, a folder
+    /// read, or a command's output): the first byte of the stream to send.
+    /// The end still names the size and SHA-256 of the whole stream.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The operations of RA-5.

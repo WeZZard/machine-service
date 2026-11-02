@@ -10,14 +10,15 @@
 //! release gate is let go, so release stops it and the sweep finds what it
 //! left exactly as for an in-session command (DM-7, HY-3).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use relay_agent::protocol::{Op, Outcome};
-use relay_broker::{Broker, JobEvent, Purged, Target};
+use relay_broker::{Broker, Events, JobEvent, Purged, Target, Upload};
 use serde_json::{json, Value};
 
 use super::super::exec::Request;
@@ -69,22 +70,45 @@ pub(super) struct Retry {
 
 /// One relay call's events, gathered as they come.
 struct Call {
-    events: Receiver<JobEvent>,
+    events: Events,
     bytes: Vec<u8>,
+    /// Where the stream's bytes go instead of `bytes`, with their count and
+    /// SHA-256.
+    sink: Option<(std::io::BufWriter<std::fs::File>, Received)>,
+    sink_failed: Option<String>,
     end_sha256: Option<String>,
     outcome: Option<Outcome>,
 }
 
 impl Call {
+    fn new(events: Events) -> Call {
+        Call {
+            events,
+            bytes: Vec::new(),
+            sink: None,
+            sink_failed: None,
+            end_sha256: None,
+            outcome: None,
+        }
+    }
+
     /// Take events for up to `wait`; true once the outcome is in.
     fn pump(&mut self, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         while self.outcome.is_none() {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.events.recv_timeout(left) {
-                Ok(JobEvent::Chunk(data)) => self.bytes.extend_from_slice(&data),
+                Ok(JobEvent::Chunk(data)) => match self.sink.as_mut() {
+                    Some((writer, received)) => {
+                        received.update(&data);
+                        if let Err(error) = writer.write_all(&data) {
+                            self.sink_failed.get_or_insert(error.to_string());
+                        }
+                    }
+                    None => self.bytes.extend_from_slice(&data),
+                },
                 Ok(JobEvent::End(digest)) => self.end_sha256 = Some(digest.sha256),
-                Ok(JobEvent::Pending { .. }) => {}
+                Ok(JobEvent::Pending { .. }) | Ok(JobEvent::Progress(_)) => {}
                 Ok(JobEvent::Done { outcome, .. }) => self.outcome = Some(outcome),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -393,14 +417,9 @@ impl DurableMachine {
                 stdin: false,
                 timeout_s: timeout as f64,
             },
-            Vec::new(),
+            Upload::None,
         );
-        let mut call = Call {
-            events,
-            bytes: Vec::new(),
-            end_sha256: None,
-            outcome: None,
-        };
+        let mut call = Call::new(events);
         let deadline = Instant::now() + RECORD_WAIT;
         while !files.group.exists() && Instant::now() < deadline {
             if call.pump(Duration::from_millis(20)) {
@@ -504,8 +523,9 @@ impl DurableMachine {
         };
         let (op, upload) = if push {
             use std::os::unix::fs::PermissionsExt;
-            let bytes = match std::fs::read(source) {
-                Ok(bytes) => bytes,
+            // The file streams from the disk (RP-15).
+            let upload = match Upload::file(source) {
+                Ok(upload) => upload,
                 Err(error) => {
                     return Reply::error(409, format!("cannot read {}: {error}", source.display()))
                 }
@@ -519,23 +539,38 @@ impl DurableMachine {
                     name: file_name,
                     mode,
                 },
-                bytes,
+                upload,
             )
         } else {
             (
                 Op::Read {
                     path: source.to_string_lossy().to_string(),
                 },
-                Vec::new(),
+                Upload::None,
             )
         };
-        let mut call = Call {
-            events: relay.broker.submit(&relay.target, &execution, op, upload),
-            bytes: Vec::new(),
-            end_sha256: None,
-            outcome: None,
+        let size = upload.digest().size;
+        // A pull's bytes stream to a temporary sibling of the target, which
+        // is renamed into place once they match (DM-5).
+        let staged = if push {
+            None
+        } else {
+            match staging_file(&target) {
+                Ok(staged) => Some(staged),
+                Err(error) => return Reply::error(409, format!("transfer failed: {error}")),
+            }
         };
-        if !call.pump(relay.agent_wait + Duration::from_secs(300)) {
+        let mut call = Call::new(relay.broker.submit(&relay.target, &execution, op, upload));
+        if let Some(staged) = &staged {
+            match staged.reopen() {
+                Ok(file) => {
+                    call.sink = Some((std::io::BufWriter::new(file), Default::default()));
+                }
+                Err(error) => return Reply::error(409, format!("transfer failed: {error}")),
+            }
+        }
+        let bound = relay.agent_wait + Duration::from_secs(300 + (size >> 20));
+        if !call.pump(bound) {
             return Reply::error(
                 409,
                 format!("relay: no outcome for transfer {execution}; it may still run"),
@@ -544,17 +579,37 @@ impl DurableMachine {
         let (bytes, sha256) = match call.outcome.as_ref().expect("the outcome is in") {
             Outcome::Written(digest) => (digest.size, digest.sha256.clone()),
             Outcome::Read(digest) => {
-                let matches = digest.size == call.bytes.len() as u64
+                let Some((mut writer, received)) = call.sink.take() else {
+                    return Reply::error(409, "transfer failed: no bytes were kept");
+                };
+                let flushed = writer.flush();
+                let received = received.finish();
+                let matches = digest.size == received.size
                     && call.end_sha256.as_deref() == Some(digest.sha256.as_str())
-                    && service_layout::release::sha256_hex(&call.bytes) == digest.sha256;
+                    && received.sha256 == digest.sha256;
                 if !matches {
                     return Reply::error(
                         409,
                         "transfer failed: the bytes do not match their SHA-256; pull again",
                     );
                 }
-                if let Err(error) = write_into_place(&target, &call.bytes) {
+                if let Some(error) = call
+                    .sink_failed
+                    .take()
+                    .or_else(|| flushed.err().map(|e| e.to_string()))
+                {
                     return Reply::error(409, format!("transfer failed: {error}"));
+                }
+                let staged = staged.expect("a pull stages its file");
+                if let Err(error) = staged.persist(&target) {
+                    return Reply::error(
+                        409,
+                        format!(
+                            "transfer failed: cannot move into {}: {}",
+                            target.display(),
+                            error.error
+                        ),
+                    );
                 }
                 (digest.size, digest.sha256.clone())
             }
@@ -578,16 +633,41 @@ impl DurableMachine {
     }
 }
 
-/// Write `bytes` to `target` through a temporary sibling and a rename, so a
-/// reader never sees a partial file (DM-5).
-fn write_into_place(target: &Path, bytes: &[u8]) -> Result<(), String> {
+/// The count and SHA-256 of the bytes a pull received.
+#[derive(Default)]
+struct Received {
+    size: u64,
+    hasher: sha2::Sha256,
+}
+
+/// The size and SHA-256 of what was received.
+struct ReceivedDigest {
+    size: u64,
+    sha256: String,
+}
+
+impl Received {
+    fn update(&mut self, data: &[u8]) {
+        self.size += data.len() as u64;
+        sha2::Digest::update(&mut self.hasher, data);
+    }
+
+    fn finish(self) -> ReceivedDigest {
+        let digest = sha2::Digest::finalize(self.hasher);
+        ReceivedDigest {
+            size: self.size,
+            sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+}
+
+/// A temporary sibling of `target` that a pull's bytes stream into, renamed
+/// into place once they match, so a reader never sees a partial file
+/// (DM-5).
+fn staging_file(target: &Path) -> Result<tempfile::NamedTempFile, String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("{} has no parent", target.display()))?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
-    std::io::Write::write_all(&mut file, bytes).map_err(|error| error.to_string())?;
-    file.persist(target)
-        .map_err(|error| format!("cannot move into {}: {}", target.display(), error.error))?;
-    Ok(())
+    tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())
 }

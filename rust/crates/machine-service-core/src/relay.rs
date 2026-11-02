@@ -29,7 +29,7 @@ use acquisition_options::GuestNetwork;
 use relay_agent::protocol::AgentInfo;
 use relay_agent::protocol::{Op, Outcome};
 use relay_broker::tls::Authority;
-use relay_broker::{Answer, Broker, BrokerConfig, RestartError, Role, RunError, Target};
+use relay_broker::{Answer, Broker, BrokerConfig, RestartError, Role, RunError, Target, Upload};
 use remote_session::{Listening, ServerConfig, SessionServer};
 use serde_json::{json, Value};
 
@@ -790,7 +790,7 @@ impl Service {
                     name: String::new(),
                     mode: Some(0o755),
                 },
-                build,
+                Upload::bytes(build),
                 relay.settings.agent_wait + Duration::from_secs(300),
             )
             .map_err(|e| format!("writing the build got no answer: {e:?}"))?;
@@ -1026,7 +1026,7 @@ impl Service {
                     &target,
                     &uuid::Uuid::new_v4().to_string(),
                     op,
-                    upload,
+                    Upload::bytes(upload),
                     bound,
                 )
                 .map_err(|e| format!("the relay agent did not answer in time: {e:?}"))
@@ -1093,15 +1093,40 @@ impl Service {
         target: &Target,
         execution: &str,
         op: Op,
-        upload: Vec<u8>,
+        upload: Upload,
         timeout_s: u64,
+    ) -> OpResult<Answer> {
+        let mut bytes = Vec::new();
+        let mut answer =
+            self.relay_run_into(vm, target, execution, op, upload, timeout_s, |data| {
+                bytes.extend_from_slice(data);
+                Ok(())
+            })?;
+        answer.bytes = bytes;
+        Ok(answer)
+    }
+
+    /// [`Self::relay_run`], handing the answer's stream to `sink` as it
+    /// comes, so a transfer of any size streams through (RP-15).
+    #[allow(clippy::too_many_arguments)]
+    fn relay_run_into(
+        &self,
+        vm: &str,
+        target: &Target,
+        execution: &str,
+        op: Op,
+        upload: Upload,
+        timeout_s: u64,
+        mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
     ) -> OpResult<Answer> {
         let relay = self
             .relay()
             .ok_or_else(|| OpError::new("the relay link is not running"))?;
         let bound =
             Duration::from_secs(timeout_s) + relay.settings.agent_wait + Duration::from_secs(60);
-        let answer = relay.broker.run(target, execution, op, upload, bound);
+        let answer = relay
+            .broker
+            .run_into(target, execution, op, upload, bound, &mut sink);
         let released = self.release_flag(vm).load(Ordering::SeqCst);
         match answer {
             Ok(answer) => {
@@ -1120,6 +1145,9 @@ impl Service {
             ))),
             Err(RunError::Internal) => Err(OpError::uncertain(format!(
                 "relay: the broker lost execution {execution}"
+            ))),
+            Err(RunError::Sink(error)) => Err(OpError::new(format!(
+                "relay: the transfer could not be stored: {error}"
             ))),
         }
     }
@@ -1141,7 +1169,7 @@ impl Service {
                 Op::Script {
                     timeout_s: timeout_s as f64,
                 },
-                script,
+                Upload::bytes(script),
             ),
             (Some(command), None) => (
                 Op::Exec {
@@ -1149,7 +1177,7 @@ impl Service {
                     stdin: false,
                     timeout_s: timeout_s as f64,
                 },
-                Vec::new(),
+                Upload::None,
             ),
             (None, None) => return Err(OpError::new("need 'argv' or 'script'")),
         };
@@ -1174,7 +1202,8 @@ impl Service {
                 .map(Some);
         }
         use std::os::unix::fs::PermissionsExt;
-        let bytes = std::fs::read(local)
+        // The file streams from the disk, from any offset (RP-15).
+        let upload = Upload::file(local)
             .map_err(|e| OpError::new(format!("cannot read {}: {e}", local.display())))?;
         let mode = std::fs::metadata(local)
             .map(|m| m.permissions().mode() & 0o777)
@@ -1189,7 +1218,8 @@ impl Service {
             name,
             mode,
         };
-        let answer = self.relay_run(vm, target, &execution, op, bytes, 300)?;
+        let timeout = transfer_timeout(upload.digest().size);
+        let answer = self.relay_run(vm, target, &execution, op, upload, timeout)?;
         match &answer.outcome {
             Outcome::Written(digest) => Ok(Some(json!({
                 "vm": vm, "pushed": local.display().to_string(), "to": remote,
@@ -1208,17 +1238,15 @@ impl Service {
         local: &Path,
         remote: &str,
     ) -> OpResult<Value> {
-        let stream = byte_transfer::pack_into(local, Vec::new())
+        // The tar stream is spooled to a temporary file and streams from
+        // there, so a folder of any size needs no memory of its size.
+        let spool = tempfile::NamedTempFile::new()
             .map_err(|e| OpError::new(format!("push failed: {e}")))?;
-        let limit = self
-            .relay()
-            .map_or(usize::MAX, |relay| relay.broker.config().max_upload);
-        if stream.len() > limit {
-            return Err(OpError::new(format!(
-                "push failed: the folder's tar stream is {} bytes; the relay carries at most {limit}",
-                stream.len()
-            )));
-        }
+        byte_transfer::pack_into(local, std::io::BufWriter::new(spool.as_file()))
+            .and_then(|mut writer| std::io::Write::flush(&mut writer).map_err(|e| e.to_string()))
+            .map_err(|e| OpError::new(format!("push failed: {e}")))?;
+        let stream =
+            Upload::file(spool.path()).map_err(|e| OpError::new(format!("push failed: {e}")))?;
         let name = local
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1228,7 +1256,9 @@ impl Service {
             path: remote.to_string(),
             name,
         };
-        let answer = self.relay_run(vm, target, &execution, op, stream, 300)?;
+        let timeout = transfer_timeout(stream.digest().size);
+        let answer = self.relay_run(vm, target, &execution, op, stream, timeout)?;
+        drop(spool);
         match &answer.outcome {
             Outcome::Written(digest) => Ok(json!({
                 "vm": vm, "pushed": local.display().to_string(), "to": remote,
@@ -1254,19 +1284,31 @@ impl Service {
         let op = Op::Read {
             path: remote.to_string(),
         };
-        let answer = self.relay_run(vm, target, &execution, op, Vec::new(), 300)?;
+        // The bytes stream to a temporary sibling and are renamed into
+        // place once they match.
+        let parent = local
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+        let answer = {
+            let mut writer = std::io::BufWriter::new(file.as_file_mut());
+            let answer =
+                self.relay_run_into(vm, target, &execution, op, Upload::None, 300, |data| {
+                    std::io::Write::write_all(&mut writer, data)
+                })?;
+            std::io::Write::flush(&mut writer)
+                .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+            answer
+        };
         match &answer.outcome {
             Outcome::Read(digest) => {
-                if !answer.end_matches() || digest.size != answer.bytes.len() as u64 {
+                if !answer.end_matches() || digest.size != answer.stream.size {
                     return Err(OpError::new(
                         "pull failed: the bytes do not match their SHA-256; pull again",
                     ));
                 }
-                let parent = local.parent().unwrap_or_else(|| Path::new("."));
-                let mut file = tempfile::NamedTempFile::new_in(parent)
-                    .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
-                std::io::Write::write_all(&mut file, &answer.bytes)
-                    .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
                 file.persist(local)
                     .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
                 Ok(Some(json!({
@@ -1297,23 +1339,43 @@ impl Service {
         let op = Op::ReadTree {
             path: remote.to_string(),
         };
-        let answer = self.relay_run(vm, target, &execution, op, Vec::new(), 300)?;
-        let digest = match &answer.outcome {
-            Outcome::Read(digest) => digest.clone(),
-            other => return Err(outcome_error(other)),
-        };
-        if !answer.end_matches() || digest.size != answer.bytes.len() as u64 {
-            return Err(OpError::new(
-                "pull failed: the folder's stream does not match its SHA-256; pull again",
-            ));
-        }
         let name = Path::new(remote.trim_end_matches('/'))
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let destination = byte_transfer::tree_destination(local, &name)
             .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
-        place_pulled_tree(&answer.bytes, &destination)
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = tempfile::Builder::new()
+            .prefix(".machine-service-pull-")
+            .tempdir_in(parent)
+            .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+        let archive = scratch.path().join("tree.tar");
+        let answer = {
+            let file = std::fs::File::create(&archive)
+                .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+            let mut writer = std::io::BufWriter::new(file);
+            let answer =
+                self.relay_run_into(vm, target, &execution, op, Upload::None, 300, |data| {
+                    std::io::Write::write_all(&mut writer, data)
+                })?;
+            std::io::Write::flush(&mut writer)
+                .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+            answer
+        };
+        let digest = match &answer.outcome {
+            Outcome::Read(digest) => digest.clone(),
+            other => return Err(outcome_error(other)),
+        };
+        if !answer.end_matches() || digest.size != answer.stream.size {
+            return Err(OpError::new(
+                "pull failed: the folder's stream does not match its SHA-256; pull again",
+            ));
+        }
+        place_pulled_tree(scratch.path(), &archive, &destination)
             .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
         Ok(json!({
             "vm": vm, "pulled": remote, "to": destination.display().to_string(),
@@ -1323,21 +1385,18 @@ impl Service {
     }
 }
 
-/// Unpack a folder's tar stream beside `destination` and put it there in
-/// one step, replacing a folder that is there whole.
-fn place_pulled_tree(stream: &[u8], destination: &Path) -> Result<(), String> {
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let scratch = tempfile::Builder::new()
-        .prefix(".machine-service-pull-")
-        .tempdir_in(parent)
-        .map_err(|e| e.to_string())?;
-    let archive = scratch.path().join("tree.tar");
-    std::fs::write(&archive, stream).map_err(|e| e.to_string())?;
-    let staged = scratch.path().join("tree");
-    byte_transfer::unpack(&archive, &staged)?;
+/// How long a transfer of `size` bytes may take: five minutes, and a
+/// second for every MiB beyond, so a slow link still carries a large file.
+fn transfer_timeout(size: u64) -> u64 {
+    300 + (size >> 20)
+}
+
+/// Unpack a folder's tar stream at `archive`, in `scratch` beside
+/// `destination`, and put it there in one step, replacing a folder that is
+/// there whole.
+fn place_pulled_tree(scratch: &Path, archive: &Path, destination: &Path) -> Result<(), String> {
+    let staged = scratch.join("tree");
+    byte_transfer::unpack(archive, &staged)?;
     // The staged folder sits one level below the destination's folder; a
     // rename within one file system keeps the placement atomic.
     byte_transfer::place_tree(&staged, destination).map_err(|e| e.to_string())

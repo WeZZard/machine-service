@@ -1,26 +1,44 @@
-//! One client session (RP-4 to RP-8): take its calls and queries, collect
-//! each upload and check it against its end, then hand the call to the
-//! lease's execution record and stream the record's events back under the
-//! client's call number.
+//! One client session (RP-4 to RP-8, RP-15): take its calls and queries,
+//! pass each upload on to the lease's execution record as it comes, and
+//! stream the record's events back under the client's call number.
+//!
+//! A client of protocol 2, which names it in its hello's attributes, streams
+//! an upload of any size within the window beyond the agent's progress, and
+//! continues it after a loss. A client of protocol 1 sends an upload whole,
+//! which the broker holds, up to [`crate::BrokerConfig::max_upload`], and
+//! checks against its end before it hands the call on, as it always did.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use relay_agent::agent::MAX_EXECUTION_ID;
-use relay_agent::protocol::{Call, CallResult, Message, Op, Outcome, Pending, Ready, PROTOCOL};
+use relay_agent::protocol::{
+    Call, CallResult, Digest, Message, Op, Outcome, Pending, Ready, PROTOCOL,
+};
 use remote_session::Session;
 
 use crate::credentials::Target;
-use crate::job::JobEvent;
+use crate::job::{Events, Fed, Feed, Job, JobEvent, JobSpec, Upload};
 use crate::Inner;
 
-struct Upload {
-    execution: String,
-    op: Op,
-    bytes: Vec<u8>,
-    too_large: bool,
+/// An upload between its call and its end.
+enum Slot {
+    /// A client of protocol 2 feeds the record as it goes; `None` once the
+    /// record takes no more bytes, or when the call attached to a record
+    /// that has its upload already.
+    Feeding {
+        execution: String,
+        job: Option<Arc<Job>>,
+    },
+    /// A client of protocol 1: the whole upload, held until its end.
+    Whole {
+        execution: String,
+        op: Op,
+        bytes: Vec<u8>,
+        too_large: bool,
+    },
     /// Refused when it came; its chunks and end are taken and dropped.
-    refused: bool,
+    Refused,
 }
 
 type Open = Arc<Mutex<HashSet<u64>>>;
@@ -41,12 +59,27 @@ fn refuse(session: &Session, call: u64, execution: &str, code: &str, message: &s
     );
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The relay protocol a client speaks: its hello's `attributes.protocol`,
+/// else 1, and never more than the broker's.
+fn protocol_of(session: &Session) -> u32 {
+    session
+        .attributes()
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(1, |protocol| protocol.min(u64::from(PROTOCOL)) as u32)
+}
+
 /// Serve one client session until it ends.
 pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
     let Some(id) = inner.add_client(&target, &session) else {
         session.close();
         return;
     };
+    let protocol = protocol_of(&session);
     send(
         &session,
         &Message::Ready(Ready {
@@ -56,7 +89,7 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
         }),
     );
     let open: Open = Arc::default();
-    let mut uploads: HashMap<u64, Upload> = HashMap::new();
+    let mut slots: HashMap<u64, Slot> = HashMap::new();
     let protocol_error = |why: String| {
         (inner.log)(&format!("relay: {target}: closing a client session: {why}"));
         session.close();
@@ -76,14 +109,12 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
                 op,
                 // The broker names the lease itself (RA-5).
                 lease: _,
+                resume,
+                offset,
             }) => {
-                let in_use = call == 0
-                    || uploads.contains_key(&call)
-                    || open
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains(&call);
-                if in_use {
+                // A call number whose result went out may be used again;
+                // what its old upload still sends is dropped.
+                if call == 0 || lock(&open).contains(&call) {
                     refuse(
                         &session,
                         call,
@@ -93,128 +124,148 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
                     );
                     continue;
                 }
-                if let Op::Purge { .. } = op {
+                slots.remove(&call);
+                let uploads = op.kind().uploads();
+                let refused = if let Op::Purge { .. } = op {
                     // Only machine-service purges a lease's records, at
                     // release (DC-173).
-                    refuse(
-                        &session,
-                        call,
-                        &execution,
+                    Some((
                         "forbidden",
-                        "purge is machine-service's own operation",
-                    );
-                    continue;
-                }
-                if execution.is_empty() || execution.len() > MAX_EXECUTION_ID {
-                    let message = format!("an execution ID has 1 to {MAX_EXECUTION_ID} bytes");
-                    if op.kind().uploads() {
-                        uploads.insert(
-                            call,
-                            Upload {
-                                execution: execution.clone(),
-                                op,
-                                bytes: Vec::new(),
-                                too_large: false,
-                                refused: true,
-                            },
-                        );
+                        "purge is machine-service's own operation".into(),
+                    ))
+                } else if execution.is_empty() || execution.len() > MAX_EXECUTION_ID {
+                    Some((
+                        "bad_request",
+                        format!("an execution ID has 1 to {MAX_EXECUTION_ID} bytes"),
+                    ))
+                } else {
+                    None
+                };
+                if let Some((code, message)) = refused {
+                    if uploads {
+                        slots.insert(call, Slot::Refused);
                     }
-                    refuse(&session, call, &execution, "bad_request", &message);
+                    refuse(&session, call, &execution, code, &message);
                     continue;
                 }
-                if op.kind().uploads() {
-                    uploads.insert(
+                let call_of = Started {
+                    inner: &inner,
+                    session: &session,
+                    open: &open,
+                    target: &target,
+                    call,
+                };
+                if !uploads {
+                    call_of.start(execution, op, Feed::Local(Upload::None), false, offset);
+                } else if protocol >= 2 {
+                    let job = call_of.start(execution.clone(), op, Feed::Client, resume, offset);
+                    slots.insert(call, Slot::Feeding { execution, job });
+                } else {
+                    slots.insert(
                         call,
-                        Upload {
+                        Slot::Whole {
                             execution,
                             op,
                             bytes: Vec::new(),
                             too_large: false,
-                            refused: false,
                         },
                     );
-                } else {
-                    start(
-                        &inner,
-                        &session,
-                        &open,
-                        &target,
-                        call,
-                        execution,
-                        op,
-                        Vec::new(),
-                    );
                 }
             }
-            Message::Chunk { call, data } => {
-                let Some(upload) = uploads.get_mut(&call) else {
-                    protocol_error(format!("a chunk for call {call}, which is not open"));
-                    break;
-                };
-                if upload.too_large || upload.refused {
-                    continue;
+            Message::Chunk { call, data } => match slots.get_mut(&call) {
+                // A chunk of a call that ended before its stream did.
+                None | Some(Slot::Refused) | Some(Slot::Feeding { job: None, .. }) => {}
+                Some(Slot::Feeding { job, .. }) => {
+                    let feeding = job.clone().expect("a fed record");
+                    if let Fed::Closed = feeding.feed(data) {
+                        inner.forget_unrun(&feeding);
+                        *job = None;
+                    }
                 }
-                if upload.bytes.len() + data.len() > inner.config.max_upload {
-                    upload.too_large = true;
-                    upload.bytes = Vec::new();
-                } else {
-                    upload.bytes.extend_from_slice(&data);
+                Some(Slot::Whole {
+                    bytes, too_large, ..
+                }) => {
+                    if *too_large {
+                        continue;
+                    }
+                    if bytes.len() + data.len() > inner.config.max_upload {
+                        *too_large = true;
+                        *bytes = Vec::new();
+                    } else {
+                        bytes.extend_from_slice(&data);
+                    }
                 }
-            }
+            },
             Message::End {
                 call,
                 execution,
                 size,
                 sha256,
-            } => {
-                let Some(upload) = uploads.remove(&call) else {
-                    protocol_error(format!("an end for call {call}, which is not open"));
-                    break;
-                };
-                if upload.refused {
-                    continue;
+            } => match slots.remove(&call) {
+                None | Some(Slot::Refused) | Some(Slot::Feeding { job: None, .. }) => {}
+                Some(Slot::Feeding {
+                    execution: own,
+                    job: Some(job),
+                }) => {
+                    if execution == own {
+                        job.finish(Digest { size, sha256 });
+                    } else {
+                        job.refuse("bad_request", "the end names another execution ID");
+                        inner.forget_unrun(&job);
+                    }
                 }
-                if upload.too_large {
-                    refuse(
-                        &session,
-                        call,
-                        &upload.execution,
-                        "too_large",
-                        "the upload exceeds 256 MiB",
-                    );
-                } else if execution != upload.execution {
-                    refuse(
-                        &session,
-                        call,
-                        &upload.execution,
-                        "bad_request",
-                        "the end names another execution ID",
-                    );
-                } else if size != upload.bytes.len() as u64
-                    || sha256 != guest_actions::sha256_hex(&upload.bytes)
-                {
-                    refuse(
-                        &session,
-                        call,
-                        &upload.execution,
-                        "checksum_mismatch",
-                        "the upload does not match its end",
-                    );
-                } else {
-                    start(
-                        &inner,
-                        &session,
-                        &open,
-                        &target,
-                        call,
-                        upload.execution,
-                        upload.op,
-                        upload.bytes,
-                    );
+                Some(Slot::Whole {
+                    execution: own,
+                    op,
+                    bytes,
+                    too_large,
+                }) => {
+                    if too_large {
+                        refuse(
+                            &session,
+                            call,
+                            &own,
+                            "too_large",
+                            "the upload exceeds 256 MiB; a client of protocol 2 streams it",
+                        );
+                    } else if execution != own {
+                        refuse(
+                            &session,
+                            call,
+                            &own,
+                            "bad_request",
+                            "the end names another execution ID",
+                        );
+                    } else if size != bytes.len() as u64
+                        || sha256 != guest_actions::sha256_hex(&bytes)
+                    {
+                        refuse(
+                            &session,
+                            call,
+                            &own,
+                            "checksum_mismatch",
+                            "the upload does not match its end",
+                        );
+                    } else {
+                        Started {
+                            inner: &inner,
+                            session: &session,
+                            open: &open,
+                            target: &target,
+                            call,
+                        }
+                        .start(
+                            own,
+                            op,
+                            Feed::Local(Upload::bytes(bytes)),
+                            false,
+                            0,
+                        );
+                    }
                 }
-            }
+            },
             Message::Query { call, execution } => {
-                if call == 0 || !open.lock().unwrap_or_else(|e| e.into_inner()).insert(call) {
+                if call == 0 || !lock(&open).insert(call) {
                     refuse(
                         &session,
                         call,
@@ -250,73 +301,111 @@ pub(crate) fn serve(inner: Arc<Inner>, session: Session, target: Target) {
                             state,
                         },
                     );
-                    open.lock().unwrap_or_else(|e| e.into_inner()).remove(&call);
+                    lock(&open).remove(&call);
                 });
             }
-            Message::Heartbeat => {}
+            // A client's own progress paces nothing: the broker paces the
+            // agent's streams by what it passed on to the client.
+            Message::Heartbeat | Message::Progress { .. } => {}
             other => {
                 protocol_error(format!("a client sent {other:?}"));
                 break;
             }
         }
     }
+    // Uploads whose end never came cannot complete; the agent keeps what
+    // it committed for the client's next session.
+    for slot in slots.into_values() {
+        if let Slot::Feeding { job: Some(job), .. } = slot {
+            job.abandon();
+            inner.forget_unrun(&job);
+        }
+    }
     inner.remove_client(&target, id);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start(
-    inner: &Arc<Inner>,
-    session: &Session,
-    open: &Open,
-    target: &Target,
+/// A call of this session, about to start.
+struct Started<'a> {
+    inner: &'a Arc<Inner>,
+    session: &'a Session,
+    open: &'a Open,
+    target: &'a Target,
     call: u64,
-    execution: String,
-    op: Op,
-    upload: Vec<u8>,
-) {
-    open.lock().unwrap_or_else(|e| e.into_inner()).insert(call);
-    let events = inner.submit(target, &execution, op, upload);
-    let session = session.clone();
-    let open = Arc::clone(open);
-    std::thread::spawn(move || {
-        for event in events {
-            let message = match event {
-                JobEvent::Pending {
-                    code,
-                    message,
-                    wait_ms,
-                } => Message::Pending(Pending {
-                    call,
-                    execution: execution.clone(),
-                    code,
-                    message,
-                    wait_ms,
-                }),
-                JobEvent::Chunk(data) => Message::Chunk { call, data },
-                JobEvent::End(end) => Message::End {
-                    call,
-                    execution: execution.clone(),
-                    size: end.size,
-                    sha256: end.sha256,
-                },
-                JobEvent::Done { replayed, outcome } => {
-                    open.lock().unwrap_or_else(|e| e.into_inner()).remove(&call);
-                    send(
-                        &session,
-                        &Message::Result(CallResult {
-                            call,
-                            execution,
-                            replayed,
-                            outcome,
-                        }),
-                    );
-                    return;
-                }
-            };
-            if !send(&session, &message) {
-                break;
+}
+
+impl Started<'_> {
+    /// Start or attach to the call's record, and stream its events back to
+    /// the client. Returns the record when the client feeds its upload.
+    fn start(
+        self,
+        execution: String,
+        op: Op,
+        feed: Feed,
+        resume: bool,
+        offset: u64,
+    ) -> Option<Arc<Job>> {
+        let call = self.call;
+        lock(self.open).insert(call);
+        let (events, job) = self.inner.submit(JobSpec {
+            target: self.target.clone(),
+            lease: String::new(),
+            execution: execution.clone(),
+            op,
+            feed,
+            resume,
+            offset,
+            transient: false,
+        });
+        let session = self.session.clone();
+        let open = Arc::clone(self.open);
+        std::thread::spawn(move || forward(events, &session, &open, call, execution));
+        job
+    }
+}
+
+fn forward(events: Events, session: &Session, open: &Open, call: u64, execution: String) {
+    for event in events {
+        let message = match event {
+            JobEvent::Pending {
+                code,
+                message,
+                wait_ms,
+            } => Message::Pending(Pending {
+                call,
+                execution: execution.clone(),
+                code,
+                message,
+                wait_ms,
+            }),
+            JobEvent::Progress(committed) => Message::Progress {
+                call,
+                execution: execution.clone(),
+                committed,
+            },
+            JobEvent::Chunk(data) => Message::Chunk { call, data },
+            JobEvent::End(end) => Message::End {
+                call,
+                execution: execution.clone(),
+                size: end.size,
+                sha256: end.sha256,
+            },
+            JobEvent::Done { replayed, outcome } => {
+                lock(open).remove(&call);
+                send(
+                    session,
+                    &Message::Result(CallResult {
+                        call,
+                        execution,
+                        replayed,
+                        outcome,
+                    }),
+                );
+                return;
             }
+        };
+        if !send(session, &message) {
+            break;
         }
-        open.lock().unwrap_or_else(|e| e.into_inner()).remove(&call);
-    });
+    }
+    lock(open).remove(&call);
 }

@@ -169,7 +169,7 @@ fn leftovers(directory: &Path) -> Vec<String> {
     std::fs::read_dir(directory)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".tmp"))
+        .filter(|name| name.ends_with(".tmp") || name.ends_with(".part"))
         .collect()
 }
 
@@ -196,18 +196,24 @@ fn every_message_survives_encoding() {
         Message::Heartbeat,
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 1,
             execution: "e".into(),
             op: exec("true"),
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 2,
             execution: "e".into(),
             op: Op::Script { timeout_s: 1.5 },
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 3,
             execution: "e".into(),
             op: Op::Write {
@@ -218,24 +224,32 @@ fn every_message_survives_encoding() {
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 4,
             execution: "e".into(),
             op: Op::Read { path: "p".into() },
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 5,
             execution: "e".into(),
             op: Op::Cancel { target: "t".into() },
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 6,
             execution: "e".into(),
             op: Op::Status,
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 8,
             execution: "e".into(),
             op: Op::WriteTree {
@@ -245,12 +259,16 @@ fn every_message_survives_encoding() {
         }),
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 9,
             execution: "e".into(),
             op: Op::ReadTree { path: "p".into() },
         }),
         Message::Call(Call {
             lease: Some("lease-1".into()),
+            resume: false,
+            offset: 0,
             call: 10,
             execution: "e".into(),
             op: Op::Purge {
@@ -548,6 +566,8 @@ fn an_upload_that_does_not_match_its_end_never_runs_and_is_not_recorded() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "m1".into(),
             op: exec("touch ran"),
@@ -586,6 +606,8 @@ fn an_exec_without_its_end_never_runs() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "n1".into(),
             op: exec("touch ran"),
@@ -604,6 +626,8 @@ fn a_call_resent_before_its_end_supersedes_the_first() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: first,
             execution: "r1".into(),
             op: exec("echo run >> runs"),
@@ -639,6 +663,8 @@ fn an_end_for_another_execution_never_commits_a_pending_call() {
     let write = |execution: &str| {
         Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: execution.into(),
             op: Op::Write {
@@ -707,6 +733,8 @@ fn a_call_number_in_use_is_refused() {
         driver
             .send(&Message::Call(Call {
                 lease: None,
+                resume: false,
+                offset: 0,
                 call,
                 execution: execution.into(),
                 op: exec("true"),
@@ -788,6 +816,8 @@ fn cancel_reports_completed_unknown_and_discarded_targets() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "waiting".into(),
             op: exec("touch ran"),
@@ -875,6 +905,8 @@ fn a_write_that_fails_its_check_or_loses_its_link_leaves_nothing() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "w1".into(),
             op: op.clone(),
@@ -902,6 +934,8 @@ fn a_write_that_fails_its_check_or_loses_its_link_leaves_nothing() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "w2".into(),
             op,
@@ -1127,6 +1161,8 @@ fn a_call_names_its_lease_only_when_it_has_one() {
                 execution: "e".into(),
                 op: Op::Status,
                 lease: lease.map(str::to_string),
+                resume: false,
+                offset: 0,
             })
             .encode(),
         )
@@ -1438,6 +1474,8 @@ fn plan(rng: &mut Rng, index: usize) -> Planned {
 fn messages(rng: &mut Rng, call: u64, planned: &Planned) -> Vec<Message> {
     let mut messages = vec![Message::Call(Call {
         lease: None,
+        resume: false,
+        offset: 0,
         call,
         execution: planned.execution.clone(),
         op: planned.op.clone(),
@@ -2052,6 +2090,8 @@ fn a_bad_folder_upload_never_lands_and_is_not_recorded() {
     rig.driver
         .send(&Message::Call(Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: "bad".into(),
             op: Op::WriteTree {
@@ -2172,4 +2212,445 @@ fn a_restart_runs_only_when_idle_and_only_once() {
     let again = rig.run("r2", Op::Restart, b"");
     assert!(again.result.as_ref().unwrap().replayed);
     assert_eq!(restarts.load(Ordering::SeqCst), 1, "never restarts twice");
+}
+
+// ------------------------------------------------- resumable streams (RP-15)
+
+/// Deterministic bytes that differ at every offset.
+fn pattern(size: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+impl Rig {
+    /// A rig whose broker end speaks protocol 2.
+    fn v2() -> Rig {
+        let rig = Rig::new();
+        rig.driver.ready(PROTOCOL).unwrap();
+        rig
+    }
+
+    /// Lose the link as a session that ends would, and serve a new one that
+    /// speaks protocol 2.
+    fn reconnect_v2(&mut self) {
+        self.reconnect();
+        self.driver.ready(PROTOCOL).unwrap();
+    }
+}
+
+fn write_op(path: &str) -> Op {
+    Op::Write {
+        path: path.into(),
+        name: String::new(),
+        mode: Some(0o640),
+    }
+}
+
+/// Send the start of an upload in uneven chunks, then lose the link.
+fn upload_then_lose(rig: &mut Rig, execution: &str, op: Op, bytes: &[u8]) {
+    let call = rig.driver.call(execution, op, false, 0).unwrap();
+    for piece in bytes.chunks(MAX_CHUNK / 3 + 17) {
+        rig.driver.chunks(call, piece).unwrap();
+    }
+    rig.driver.link().flush(Duration::from_secs(5));
+    rig.reconnect_v2();
+}
+
+/// Continue an upload: resume, take the committed offset, send the rest
+/// and the end of the whole stream.
+fn resume(rig: &mut Rig, execution: &str, op: Op, whole: &[u8]) -> (u64, Answer) {
+    let call = rig.driver.call(execution, op, true, 0).unwrap();
+    let committed = match rig.driver.first_progress(call).unwrap() {
+        Ok(committed) => committed,
+        Err(result) => panic!("a result before any progress: {result:?}"),
+    };
+    rig.driver
+        .chunks(call, &whole[committed as usize..])
+        .unwrap();
+    rig.driver.end(call, execution, whole).unwrap();
+    (committed, rig.driver.finish(call).unwrap())
+}
+
+/// RP-15 (TL-1): an upload whose link ends at any offset continues on the
+/// next link from the agent's committed offset, and lands whole and only
+/// at its end.
+#[test]
+fn an_upload_continues_from_its_committed_offset_after_a_lost_link() {
+    let whole = pattern(3 * MAX_CHUNK + 4321, 7);
+    for (index, cut) in [
+        0,
+        1,
+        4096,
+        MAX_CHUNK - 1,
+        MAX_CHUNK,
+        2 * MAX_CHUNK + 999,
+        whole.len(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rig = Rig::v2();
+        let execution = format!("resume-{index}");
+        upload_then_lose(&mut rig, &execution, write_op("f.bin"), &whole[..cut]);
+        assert!(
+            !rig.path("f.bin").exists(),
+            "nothing visible before the end"
+        );
+        assert_eq!(rig.agent.upload_held(&execution), Some(cut as u64));
+        let (committed, answer) = resume(&mut rig, &execution, write_op("f.bin"), &whole);
+        assert_eq!(committed, cut as u64, "cut at {cut}");
+        assert_eq!(
+            outcome(&answer),
+            &Outcome::Written(Digest {
+                size: whole.len() as u64,
+                sha256: guest_actions::sha256_hex(&whole),
+            })
+        );
+        assert_eq!(std::fs::read(rig.path("f.bin")).unwrap(), whole);
+        let mode = std::fs::metadata(rig.path("f.bin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+        assert!(leftovers(rig.home.path()).is_empty(), "cut at {cut}");
+        assert_eq!(rig.agent.upload_held(&execution), None);
+    }
+}
+
+/// RP-15 (TL-1): the agent reports progress at least every step, and a
+/// resumed call of an upload that already committed replays its result.
+#[test]
+fn progress_counts_the_upload_and_a_committed_one_replays() {
+    let mut rig = Rig::v2();
+    let whole = pattern((PROGRESS_STEP as usize) * 3 + 10, 3);
+    let call = rig.driver.call("p", write_op("p.bin"), false, 0).unwrap();
+    rig.driver.chunks(call, &whole).unwrap();
+    rig.driver.end(call, "p", &whole).unwrap();
+    let answer = rig.driver.finish(call).unwrap();
+    assert!(matches!(outcome(&answer), Outcome::Written(_)));
+    assert_eq!(answer.progress.first(), Some(&0), "the call is taken at 0");
+    assert!(answer.progress.len() >= 3, "{:?}", answer.progress);
+    assert!(answer.progress.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let call = rig.driver.call("p", write_op("p.bin"), true, 0).unwrap();
+    match rig.driver.first_progress(call).unwrap() {
+        Err(result) => assert!(result.replayed),
+        Ok(committed) => panic!("a committed upload resumed at {committed}"),
+    }
+}
+
+/// RP-15 (TL-1): an upload continues after the agent itself restarted: its
+/// committed bytes were flushed, and nothing after them is kept.
+#[test]
+fn an_upload_continues_after_the_agent_restarts() {
+    let mut rig = Rig::v2();
+    let whole = pattern(2 * MAX_CHUNK + 77, 11);
+    let cut = MAX_CHUNK + 5;
+    upload_then_lose(&mut rig, "restart-up", write_op("r.bin"), &whole[..cut]);
+    rig.restart();
+    rig.driver.ready(PROTOCOL).unwrap();
+    assert_eq!(rig.agent.upload_held("restart-up"), Some(cut as u64));
+    let (committed, answer) = resume(&mut rig, "restart-up", write_op("r.bin"), &whole);
+    assert_eq!(committed, cut as u64);
+    assert!(matches!(outcome(&answer), Outcome::Written(d) if d.size == whole.len() as u64));
+    assert_eq!(std::fs::read(rig.path("r.bin")).unwrap(), whole);
+    assert!(leftovers(rig.home.path()).is_empty());
+}
+
+/// RP-15 (TL-1): a short stream never commits; it is kept, and the sender
+/// continues it. A corrupted stream never commits either, and is dropped
+/// with no record, so the same ID may be sent again.
+#[test]
+fn a_short_or_corrupted_stream_never_commits() {
+    let mut rig = Rig::v2();
+    let whole = pattern(MAX_CHUNK + 300, 5);
+    let call = rig
+        .driver
+        .call("short", write_op("s.bin"), false, 0)
+        .unwrap();
+    rig.driver.chunks(call, &whole[..1000]).unwrap();
+    rig.driver.end(call, "short", &whole).unwrap();
+    let answer = rig.driver.finish(call).unwrap();
+    assert!(matches!(
+        outcome(&answer),
+        Outcome::Failed { code, committed: false, .. } if code == "upload_incomplete"
+    ));
+    assert!(!rig.path("s.bin").exists());
+    assert_eq!(rig.agent.query("short"), ExecutionState::Unknown);
+    let (committed, answer) = resume(&mut rig, "short", write_op("s.bin"), &whole);
+    assert_eq!(committed, 1000);
+    assert!(matches!(outcome(&answer), Outcome::Written(_)));
+    assert_eq!(std::fs::read(rig.path("s.bin")).unwrap(), whole);
+
+    // A stream that changed between its attempts: the agent's bytes do not
+    // match the end, which names the sender's whole stream.
+    let changed = pattern(whole.len(), 6);
+    upload_then_lose(&mut rig, "bad", write_op("b.bin"), &whole[..500]);
+    let (_, answer) = resume(&mut rig, "bad", write_op("b.bin"), &changed);
+    assert!(matches!(
+        outcome(&answer),
+        Outcome::Failed { code, committed: false, .. } if code == "checksum_mismatch"
+    ));
+    assert!(!rig.path("b.bin").exists());
+    assert!(leftovers(rig.home.path()).is_empty());
+    assert_eq!(rig.agent.query("bad"), ExecutionState::Unknown);
+    assert_eq!(rig.agent.upload_held("bad"), None);
+    // More bytes than the end names is a mismatch as well.
+    let call = rig
+        .driver
+        .call("long", write_op("l.bin"), false, 0)
+        .unwrap();
+    rig.driver.chunks(call, &whole).unwrap();
+    rig.driver.end(call, "long", &whole[..10]).unwrap();
+    let answer = rig.driver.finish(call).unwrap();
+    assert!(matches!(
+        outcome(&answer),
+        Outcome::Failed { code, committed: false, .. } if code == "checksum_mismatch"
+    ));
+    assert!(!rig.path("l.bin").exists());
+    // The same ID runs afresh after a mismatch.
+    let again = rig.run("bad", write_op("b.bin"), &changed);
+    assert!(matches!(outcome(&again), Outcome::Written(_)));
+}
+
+/// RP-15 (TL-1): a call that does not resume starts its upload again, a
+/// cancel drops a held upload, and so does a purge of its lease.
+#[test]
+fn a_fresh_call_a_cancel_and_a_purge_drop_a_held_upload() {
+    let mut rig = Rig::v2();
+    let whole = pattern(5000, 9);
+    upload_then_lose(&mut rig, "fresh", write_op("f.bin"), &whole[..3000]);
+    let call = rig
+        .driver
+        .call("fresh", write_op("f.bin"), false, 0)
+        .unwrap();
+    assert_eq!(rig.driver.first_progress(call).unwrap(), Ok(0));
+    rig.driver.chunks(call, &whole).unwrap();
+    rig.driver.end(call, "fresh", &whole).unwrap();
+    assert!(matches!(
+        outcome(&rig.driver.finish(call).unwrap()),
+        Outcome::Written(_)
+    ));
+    assert_eq!(std::fs::read(rig.path("f.bin")).unwrap(), whole);
+
+    upload_then_lose(&mut rig, "held", write_op("h.bin"), &whole[..3000]);
+    let cancel = rig.run(
+        "cancel-held",
+        Op::Cancel {
+            target: "held".into(),
+        },
+        b"",
+    );
+    assert!(matches!(
+        outcome(&cancel),
+        Outcome::Cancel {
+            found: CancelFound::Discarded,
+            ..
+        }
+    ));
+    assert_eq!(rig.agent.upload_held("held"), None);
+    assert!(leftovers(rig.home.path()).is_empty());
+
+    rig.driver.lease = Some("lease-1".into());
+    upload_then_lose(&mut rig, "leased", write_op("x.bin"), &whole[..3000]);
+    rig.driver.lease = Some("lease-1".into());
+    let purged = purge(&mut rig, "purge-1", "lease-1");
+    assert!(matches!(purged, Outcome::Purged { .. }), "{purged:?}");
+    assert_eq!(rig.agent.upload_held("leased"), None);
+    assert!(leftovers(rig.home.path()).is_empty());
+}
+
+/// RP-15 (TL-1): a script's upload is spooled and continued like a file's,
+/// and the script reads it whole on its standard input.
+#[test]
+fn a_script_upload_continues_and_runs_once() {
+    let mut rig = Rig::v2();
+    let mut script = b"wc -c <<'EOF'\n".to_vec();
+    script.extend(std::iter::repeat_n(b'x', 3 * MAX_CHUNK));
+    script.extend_from_slice(b"\nEOF\necho done\n");
+    let op = Op::Script { timeout_s: LONG };
+    upload_then_lose(&mut rig, "script", op.clone(), &script[..MAX_CHUNK + 11]);
+    let (committed, answer) = resume(&mut rig, "script", op, &script);
+    assert_eq!(committed, MAX_CHUNK as u64 + 11);
+    assert_eq!(exit_code(&answer), Some(0));
+    let output = text(&answer);
+    assert!(
+        output.contains(&format!("{}", 3 * MAX_CHUNK + 1)),
+        "{output}"
+    );
+    assert!(output.ends_with("done\n"));
+}
+
+/// RP-15 (TL-1): a read starts at any offset and its end names the whole
+/// file; a folder read and a command's replay do the same.
+#[test]
+fn a_stream_starts_at_any_offset_and_ends_with_the_whole_digest() {
+    let mut rig = Rig::v2();
+    let whole = pattern(2 * MAX_CHUNK + 123, 13);
+    std::fs::write(rig.path("data.bin"), &whole).unwrap();
+    for offset in [0usize, 1, MAX_CHUNK, whole.len() - 1, whole.len()] {
+        let call = rig
+            .driver
+            .call(
+                &format!("read-{offset}"),
+                Op::Read {
+                    path: "data.bin".into(),
+                },
+                false,
+                offset as u64,
+            )
+            .unwrap();
+        let answer = rig.driver.finish(call).unwrap();
+        assert_eq!(answer.bytes, &whole[offset..]);
+        let end = answer.end.clone().unwrap();
+        assert_eq!(end.size, whole.len() as u64);
+        assert_eq!(end.sha256, guest_actions::sha256_hex(&whole));
+    }
+
+    let source = rig.path("tree");
+    std::fs::create_dir_all(source.join("n")).unwrap();
+    std::fs::write(source.join("n/a.bin"), &whole).unwrap();
+    let stream = folder_stream(&source);
+    let call = rig
+        .driver
+        .call(
+            "tree-offset",
+            Op::ReadTree {
+                path: "tree".into(),
+            },
+            false,
+            700,
+        )
+        .unwrap();
+    let answer = rig.driver.finish(call).unwrap();
+    assert_eq!(answer.bytes, &stream[700..]);
+    assert_eq!(
+        answer.end.unwrap().sha256,
+        guest_actions::sha256_hex(&stream)
+    );
+
+    rig.exec("out", "printf 0123456789");
+    let call = rig.driver.call("out", exec("unused"), false, 4).unwrap();
+    let answer = rig.driver.finish(call).unwrap();
+    assert_eq!(text(&answer), "456789");
+    assert_eq!(
+        answer.end.unwrap().sha256,
+        guest_actions::sha256_hex(b"0123456789")
+    );
+}
+
+/// RP-15 (TL-1): with protocol 2 the agent sends at most the window beyond
+/// the broker's acknowledgement, and continues as it is acknowledged; with
+/// protocol 1 it never waits.
+#[test]
+fn a_stream_waits_for_acknowledgements_beyond_the_window() {
+    let rig = Rig::v2();
+    let size = (UPLOAD_WINDOW as usize) + 6 * MAX_CHUNK;
+    let whole = pattern(size, 17);
+    std::fs::write(rig.path("big.bin"), &whole).unwrap();
+    let read = Op::Read {
+        path: "big.bin".into(),
+    };
+    // A link of its own, whose queue the test can see.
+    let (broker, end) = memory_pair();
+    let broker = Arc::new(broker);
+    let agent = rig.agent.clone();
+    let serving = thread::spawn(move || agent.serve(Arc::new(end)));
+    let mut driver = Driver::open(Arc::clone(&broker) as Arc<dyn Link>).unwrap();
+    driver.ready(PROTOCOL).unwrap();
+    let call = driver.call("window", read.clone(), false, 0).unwrap();
+    // Wait until the agent stops sending.
+    let mut queued = 0;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        thread::sleep(Duration::from_millis(1000));
+        let now = broker.queued_bytes() as u64;
+        if now == queued || Instant::now() > deadline {
+            break;
+        }
+        queued = now;
+    }
+    let overhead = 64 * 1024;
+    assert!(
+        queued <= UPLOAD_WINDOW + overhead,
+        "{queued} bytes past no acknowledgement"
+    );
+    assert!(queued >= UPLOAD_WINDOW - MAX_CHUNK as u64, "{queued}");
+    driver.ack(call, "window", size as u64).unwrap();
+    let answer = driver.finish(call).unwrap();
+    assert_eq!(answer.bytes.len(), size);
+    assert!(answer.end_matches());
+    broker.close();
+    serving.join().unwrap().unwrap();
+
+    let mut v1 = Rig::new();
+    std::fs::write(v1.path("big.bin"), &whole).unwrap();
+    let answer = v1.run("window-v1", read, b"");
+    assert_eq!(answer.bytes.len(), size);
+}
+
+/// RP-13, RP-15 (TL-1): a tree of 10,000 files is written as one tar
+/// stream, continued after a lost link, lands whole, and reads back whole.
+#[test]
+fn a_tree_of_ten_thousand_files_moves_each_way() {
+    let mut rig = Rig::v2();
+    let source = rig.path("source");
+    for folder in 0..100 {
+        let folder = source.join(format!("d{folder:03}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        for file in 0..100 {
+            std::fs::write(
+                folder.join(format!("f{file:03}.txt")),
+                format!("{folder:?}/{file}"),
+            )
+            .unwrap();
+        }
+    }
+    let stream = folder_stream(&source);
+    let op = Op::WriteTree {
+        path: "copy".into(),
+        name: String::new(),
+    };
+    upload_then_lose(
+        &mut rig,
+        "ten-thousand",
+        op.clone(),
+        &stream[..stream.len() / 2],
+    );
+    assert!(!rig.path("copy").exists());
+    let (_, answer) = resume(&mut rig, "ten-thousand", op, &stream);
+    assert!(matches!(outcome(&answer), Outcome::Written(d) if d.size == stream.len() as u64));
+    let mut count = 0;
+    for folder in std::fs::read_dir(rig.path("copy")).unwrap() {
+        count += std::fs::read_dir(folder.unwrap().path()).unwrap().count();
+    }
+    assert_eq!(count, 10_000);
+    assert!(leftovers(rig.home.path()).is_empty());
+    let read = rig.run(
+        "ten-thousand-read",
+        Op::ReadTree {
+            path: "copy".into(),
+        },
+        b"",
+    );
+    assert!(read.end_matches());
+    let archive = rig.path("back.tar");
+    std::fs::write(&archive, &read.bytes).unwrap();
+    byte_transfer::unpack(&archive, &rig.path("back")).unwrap();
+    let mut count = 0;
+    for folder in std::fs::read_dir(rig.path("back")).unwrap() {
+        count += std::fs::read_dir(folder.unwrap().path()).unwrap().count();
+    }
+    assert_eq!(count, 10_000);
+    assert_eq!(
+        std::fs::read(rig.path("back/d042/f017.txt")).unwrap(),
+        std::fs::read(source.join("d042/f017.txt")).unwrap()
+    );
 }

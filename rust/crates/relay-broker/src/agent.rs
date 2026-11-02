@@ -1,6 +1,11 @@
-//! The broker's end of one relay agent session: send calls with their
-//! uploads, and route what the agent sends back to the call that waits for
-//! it. Many calls run at once on one session.
+//! The broker's end of one relay agent session: send calls, their streams
+//! and acknowledgements, and route what the agent sends back to the call
+//! that waits for it. Many calls run at once on one session.
+//!
+//! The session speaks the lower of the agent's protocol, from its hello,
+//! and the broker's, which the broker announces with `ready` right after
+//! the hello. Protocol 2's fields and `progress` never reach an agent of
+//! protocol 1.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 
 use relay_agent::protocol::{
-    AgentInfo, Call, CallResult, Digest, ExecutionState, Hello, Message, Op, MAX_CHUNK,
+    AgentInfo, Call, CallResult, Digest, ExecutionState, Hello, Message, Op, Ready, PROTOCOL,
 };
 use remote_session::Session;
 
@@ -21,6 +26,8 @@ pub(crate) enum AgentEvent {
     End(Digest),
     Result(CallResult),
     Query(ExecutionState),
+    /// Bytes of the call's upload the agent holds (protocol 2).
+    Progress(u64),
     /// The session ended before the call's result.
     Lost,
 }
@@ -57,6 +64,22 @@ impl AgentConn {
         }
     }
 
+    /// Whether the session speaks protocol 2: resumable uploads, stream
+    /// offsets and `progress`.
+    pub fn v2(&self) -> bool {
+        self.hello.protocol.min(PROTOCOL) >= 2
+    }
+
+    /// Tell the agent the broker's protocol; the first message the broker
+    /// sends on the session.
+    pub fn announce(&self) -> bool {
+        self.send(&Message::Ready(Ready {
+            protocol: PROTOCOL,
+            lease: self.target.name().to_string(),
+            agent: None,
+        }))
+    }
+
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
@@ -80,42 +103,80 @@ impl AgentConn {
         self.session.send(message.encode()).is_ok()
     }
 
-    /// Send one call of `lease` with its upload. Events for it arrive on
-    /// the returned receiver, which ends with a result or
-    /// [`AgentEvent::Lost`].
-    pub fn start(
+    /// Send a call of `lease`, without its stream. `resume` and `offset`
+    /// reach an agent of protocol 2 only. Events for the call arrive on the
+    /// returned receiver, which ends with a result or [`AgentEvent::Lost`].
+    pub fn open(
         &self,
         execution: &str,
         op: &Op,
-        upload: &[u8],
         lease: &str,
-    ) -> Receiver<AgentEvent> {
+        resume: bool,
+        offset: u64,
+    ) -> (u64, Receiver<AgentEvent>) {
         let (call, rx) = self.route();
-        let uploads = op.kind().uploads();
-        let mut sent = self.send(&Message::Call(Call {
+        let v2 = self.v2();
+        let sent = self.send(&Message::Call(Call {
             call,
             execution: execution.to_string(),
             op: op.clone(),
             lease: Some(lease.to_string()),
+            resume: resume && v2,
+            offset: if v2 { offset } else { 0 },
         }));
-        if uploads {
-            for data in upload.chunks(MAX_CHUNK) {
-                sent = sent
-                    && self.send(&Message::Chunk {
-                        call,
-                        data: data.to_vec(),
-                    });
-            }
-            sent = sent
-                && self.send(&Message::End {
-                    call,
-                    execution: execution.to_string(),
-                    size: upload.len() as u64,
-                    sha256: guest_actions::sha256_hex(upload),
-                });
-        }
         if !sent {
             self.lose(call);
+        }
+        (call, rx)
+    }
+
+    /// Send the next bytes of `call`'s upload; false when the session ended.
+    pub fn chunk(&self, call: u64, data: Vec<u8>) -> bool {
+        let sent = self.send(&Message::Chunk { call, data });
+        if !sent {
+            self.lose(call);
+        }
+        sent
+    }
+
+    /// Send the end of `call`'s upload, naming the whole stream.
+    pub fn end(&self, call: u64, execution: &str, end: &Digest) -> bool {
+        let sent = self.send(&Message::End {
+            call,
+            execution: execution.to_string(),
+            size: end.size,
+            sha256: end.sha256.clone(),
+        });
+        if !sent {
+            self.lose(call);
+        }
+        sent
+    }
+
+    /// Acknowledge `committed` bytes of the stream the agent sends for
+    /// `call` (protocol 2).
+    pub fn ack(&self, call: u64, execution: &str, committed: u64) {
+        if self.v2() {
+            let _ = self.send(&Message::Progress {
+                call,
+                execution: execution.to_string(),
+                committed,
+            });
+        }
+    }
+
+    /// Send one call of `lease` that uploads nothing.
+    pub fn start(&self, execution: &str, op: &Op, lease: &str) -> Receiver<AgentEvent> {
+        let (call, rx) = self.open(execution, op, lease, false, 0);
+        if op.kind().uploads() {
+            self.end(
+                call,
+                execution,
+                &Digest {
+                    size: 0,
+                    sha256: guest_actions::sha256_hex(b""),
+                },
+            );
         }
         rx
     }
@@ -130,6 +191,11 @@ impl AgentConn {
             self.lose(call);
         }
         rx
+    }
+
+    /// Stop routing `call`: nobody waits for it any more.
+    pub fn forget(&self, call: u64) {
+        self.routes().remove(&call);
     }
 
     fn lose(&self, call: u64) {
@@ -162,6 +228,9 @@ impl AgentConn {
                 Ok(Message::End {
                     call, size, sha256, ..
                 }) => self.deliver(call, AgentEvent::End(Digest { size, sha256 }), false),
+                Ok(Message::Progress {
+                    call, committed, ..
+                }) => self.deliver(call, AgentEvent::Progress(committed), false),
                 Ok(Message::Result(result)) => {
                     let call = result.call;
                     self.deliver(call, AgentEvent::Result(result), true)

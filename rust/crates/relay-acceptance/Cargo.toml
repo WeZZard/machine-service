@@ -14,6 +14,7 @@ name = "relay-acceptance"
 path = "src/main.rs"
 
 [dependencies]
+byte-transfer = { path = "../byte-transfer" }
 network-rig = { path = "../network-rig" }
 remote-session = { path = "../remote-session" }
 relay-agent = { path = "../relay-agent" }
@@ -23,6 +24,4 @@ sha2.workspace = true
 uuid.workspace = true
 rand.workspace = true
 ureq = { version = "3", default-features = false }
-
-[dev-dependencies]
 tempfile.workspace = true

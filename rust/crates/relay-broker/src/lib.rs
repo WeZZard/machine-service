@@ -30,8 +30,8 @@ use remote_session::{AuthRequest, Authenticator, Rejection, Session, SessionServ
 use crate::agent::{AgentConn, AgentEvent};
 pub use crate::credentials::{credential_sha256, new_credential, Role, Target, Validity};
 use crate::credentials::{Grant, Grants};
-use crate::job::Job;
-pub use crate::job::JobEvent;
+pub use crate::job::{Events, JobEvent, Upload};
+use crate::job::{Feed, Held, Job, JobSpec};
 
 /// How the broker behaves.
 #[derive(Debug, Clone)]
@@ -41,7 +41,9 @@ pub struct BrokerConfig {
     pub agent_wait: Duration,
     /// How long a finished execution record is kept (BK-3: at least 1 h).
     pub retention: Duration,
-    /// The largest upload a call may carry (RP-5).
+    /// The largest upload a client of protocol 1 may send, which the
+    /// broker holds whole (RP-5); a client of protocol 2 streams an upload
+    /// of any size (RP-15).
     pub max_upload: usize,
     /// The largest exec or script output kept in a record for late callers;
     /// beyond it, a late caller gets a replay from the agent.
@@ -116,6 +118,8 @@ pub(crate) struct Inner {
     links: Mutex<Links>,
     links_changed: Condvar,
     jobs: Mutex<HashMap<(Target, String), Arc<Job>>>,
+    /// The bytes of streams the records hold.
+    held: Arc<Held>,
     next_id: AtomicU64,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
     watchers: Mutex<Vec<Arc<AgentWatcher>>>,
@@ -124,8 +128,11 @@ pub(crate) struct Inner {
 /// What an in-process call answered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answer {
-    /// The stream's bytes: an exec's or script's output, or a read's file.
+    /// The stream's bytes: an exec's or script's output, or a read's file,
+    /// unless a sink took them.
     pub bytes: Vec<u8>,
+    /// The size and SHA-256 of the stream as it arrived.
+    pub stream: Digest,
     /// The stream's end.
     pub end: Option<Digest>,
     /// Whether the execution ID had run before.
@@ -137,12 +144,9 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// Whether the bytes match the stream's end.
+    /// Whether the stream that arrived matches its end.
     pub fn end_matches(&self) -> bool {
-        self.end.as_ref().is_some_and(|end| {
-            end.size == self.bytes.len() as u64
-                && end.sha256 == guest_actions::sha256_hex(&self.bytes)
-        })
+        self.end.as_ref() == Some(&self.stream)
     }
 }
 
@@ -152,6 +156,8 @@ pub enum RunError {
     /// The caller's bound passed first. The call still runs, and its
     /// outcome stays in the record for a query.
     Timeout,
+    /// The sink refused the stream's bytes.
+    Sink(String),
     /// The broker dropped the call; this is a bug.
     Internal,
 }
@@ -173,6 +179,7 @@ impl Broker {
                 links: Mutex::new(Links::default()),
                 links_changed: Condvar::new(),
                 jobs: Mutex::new(HashMap::new()),
+                held: Arc::default(),
                 next_id: AtomicU64::new(1),
                 log: Arc::new(log),
                 watchers: Mutex::new(Vec::new()),
@@ -305,51 +312,93 @@ impl Broker {
     }
 
     /// Start or attach to one execution, as a client's call does, and
-    /// receive its events.
-    pub fn submit(
-        &self,
-        target: &Target,
-        execution: &str,
-        op: Op,
-        upload: Vec<u8>,
-    ) -> std::sync::mpsc::Receiver<JobEvent> {
-        self.inner.submit(target, execution, op, upload)
+    /// receive its events. The broker reads `upload` itself, from any
+    /// offset, so an upload continues after the agent's session ends.
+    pub fn submit(&self, target: &Target, execution: &str, op: Op, upload: Upload) -> Events {
+        self.inner
+            .submit(JobSpec {
+                target: target.clone(),
+                lease: String::new(),
+                execution: execution.to_string(),
+                op,
+                feed: Feed::Local(upload),
+                resume: false,
+                offset: 0,
+                transient: false,
+            })
+            .0
     }
 
     /// Run one call through the lease's relay agent and wait up to `timeout`
-    /// for its outcome.
+    /// for its outcome, keeping the stream's bytes in the answer.
     pub fn run(
         &self,
         target: &Target,
         execution: &str,
         op: Op,
-        upload: Vec<u8>,
+        upload: Upload,
         timeout: Duration,
+    ) -> Result<Answer, RunError> {
+        let mut bytes = Vec::new();
+        let mut answer = self.run_into(target, execution, op, upload, timeout, &mut |data| {
+            bytes.extend_from_slice(data);
+            Ok(())
+        })?;
+        answer.bytes = bytes;
+        Ok(answer)
+    }
+
+    /// [`Self::run`], handing the stream's bytes to `sink` as they come
+    /// instead of keeping them, so a stream of any size needs no memory of
+    /// its size.
+    pub fn run_into(
+        &self,
+        target: &Target,
+        execution: &str,
+        op: Op,
+        upload: Upload,
+        timeout: Duration,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
     ) -> Result<Answer, RunError> {
         let events = self.submit(target, execution, op, upload);
         let deadline = Instant::now() + timeout;
-        let mut bytes = Vec::new();
+        let mut tally = guest_actions::Tally::default();
         let mut end = None;
         let mut waited = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match events.recv_timeout(left) {
                 Ok(JobEvent::Pending { .. }) => waited = true,
-                Ok(JobEvent::Chunk(data)) => bytes.extend_from_slice(&data),
+                Ok(JobEvent::Progress(_)) => {}
+                Ok(JobEvent::Chunk(data)) => {
+                    tally.update(&data);
+                    sink(&data).map_err(|error| RunError::Sink(error.to_string()))?;
+                }
                 Ok(JobEvent::End(digest)) => end = Some(digest),
                 Ok(JobEvent::Done { replayed, outcome }) => {
+                    let stream = tally.finish();
                     return Ok(Answer {
-                        bytes,
+                        bytes: Vec::new(),
+                        stream: Digest {
+                            size: stream.size,
+                            sha256: stream.sha256,
+                        },
                         end,
                         replayed,
                         outcome,
                         waited,
-                    })
+                    });
                 }
                 Err(RecvTimeoutError::Timeout) => return Err(RunError::Timeout),
                 Err(RecvTimeoutError::Disconnected) => return Err(RunError::Internal),
             }
         }
+    }
+
+    /// The most bytes of streams the broker held at once: whatever the size
+    /// of the streams, about one window per stream (RP-15).
+    pub fn held_most(&self) -> u64 {
+        self.inner.held.most()
     }
 
     /// Call `watch` with every relay agent that registers, after it is the
@@ -510,6 +559,11 @@ impl Inner {
         };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let conn = Arc::new(AgentConn::new(id, target.clone(), session.clone(), hello));
+        // The broker's protocol, before any call (RP-15).
+        if !conn.announce() {
+            session.close();
+            return;
+        }
         let replaced = {
             let mut links = self.links();
             if links.revoked.contains_key(&target) {
@@ -608,61 +662,67 @@ impl Inner {
         }
     }
 
-    pub(crate) fn submit(
-        self: &Arc<Self>,
-        target: &Target,
-        execution: &str,
-        op: Op,
-        upload: Vec<u8>,
-    ) -> std::sync::mpsc::Receiver<JobEvent> {
-        let key = (target.clone(), execution.to_string());
+    /// Start a record for `spec`, or attach to the record its execution ID
+    /// has. Returns the caller's events and, when a client feeds the new
+    /// record's upload, the record to feed; a caller that attached feeds
+    /// nothing, and its upload is dropped.
+    pub(crate) fn submit(self: &Arc<Self>, mut spec: JobSpec) -> (Events, Option<Arc<Job>>) {
+        let key = (spec.target.clone(), spec.execution.clone());
         let max_kept = self.config.max_kept_output;
-        let lease = self.lease_of(target);
+        spec.lease = self.lease_of(&spec.target);
+        let feeds = matches!(spec.feed, Feed::Client);
         let mut jobs = self.jobs();
         let now = Instant::now();
         jobs.retain(|_, job| !job.expired(now, self.config.retention));
         let existing = jobs.get(&key).cloned();
-        let job = match existing {
-            Some(existing) => {
+        if let Some(existing) = existing {
+            if existing.uploading() {
+                // A later call of an upload that a client still feeds
+                // replaces it: the agent supersedes the first call too.
+                jobs.remove(&key);
                 drop(jobs);
-                if let Some(events) = existing.subscribe(false) {
-                    return events;
-                }
-                // The kept output was dropped for its size: the agent
-                // replays it from its own record.
-                let replay = Arc::new(Job::new(
-                    target.clone(),
-                    existing.lease.clone(),
-                    execution.to_string(),
-                    existing.op.clone(),
-                    upload,
-                    true,
-                    max_kept,
-                ));
-                let events = replay.subscribe(true).expect("a new record takes callers");
-                let inner = Arc::clone(self);
-                std::thread::spawn(move || job::drive(inner, replay));
-                return events;
+                existing.abandon();
+                return self.submit(spec);
             }
-            None => {
-                let job = Arc::new(Job::new(
-                    target.clone(),
-                    lease,
-                    execution.to_string(),
-                    op,
-                    upload,
-                    false,
-                    max_kept,
-                ));
-                jobs.insert(key, Arc::clone(&job));
-                job
+            drop(jobs);
+            if let Some(events) = existing.subscribe(false) {
+                return (events, None);
             }
-        };
+            // The kept output was dropped for its size: the agent replays
+            // it from its own record.
+            let replay = Arc::new(Job::new(
+                JobSpec {
+                    lease: existing.lease.clone(),
+                    op: existing.op.clone(),
+                    feed: Feed::Local(Upload::None),
+                    resume: false,
+                    transient: true,
+                    ..spec
+                },
+                max_kept,
+                Arc::clone(&self.held),
+            ));
+            let events = replay.subscribe(true).expect("a new record takes callers");
+            let inner = Arc::clone(self);
+            std::thread::spawn(move || job::drive(inner, replay));
+            return (events, None);
+        }
+        let job = Arc::new(Job::new(spec, max_kept, Arc::clone(&self.held)));
+        jobs.insert(key, Arc::clone(&job));
         drop(jobs);
         let events = job.subscribe(true).expect("a new record takes callers");
         let inner = Arc::clone(self);
-        std::thread::spawn(move || job::drive(inner, job));
-        events
+        let driven = Arc::clone(&job);
+        std::thread::spawn(move || job::drive(inner, driven));
+        (events, feeds.then_some(job))
+    }
+
+    /// Forget a record that ended without running, so its ID may be sent
+    /// again at once (RP-6).
+    pub(crate) fn forget_unrun(&self, job: &Arc<Job>) {
+        if job.unrun() && !job.transient {
+            self.forget(job);
+        }
     }
 
     /// Forget a record whose call never ran, so its ID may be sent again.
@@ -742,7 +802,6 @@ impl Inner {
                 &Op::Purge {
                     lease: lease.into(),
                 },
-                &[],
                 lease,
             );
             let answered = loop {
@@ -832,7 +891,7 @@ impl Inner {
             "restart:{}",
             guest_actions::hex(&rand::random::<[u8; 16]>())
         );
-        let events = conn.start(&execution, &Op::Restart, &[], &self.lease_of(target));
+        let events = conn.start(&execution, &Op::Restart, &self.lease_of(target));
         let answered = loop {
             match events.recv_timeout(Duration::from_secs(30)) {
                 Ok(AgentEvent::Result(result)) => break Some(result.outcome),

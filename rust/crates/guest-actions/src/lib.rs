@@ -253,14 +253,26 @@ impl Spawned {
     /// group is killed. `on_output` returning false kills the group too,
     /// because nobody can receive the rest.
     pub fn supervise(
-        mut self,
+        self,
         stdin: Option<Vec<u8>>,
+        timeout: Duration,
+        on_output: impl FnMut(&[u8]) -> bool,
+    ) -> Exit {
+        let input = stdin.map(|bytes| Box::new(io::Cursor::new(bytes)) as Box<dyn Read + Send>);
+        self.supervise_from(input, timeout, on_output)
+    }
+
+    /// [`Self::supervise`], with standard input read from `stdin`, such as
+    /// a spooled upload, so the input never has to fit in memory.
+    pub fn supervise_from(
+        mut self,
+        stdin: Option<Box<dyn Read + Send>>,
         timeout: Duration,
         mut on_output: impl FnMut(&[u8]) -> bool,
     ) -> Exit {
-        if let (Some(bytes), Some(mut input)) = (stdin, self.child.stdin.take()) {
+        if let (Some(mut reader), Some(mut input)) = (stdin, self.child.stdin.take()) {
             thread::spawn(move || {
-                let _ = input.write_all(&bytes);
+                let _ = io::copy(&mut reader, &mut input);
             });
         }
         let (finished, watch) = mpsc::channel::<()>();
@@ -306,6 +318,337 @@ impl Spawned {
 
 // --------------------------------------------------------------------- files
 
+/// Where a file written to `path` lands, resolved against `home`, with its
+/// parent folder and its file name. When `path` is an existing directory,
+/// the file goes into it under `name`, as `scp` copies into a directory
+/// under the source's own name.
+fn file_destination(
+    path: &str,
+    name: &str,
+    home: &Path,
+) -> Result<(PathBuf, PathBuf, String), ActionError> {
+    let mut destination = resolve(path, home);
+    if destination.is_dir() {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(ActionError::new(
+                "invalid_request",
+                "a directory destination needs a plain file name",
+            ));
+        }
+        destination = destination.join(name);
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| {
+            ActionError::new(
+                "not_found",
+                format!("no such directory for {}", destination.display()),
+            )
+        })?
+        .to_path_buf();
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| ActionError::new("invalid_request", "destination has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((destination, parent, file_name))
+}
+
+/// Where a folder written to `path` lands, as `scp -r` places it, with its
+/// parent folder and its name. A destination that is a file is refused.
+fn tree_destination(
+    path: &str,
+    name: &str,
+    home: &Path,
+) -> Result<(PathBuf, PathBuf, String), ActionError> {
+    let destination = byte_transfer::tree_destination(&resolve(path, home), name)
+        .map_err(|message| ActionError::new("invalid_request", message))?;
+    let parent = destination
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| {
+            ActionError::new(
+                "not_found",
+                format!("no such directory for {}", destination.display()),
+            )
+        })?
+        .to_path_buf();
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| ActionError::new("invalid_request", "destination has no name"))?
+        .to_string_lossy()
+        .into_owned();
+    if destination.exists() && !destination.is_dir() {
+        return Err(ActionError::new(
+            "not_a_directory",
+            format!("{} exists and is not a folder", destination.display()),
+        ));
+    }
+    Ok((destination, parent, file_name))
+}
+
+// ------------------------------------------------------------------ spools
+
+/// The bytes of a resumable upload so far, in a file of their own: the
+/// temporary sibling of a file's destination, a folder's tar stream beside
+/// it, or a command's standard input. A spool lives as long as its upload,
+/// across lost links and restarts of the agent; it is reopened by its path
+/// and continues where its committed bytes end. Nothing in it is visible at
+/// the destination before the commit point.
+pub struct Spool {
+    path: PathBuf,
+    file: File,
+    tally: Tally,
+    synced: u64,
+}
+
+impl Spool {
+    /// A new, empty spool at `path`, replacing whatever is there.
+    pub fn create(path: &Path) -> Result<Spool, ActionError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(path)
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        Ok(Spool {
+            path: path.to_path_buf(),
+            file,
+            tally: Tally::default(),
+            synced: 0,
+        })
+    }
+
+    /// Reopen the spool at `path`, keeping its first `committed` bytes and
+    /// dropping whatever follows them; the kept bytes are hashed again, so
+    /// the stream's SHA-256 still covers it whole. A spool shorter than
+    /// `committed` is refused (`write_failed`): its bytes were lost.
+    pub fn reopen(path: &Path, committed: u64) -> Result<Spool, ActionError> {
+        let failed = |error: io::Error| ActionError::new("write_failed", error.to_string());
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(path)
+            .map_err(failed)?;
+        let length = file.metadata().map_err(failed)?.len();
+        if length < committed {
+            return Err(ActionError::new(
+                "write_failed",
+                format!(
+                    "{} holds {length} bytes, fewer than the {committed} committed",
+                    path.display()
+                ),
+            ));
+        }
+        file.set_len(committed).map_err(failed)?;
+        let mut tally = Tally::default();
+        let mut buffer = vec![0u8; 1 << 20];
+        let mut reader = io::Read::by_ref(&mut file).take(committed);
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => tally.update(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(failed(error)),
+            }
+        }
+        if tally.size() != committed {
+            return Err(ActionError::new(
+                "write_failed",
+                format!("{} could not be read back whole", path.display()),
+            ));
+        }
+        Ok(Spool {
+            path: path.to_path_buf(),
+            file,
+            tally,
+            synced: committed,
+        })
+    }
+
+    /// The spool's file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append the next bytes of the stream.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), ActionError> {
+        self.file
+            .write_all(bytes)
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        self.tally.update(bytes);
+        Ok(())
+    }
+
+    /// The bytes appended so far.
+    pub fn written(&self) -> u64 {
+        self.tally.size()
+    }
+
+    /// The bytes known to be on the disk: those of the last [`Self::sync`].
+    pub fn committed(&self) -> u64 {
+        self.synced
+    }
+
+    /// Flush every byte appended to the disk, and return how many there
+    /// are: the committed offset a sender continues from.
+    pub fn sync(&mut self) -> Result<u64, ActionError> {
+        if self.synced != self.written() {
+            self.file
+                .sync_data()
+                .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+            self.synced = self.written();
+        }
+        Ok(self.synced)
+    }
+
+    /// Check the stream against the size and SHA-256 of its end. Fewer
+    /// bytes than the end names is `upload_incomplete`: the spool is kept
+    /// and the sender continues from its committed offset. More bytes, or
+    /// another SHA-256, is `checksum_mismatch`: the stream is wrong and the
+    /// caller discards it. Neither ever reaches the destination.
+    pub fn check(&mut self, size: u64, sha256: &str) -> Result<Digest256, ActionError> {
+        let written = self.written();
+        if written < size {
+            return Err(ActionError::new(
+                "upload_incomplete",
+                format!("the agent holds {written} of the {size} bytes the end names"),
+            ));
+        }
+        let digest = self.tally.clone().finish();
+        if digest.size != size || digest.sha256 != sha256 {
+            return Err(ActionError::new(
+                "checksum_mismatch",
+                "the upload does not match its end",
+            ));
+        }
+        self.file
+            .sync_all()
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        self.synced = written;
+        Ok(digest)
+    }
+
+    /// Remove the spool's file.
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// The spool's bytes from the start, for a command's standard input.
+    pub fn reader(&self) -> io::Result<File> {
+        File::open(&self.path)
+    }
+}
+
+/// Where a resumable file write lands: its destination, and the temporary
+/// sibling its bytes are spooled to, named by `key` so that a resumed
+/// upload of the same execution finds it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileTarget {
+    /// The path the file is renamed to at the commit point.
+    pub destination: PathBuf,
+    /// The hidden sibling that holds the bytes until then.
+    pub partial: PathBuf,
+}
+
+/// Resolve a resumable write to `path`, as [`AtomicFile::create`] does.
+pub fn file_target(
+    path: &str,
+    name: &str,
+    home: &Path,
+    tag: &str,
+    key: &str,
+) -> Result<FileTarget, ActionError> {
+    let (destination, parent, file_name) = file_destination(path, name, home)?;
+    Ok(FileTarget {
+        partial: parent.join(format!(".{file_name}.{tag}-{key}.part")),
+        destination,
+    })
+}
+
+/// Seal a spooled file whose stream [`Spool::check`] accepted: its bytes
+/// are on the disk; set its mode, and it waits to be renamed into place.
+pub fn seal_spooled_file(
+    spool: Spool,
+    digest: Digest256,
+    destination: &Path,
+    mode: Option<u32>,
+) -> Result<Sealed, ActionError> {
+    let sealed = Sealed {
+        temporary: spool.path.clone(),
+        destination: destination.to_path_buf(),
+        digest,
+        renamed: false,
+    };
+    drop(spool);
+    if let Some(mode) = mode {
+        std::fs::set_permissions(
+            &sealed.temporary,
+            std::fs::Permissions::from_mode(mode & 0o7777),
+        )
+        .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+    }
+    Ok(sealed)
+}
+
+/// Where a resumable folder write lands: its destination, the hidden
+/// sibling its tar stream is spooled to, and the one it is unpacked into,
+/// both named by `key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeTarget {
+    /// The path the folder is put at, at the commit point.
+    pub destination: PathBuf,
+    /// The hidden sibling that holds the tar stream.
+    pub partial: PathBuf,
+    /// The hidden sibling the stream is unpacked into at the commit point.
+    pub staged: PathBuf,
+}
+
+/// Resolve a resumable folder write to `path`, as [`AtomicTree::create`]
+/// does.
+pub fn tree_target(
+    path: &str,
+    name: &str,
+    home: &Path,
+    tag: &str,
+    key: &str,
+) -> Result<TreeTarget, ActionError> {
+    let (destination, parent, file_name) = tree_destination(path, name, home)?;
+    let stem = format!(".{file_name}.{tag}-{key}");
+    Ok(TreeTarget {
+        partial: parent.join(format!("{stem}.tar.part")),
+        staged: parent.join(format!("{stem}.tree.tmp")),
+        destination,
+    })
+}
+
+/// Unpack a spooled tar stream that [`Spool::check`] accepted into
+/// `staged`, beside `destination`, and remove the spool. A stream that
+/// names a path outside the folder, a link or a device is refused whole
+/// (`bad_archive`), and nothing is left of it.
+pub fn seal_spooled_tree(
+    spool: Spool,
+    digest: Digest256,
+    staged: &Path,
+    destination: &Path,
+) -> Result<SealedTree, ActionError> {
+    let path = spool.path.clone();
+    drop(spool);
+    let _ = std::fs::remove_dir_all(staged);
+    let unpacked = byte_transfer::unpack(&path, staged)
+        .map_err(|message| ActionError::new("bad_archive", message));
+    let _ = std::fs::remove_file(&path);
+    unpacked?;
+    Ok(SealedTree {
+        staged: staged.to_path_buf(),
+        destination: destination.to_path_buf(),
+        digest,
+        placed: false,
+    })
+}
+
 /// A file being written to a temporary sibling of its destination. Dropping
 /// it before [`Sealed::rename`] removes the temporary file, so a reader never
 /// sees a partial file and an abandoned write leaves nothing behind.
@@ -339,31 +682,9 @@ impl AtomicFile {
         tag: &str,
         unique: u64,
     ) -> Result<AtomicFile, ActionError> {
-        let mut destination = resolve(path, home);
-        if destination.is_dir() {
-            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-                return Err(ActionError::new(
-                    "invalid_request",
-                    "a directory destination needs a plain file name",
-                ));
-            }
-            destination = destination.join(name);
-        }
-        let parent = destination
-            .parent()
-            .filter(|parent| parent.is_dir())
-            .ok_or_else(|| {
-                ActionError::new(
-                    "not_found",
-                    format!("no such directory for {}", destination.display()),
-                )
-            })?;
-        let file_name = destination
-            .file_name()
-            .ok_or_else(|| ActionError::new("invalid_request", "destination has no file name"))?;
+        let (destination, parent, file_name) = file_destination(path, name, home)?;
         let temporary = parent.join(format!(
-            ".{}.{tag}-{}-{unique}.tmp",
-            file_name.to_string_lossy(),
+            ".{file_name}.{tag}-{}-{unique}.tmp",
             std::process::id()
         ));
         let file = File::create(&temporary)
@@ -530,28 +851,7 @@ impl AtomicTree {
         tag: &str,
         unique: u64,
     ) -> Result<AtomicTree, ActionError> {
-        let destination = byte_transfer::tree_destination(&resolve(path, home), name)
-            .map_err(|message| ActionError::new("invalid_request", message))?;
-        let parent = destination
-            .parent()
-            .filter(|parent| parent.is_dir())
-            .ok_or_else(|| {
-                ActionError::new(
-                    "not_found",
-                    format!("no such directory for {}", destination.display()),
-                )
-            })?;
-        let file_name = destination
-            .file_name()
-            .ok_or_else(|| ActionError::new("invalid_request", "destination has no name"))?
-            .to_string_lossy()
-            .into_owned();
-        if destination.exists() && !destination.is_dir() {
-            return Err(ActionError::new(
-                "not_a_directory",
-                format!("{} exists and is not a folder", destination.display()),
-            ));
-        }
+        let (destination, parent, file_name) = tree_destination(path, name, home)?;
         let stem = format!(".{file_name}.{tag}-{}-{unique}", std::process::id());
         let spool = parent.join(format!("{stem}.tar.tmp"));
         let file = File::create(&spool)

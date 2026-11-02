@@ -1,37 +1,49 @@
 //! The relay agent's core (`docs/arch/relay-agent.md`, RA-5).
 //!
-//! An [`Agent`] owns the durable execution records and the running
-//! operations. [`Agent::serve`] answers one link until it closes; the agent
-//! outlives its links, so a command keeps running while the broker
-//! reconnects, and its output waits in the record for whoever asks next.
+//! An [`Agent`] owns the durable execution records, the uploads between
+//! their call and their end, and the running operations. [`Agent::serve`]
+//! answers one link until it closes; the agent outlives its links, so a
+//! command keeps running while the broker reconnects, its output waits in
+//! the record for whoever asks next, and an upload waits in its spool for a
+//! sender to continue it (`docs/arch/relay-protocol.md`, RP-15).
 //!
-//! Each call has one commit point. `exec`, `script` and `write` commit at
-//! their end message, after the uploaded bytes matched it; `read`, `cancel`
-//! and `status` commit when they arrive. The record reaches the disk at the
-//! commit point, before the operation takes effect, so an execution ID runs
-//! at most once, even across a restart of the agent. A call with a recorded
-//! execution ID never runs again: it receives the recorded outcome, or it
-//! attaches to the operation still running.
+//! Each call has one commit point. `exec`, `script`, `write` and
+//! `write_tree` commit at their end message, after the uploaded stream, all
+//! of it, matched it; `read`, `read_tree`, `cancel` and `status` commit when
+//! they arrive. The record reaches the disk at the commit point, before the
+//! operation takes effect, so an execution ID runs at most once, even across
+//! a restart of the agent. A call with a recorded execution ID never runs
+//! again: it receives the recorded outcome, or it attaches to the operation
+//! still running.
+//!
+//! A link speaks protocol 1 until the broker's `ready` names protocol 2.
+//! With protocol 2 the agent reports each upload's committed offset with
+//! `progress`, keeps an upload whose link ended for a sender to continue,
+//! and sends at most [`UPLOAD_WINDOW`] bytes of a stream beyond the broker's
+//! last `progress` for it.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use guest_actions::ownership::{Owner, Ownership};
-use guest_actions::{kill_command, AtomicFile, AtomicTree, Sealed, SealedTree, Tally};
+use guest_actions::{
+    kill_command, seal_spooled_file, seal_spooled_tree, Sealed, SealedTree, Tally,
+};
 
 use crate::link::{Link, LinkError};
 use crate::protocol::{
     Call, CallResult, CancelFound, Digest, ExecutionState, Hello, Message, Op, OpKind, Outcome,
-    Report, Status, MAX_CHUNK, PROTOCOL,
+    Report, Status, MAX_CHUNK, PROGRESS_STEP, PROTOCOL, UPLOAD_WINDOW,
 };
-use crate::store::Store;
+use crate::store::{now_ms, Store};
+use crate::uploads::{self, Landing, Upload, Uploads, UPLOAD_RETENTION};
 
 /// How often the agent sends a heartbeat; well under TC-3's 30 seconds.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
@@ -40,8 +52,6 @@ pub const HEARTBEAT: Duration = Duration::from_secs(10);
 /// only removes the records of a lease whose purge never came, such as
 /// after a crash of machine-service (DC-175).
 pub const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// The largest standard input or script a call may upload.
-pub const MAX_UPLOAD: usize = 256 << 20;
 /// The longest execution ID.
 pub const MAX_EXECUTION_ID: usize = 256;
 /// The most executions a hello reports.
@@ -106,6 +116,8 @@ struct Inner {
     /// Signalled whenever a running operation ends.
     settled: Condvar,
     links: Mutex<HashMap<u64, Arc<dyn Link>>>,
+    /// The uploads between their call and their end, by execution ID.
+    uploads: Mutex<Uploads>,
     next: AtomicU64,
     stopping: AtomicBool,
     /// What a committed restart runs; without one, a restart is refused.
@@ -174,43 +186,115 @@ impl State {
     }
 }
 
-/// A call waiting for its end message.
-struct Pending {
-    execution: String,
-    op: Op,
-    lease: Option<String>,
-    upload: Upload,
-}
-
-enum Upload {
-    Bytes(Vec<u8>, Tally),
-    /// Dropping the file removes its temporary sibling.
-    File(AtomicFile),
-    /// Dropping the tree removes its spool and its unpacked folder.
-    Tree(AtomicTree),
-}
-
 /// What a call brings to its commit point.
 enum Committed {
-    Bytes(Vec<u8>),
+    /// A command's standard input, from its spool.
+    Input(Option<File>),
     File(Sealed),
     Tree(SealedTree),
     Nothing,
+}
+
+/// The broker's acknowledgements of the streams the agent sends on one link
+/// (protocol 2), and the protocol the link speaks.
+#[derive(Default)]
+struct Flow {
+    protocol: AtomicU32,
+    acked: Mutex<FlowState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct FlowState {
+    acked: HashMap<u64, u64>,
+    closed: bool,
+}
+
+impl Flow {
+    fn new() -> Flow {
+        Flow {
+            protocol: AtomicU32::new(1),
+            ..Flow::default()
+        }
+    }
+
+    /// Whether the broker speaks protocol 2 on this link.
+    fn v2(&self) -> bool {
+        self.protocol.load(Ordering::SeqCst) >= 2
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FlowState> {
+        self.acked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn ack(&self, call: u64, committed: u64) {
+        let mut state = self.lock();
+        let acked = state.acked.entry(call).or_default();
+        *acked = (*acked).max(committed);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn forget(&self, call: u64) {
+        self.lock().acked.remove(&call);
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait until `call`'s stream may hold `sent` bytes: no more than
+    /// [`UPLOAD_WINDOW`] beyond what the broker acknowledged. Returns false
+    /// when the link ended or `stop` says to give up.
+    fn wait(&self, call: u64, sent: u64, stop: &dyn Fn() -> bool) -> bool {
+        if !self.v2() {
+            return true;
+        }
+        let mut state = self.lock();
+        loop {
+            if state.closed || stop() {
+                return false;
+            }
+            let acked = state.acked.get(&call).copied().unwrap_or(0);
+            if sent <= acked + UPLOAD_WINDOW {
+                return true;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, Duration::from_millis(500))
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+    }
+}
+
+/// An upload call this link feeds, and the progress it last reported.
+struct Feeding {
+    execution: String,
+    reported: u64,
 }
 
 /// One link being served.
 struct Session {
     inner: Arc<Inner>,
     link: Arc<dyn Link>,
-    pending: HashMap<u64, Pending>,
+    /// The link's number among the agent's links.
+    number: u64,
+    /// The upload calls this link feeds, by call number.
+    calls: HashMap<u64, Feeding>,
     /// Calls whose answer is still being sent.
     active: Arc<Mutex<HashSet<u64>>>,
+    flow: Arc<Flow>,
 }
 
 impl Agent {
-    /// Open the agent's records under `options.state`.
+    /// Open the agent's records and its uploads under `options.state`.
     pub fn open(options: AgentOptions) -> std::io::Result<Agent> {
         let store = Store::open(&options.state, options.retention)?;
+        let uploads = uploads::load(&uploads::root(&options.state), &store)?;
         Ok(Agent {
             inner: Arc::new(Inner {
                 options,
@@ -220,6 +304,7 @@ impl Agent {
                 }),
                 settled: Condvar::new(),
                 links: Mutex::new(HashMap::new()),
+                uploads: Mutex::new(uploads),
                 next: AtomicU64::new(1),
                 stopping: AtomicBool::new(false),
                 restart: Mutex::new(None),
@@ -238,7 +323,8 @@ impl Agent {
     }
 
     /// Serve one link until it closes: send the hello, then answer every
-    /// message. Operations still running when the link closes keep running.
+    /// message. Operations still running when the link closes keep running,
+    /// and so do the uploads it fed when it spoke protocol 2.
     /// A malformed message closes the link and is returned as an error.
     pub fn serve(&self, link: Arc<dyn Link>) -> Result<(), LinkError> {
         if self.is_stopped() {
@@ -254,8 +340,10 @@ impl Agent {
         let mut session = Session {
             inner: Arc::clone(&self.inner),
             link: Arc::clone(&link),
-            pending: HashMap::new(),
+            number,
+            calls: HashMap::new(),
             active: Arc::default(),
+            flow: Arc::new(Flow::new()),
         };
         let (stop, stopped) = mpsc::channel::<()>();
         let served = session.hello().and_then(|()| {
@@ -284,8 +372,10 @@ impl Agent {
             }
         });
         drop(stop);
-        drop(session);
         self.inner.links.lock().unwrap().remove(&number);
+        session.release_uploads();
+        session.flow.close();
+        drop(session);
         served
     }
 
@@ -293,11 +383,16 @@ impl Agent {
     /// running command, and wait up to `grace` for running operations to
     /// record their end. An operation stopped this way records
     /// [`Outcome::Interrupted`]; one that does not end in time is recorded so
-    /// when the records are next opened.
+    /// when the records are next opened. Every upload's bytes are flushed,
+    /// so the next agent continues it.
     pub fn shutdown(&self, grace: Duration) {
         self.inner.stopping.store(true, Ordering::SeqCst);
         for link in self.inner.links.lock().unwrap().values() {
             link.close();
+        }
+        let uploads: Vec<_> = self.inner.uploads().values().cloned().collect();
+        for upload in uploads {
+            let _ = lock(&upload).sync();
         }
         let mut state = self.inner.lock();
         for live in state.live.values() {
@@ -332,13 +427,27 @@ impl Agent {
     pub fn query(&self, execution: &str) -> ExecutionState {
         self.inner.lock().execution_state(execution)
     }
+
+    /// The bytes the agent holds of the upload of `execution`, when it holds
+    /// one that has not reached its commit point.
+    pub fn upload_held(&self, execution: &str) -> Option<u64> {
+        let upload = self.inner.uploads().get(execution).cloned()?;
+        let held = lock(&upload).held();
+        Some(held)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 impl Inner {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        lock(&self.state)
+    }
+
+    fn uploads(&self) -> MutexGuard<'_, Uploads> {
+        lock(&self.uploads)
     }
 
     fn status(&self, state: &State) -> Status {
@@ -365,6 +474,72 @@ impl Inner {
         live.changed.notify_all();
         self.settled.notify_all();
     }
+
+    /// Answer `call` on link `number` with a refusal, when that link is
+    /// still served.
+    fn refuse_on(&self, number: u64, call: u64, execution: &str, code: &str, message: &str) {
+        let link = self.links.lock().unwrap().get(&number).cloned();
+        if let Some(link) = link {
+            let _ = link.send(
+                Message::Result(CallResult {
+                    call,
+                    execution: execution.to_string(),
+                    replayed: false,
+                    outcome: Outcome::refused(code, message),
+                })
+                .encode(),
+            );
+        }
+    }
+
+    /// Drop the upload of `execution`, refusing the call that feeds it with
+    /// `code`. Returns whether there was one.
+    fn discard_upload(&self, execution: &str, code: &str, message: &str) -> bool {
+        let Some(upload) = self.uploads().remove(execution) else {
+            return false;
+        };
+        let upload = Arc::try_unwrap(upload)
+            .map(|mutex| mutex.into_inner().unwrap_or_else(|p| p.into_inner()));
+        match upload {
+            Ok(upload) => {
+                if let Some((number, call)) = upload.owner {
+                    self.refuse_on(number, call, execution, code, message);
+                }
+                upload.discard();
+            }
+            // A link is appending to it this moment; its owner check fails
+            // from now on, and the spool goes with the last reference.
+            Err(shared) => {
+                let owner = lock(&shared).owner.take();
+                if let Some((number, call)) = owner {
+                    self.refuse_on(number, call, execution, code, message);
+                }
+                let mut upload = lock(&shared);
+                if let Some(spool) = upload.spool.take() {
+                    spool.discard();
+                }
+                upload.forget();
+            }
+        }
+        true
+    }
+
+    /// Drop the uploads nobody continued within [`UPLOAD_RETENTION`].
+    fn prune_uploads(&self) {
+        let horizon = now_ms().saturating_sub(UPLOAD_RETENTION.as_millis() as u64);
+        let stale: Vec<String> = self
+            .uploads()
+            .iter()
+            .filter(|(_, upload)| {
+                let upload = lock(upload);
+                upload.owner.is_none() && upload.updated_ms < horizon
+            })
+            .map(|(execution, _)| execution.clone())
+            .collect();
+        for execution in stale {
+            self.discard_upload(&execution, "cancelled", "the upload expired");
+        }
+    }
 }
 
 impl Session {
@@ -373,6 +548,7 @@ impl Session {
     }
 
     fn hello(&self) -> Result<(), LinkError> {
+        self.inner.prune_uploads();
         let (in_flight, carried) = {
             let mut state = self.inner.lock();
             state.store.prune(self.inner.options.retention);
@@ -438,6 +614,17 @@ impl Session {
         }));
     }
 
+    /// Tell the broker how many bytes of an upload the agent holds.
+    fn progress(&self, call: u64, execution: &str, committed: u64) {
+        if self.flow.v2() {
+            let _ = self.send(&Message::Progress {
+                call,
+                execution: execution.to_string(),
+                committed,
+            });
+        }
+    }
+
     fn handle(&mut self, message: Message) {
         match message {
             Message::Call(call) => self.call(call),
@@ -456,13 +643,20 @@ impl Session {
                     state,
                 });
             }
+            Message::Progress {
+                call, committed, ..
+            } => self.flow.ack(call, committed),
+            // The broker's protocol: the lower of the two is spoken.
+            Message::Ready(ready) => self
+                .flow
+                .protocol
+                .store(ready.protocol.min(PROTOCOL), Ordering::SeqCst),
             // Heartbeats need no answer; the rest are the agent's own
             // messages, which a broker does not send.
             Message::Heartbeat
             | Message::Hello(_)
             | Message::Result(_)
             | Message::QueryResult { .. }
-            | Message::Ready(_)
             | Message::Pending(_)
             | Message::Revoked { .. } => {}
         }
@@ -475,6 +669,8 @@ impl Session {
             execution,
             op,
             lease,
+            resume,
+            offset,
         }: Call,
     ) {
         if execution.is_empty() || execution.len() > MAX_EXECUTION_ID {
@@ -485,7 +681,8 @@ impl Session {
                 format!("an execution ID has 1 to {MAX_EXECUTION_ID} bytes"),
             );
         }
-        if self.pending.contains_key(&call) || self.active.lock().unwrap().contains(&call) {
+        let feeding = self.calls.contains_key(&call) && self.fed(call).is_some();
+        if feeding || self.active.lock().unwrap().contains(&call) {
             return self.refuse(call, &execution, "call_in_use", "the call number is in use");
         }
         let timeout = match &op {
@@ -501,115 +698,138 @@ impl Session {
             );
         }
         if let Some(known) = self.inner.lock().known(&execution) {
-            return self.answer(call, execution, known, true);
+            return self.answer(call, execution, known, true, offset);
         }
-        // A call resent before its commit point replaces the first, which
-        // has not run and now never will.
-        let superseded: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| pending.execution == execution)
-            .map(|(number, _)| *number)
-            .collect();
-        for number in superseded {
-            self.pending.remove(&number);
-            self.refuse(
-                number,
-                &execution,
-                "superseded",
-                "a later call carries the same execution ID",
-            );
+        if op.kind().uploads() {
+            return self.open_upload(call, execution, op, lease, resume);
         }
-        let upload = match &op {
-            Op::Exec { .. } | Op::Script { .. } => Upload::Bytes(Vec::new(), Tally::default()),
-            Op::Write { path, name, mode } => {
-                let unique = self.inner.next.fetch_add(1, Ordering::SeqCst);
-                match AtomicFile::create(
-                    path,
-                    name,
-                    *mode,
-                    &self.inner.options.home,
-                    "relay-agent",
-                    unique,
-                ) {
-                    Ok(file) => Upload::File(file),
-                    Err(error) => return self.refuse(call, &execution, error.code, error.message),
+        self.commit(call, execution, op, lease, Committed::Nothing, offset);
+    }
+
+    /// Take an upload call: continue the upload this execution ID has when
+    /// the call resumes it, else start one, and tell the sender where its
+    /// chunks start. A call for an execution another call feeds supersedes
+    /// that call, which has not reached its commit point and now never will.
+    fn open_upload(
+        &mut self,
+        call: u64,
+        execution: String,
+        op: Op,
+        lease: Option<String>,
+        resume: bool,
+    ) {
+        let existing = self.inner.uploads().get(&execution).cloned();
+        let kept = existing.and_then(|upload| {
+            let mut held = lock(&upload);
+            if let Some((number, old)) = held.owner.take() {
+                if (number, old) != (self.number, call) {
+                    if number == self.number {
+                        self.calls.remove(&old);
+                    }
+                    self.inner.refuse_on(
+                        number,
+                        old,
+                        &execution,
+                        "superseded",
+                        "a later call carries the same execution ID",
+                    );
                 }
             }
-            Op::WriteTree { path, name } => {
-                let unique = self.inner.next.fetch_add(1, Ordering::SeqCst);
-                match AtomicTree::create(
-                    path,
-                    name,
-                    &self.inner.options.home,
-                    "relay-agent",
-                    unique,
-                ) {
-                    Ok(tree) => Upload::Tree(tree),
-                    Err(error) => return self.refuse(call, &execution, error.code, error.message),
+            let same = resume && held.op == op;
+            drop(held);
+            if same {
+                Some(upload)
+            } else {
+                self.inner.discard_upload(&execution, "superseded", "");
+                None
+            }
+        });
+        let upload = match kept {
+            Some(upload) => {
+                let opened = lock(&upload).open_spool();
+                match opened {
+                    Ok(()) => upload,
+                    Err(error) => {
+                        self.inner.discard_upload(&execution, "", "");
+                        return self.refuse(call, &execution, error.code, error.message);
+                    }
                 }
             }
-            Op::Read { .. }
-            | Op::ReadTree { .. }
-            | Op::Cancel { .. }
-            | Op::Status
-            | Op::Restart
-            | Op::Purge { .. } => {
-                return self.commit(call, execution, op, lease, Committed::Nothing);
+            None => {
+                let root = uploads::root(&self.inner.options.state);
+                match Upload::create(&root, &self.inner.options.home, &execution, op, lease) {
+                    Ok(upload) => {
+                        let upload = Arc::new(Mutex::new(upload));
+                        self.inner
+                            .uploads()
+                            .insert(execution.clone(), Arc::clone(&upload));
+                        upload
+                    }
+                    Err(error) => return self.refuse(call, &execution, error.code, error.message),
+                }
             }
         };
-        self.pending.insert(
+        let held = {
+            let mut upload = lock(&upload);
+            upload.owner = Some((self.number, call));
+            upload.held()
+        };
+        self.calls.insert(
             call,
-            Pending {
-                execution,
-                op,
-                lease,
-                upload,
+            Feeding {
+                execution: execution.clone(),
+                reported: held,
             },
         );
+        self.progress(call, &execution, held);
+    }
+
+    /// The upload `call` feeds on this link, when it still does.
+    fn fed(&mut self, call: u64) -> Option<(String, Arc<Mutex<Upload>>)> {
+        let execution = self.calls.get(&call)?.execution.clone();
+        let upload = self.inner.uploads().get(&execution).cloned();
+        let owned = upload.filter(|upload| lock(upload).owner == Some((self.number, call)));
+        if owned.is_none() {
+            // Superseded, cancelled or expired: its chunks are dropped.
+            self.calls.remove(&call);
+        }
+        owned.map(|upload| (execution, upload))
     }
 
     fn chunk(&mut self, call: u64, data: &[u8]) {
         // Chunks of a call that already failed may still be on the way.
-        let Some(pending) = self.pending.get_mut(&call) else {
+        let Some((execution, upload)) = self.fed(call) else {
             return;
         };
-        let failed = match &mut pending.upload {
-            Upload::Bytes(bytes, tally) => {
-                if bytes.len() + data.len() > MAX_UPLOAD {
-                    Some(("too_large", "the upload exceeds the limit".to_string()))
-                } else {
-                    bytes.extend_from_slice(data);
-                    tally.update(data);
-                    None
+        let appended = {
+            let mut upload = lock(&upload);
+            upload.append(data).map(|()| upload.held())
+        };
+        match appended {
+            Ok(held) => {
+                let feeding = self.calls.get_mut(&call).expect("a fed call");
+                if held >= feeding.reported + PROGRESS_STEP {
+                    feeding.reported = held;
+                    self.progress(call, &execution, held);
                 }
             }
-            Upload::File(file) => file
-                .append(data)
-                .err()
-                .map(|error| (error.code, error.message)),
-            Upload::Tree(tree) => tree
-                .append(data)
-                .err()
-                .map(|error| (error.code, error.message)),
-        };
-        if let Some((code, message)) = failed {
-            let pending = self.pending.remove(&call).expect("a pending call");
-            self.refuse(call, &pending.execution, code, message);
+            Err(error) => {
+                self.calls.remove(&call);
+                lock(&upload).owner = None;
+                self.inner.discard_upload(&execution, "", "");
+                self.refuse(call, &execution, error.code, error.message);
+            }
         }
     }
 
     fn end(&mut self, call: u64, end_execution: &str, size: u64, sha256: &str) {
-        let Some(Pending {
-            execution,
-            op,
-            lease,
-            upload,
-        }) = self.pending.remove(&call)
-        else {
+        let Some(feeding) = self.calls.get(&call) else {
             return;
         };
-        if execution != end_execution {
+        if feeding.execution != end_execution {
+            let execution = feeding.execution.clone();
+            self.calls.remove(&call);
+            self.inner.discard_upload(&execution, "", "");
             return self.refuse(
                 call,
                 &execution,
@@ -617,29 +837,101 @@ impl Session {
                 "the end names another execution ID",
             );
         }
-        let committed = match upload {
-            Upload::Bytes(bytes, tally) => {
-                let digest = tally.finish();
-                if digest.size != size || digest.sha256 != sha256 {
-                    return self.refuse(
-                        call,
-                        &execution,
-                        "checksum_mismatch",
-                        "the upload does not match its end",
-                    );
-                }
-                Committed::Bytes(bytes)
-            }
-            Upload::File(file) => match file.seal(size, sha256) {
-                Ok(sealed) => Committed::File(sealed),
-                Err(error) => return self.refuse(call, &execution, error.code, error.message),
-            },
-            Upload::Tree(tree) => match tree.seal(size, sha256) {
-                Ok(sealed) => Committed::Tree(sealed),
-                Err(error) => return self.refuse(call, &execution, error.code, error.message),
-            },
+        let Some((execution, fed)) = self.fed(call) else {
+            return;
         };
-        self.commit(call, execution, op, lease, committed);
+        self.calls.remove(&call);
+        let checked = {
+            let mut held = lock(&fed);
+            held.owner = None;
+            let checked = held
+                .spool
+                .as_mut()
+                .expect("an open spool")
+                .check(size, sha256);
+            if checked.is_err() {
+                let _ = held.sync();
+            }
+            checked
+        };
+        drop(fed);
+        let digest = match checked {
+            Ok(digest) => digest,
+            // The sender continues from the agent's committed offset; a
+            // broker of protocol 1 cannot, so it hears of a mismatch.
+            Err(error) if error.code == "upload_incomplete" && self.flow.v2() => {
+                return self.refuse(call, &execution, error.code, error.message)
+            }
+            Err(error) if error.code == "upload_incomplete" => {
+                self.inner.discard_upload(&execution, "", "");
+                return self.refuse(
+                    call,
+                    &execution,
+                    "checksum_mismatch",
+                    format!("the upload does not match its end: {}", error.message),
+                );
+            }
+            Err(error) => {
+                self.inner.discard_upload(&execution, "", "");
+                return self.refuse(call, &execution, error.code, error.message);
+            }
+        };
+        let Some(upload) = self.inner.uploads().remove(&execution) else {
+            return self.refuse(call, &execution, "cancelled", "cancelled before its end");
+        };
+        let mut upload = match Arc::try_unwrap(upload) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|p| p.into_inner()),
+            Err(_) => return self.refuse(call, &execution, "superseded", "the upload moved on"),
+        };
+        let spool = upload.spool.take().expect("an open spool");
+        let sealed = match &upload.landing {
+            Landing::File {
+                destination, mode, ..
+            } => seal_spooled_file(spool, digest, destination, *mode).map(Committed::File),
+            Landing::Tree {
+                destination,
+                staged,
+                ..
+            } => seal_spooled_tree(spool, digest, staged, destination).map(Committed::Tree),
+            Landing::Input { .. } => {
+                // An open file keeps the bytes once the record is gone.
+                let input = spool.reader().ok();
+                Ok(Committed::Input(input))
+            }
+        };
+        upload.forget();
+        let (op, lease) = (upload.op, upload.lease);
+        match sealed {
+            Ok(committed) => self.commit(call, execution, op, lease, committed, 0),
+            Err(error) => self.refuse(call, &execution, error.code, error.message),
+        }
+    }
+
+    /// The link ended: an upload it fed waits for a sender to continue it
+    /// when the link spoke protocol 2, and is dropped otherwise, since a
+    /// broker of protocol 1 sends a call whole again.
+    fn release_uploads(&mut self) {
+        let v2 = self.flow.v2();
+        for (call, feeding) in self.calls.drain() {
+            let upload = self.inner.uploads().get(&feeding.execution).cloned();
+            let Some(upload) = upload else {
+                continue;
+            };
+            let owned = {
+                let mut held = lock(&upload);
+                let owned = held.owner == Some((self.number, call));
+                if owned {
+                    held.owner = None;
+                    if v2 {
+                        let _ = held.sync();
+                    }
+                }
+                owned
+            };
+            if owned && !v2 {
+                self.inner.discard_upload(&feeding.execution, "", "");
+            }
+        }
     }
 
     /// Pass the commit point: record the execution, then start it.
@@ -650,12 +942,13 @@ impl Session {
         op: Op,
         lease: Option<String>,
         committed: Committed,
+        offset: u64,
     ) {
         let inner = Arc::clone(&self.inner);
         let mut state = inner.lock();
         if let Some(known) = state.known(&execution) {
             drop(state);
-            return self.answer(call, execution, known, true);
+            return self.answer(call, execution, known, true, offset);
         }
         if inner.stopping.load(Ordering::SeqCst) {
             drop(state);
@@ -667,6 +960,17 @@ impl Session {
         if let Op::Purge { lease: purged } = op {
             let outcome = purge(&mut state, &purged, lease.as_deref());
             drop(state);
+            if matches!(outcome, Outcome::Purged { .. }) {
+                let doomed: Vec<String> = inner
+                    .uploads()
+                    .iter()
+                    .filter(|(_, upload)| lock(upload).lease.as_deref() == Some(purged.as_str()))
+                    .map(|(execution, _)| execution.clone())
+                    .collect();
+                for upload in doomed {
+                    inner.discard_upload(&upload, "cancelled", "the lease's records were purged");
+                }
+            }
             return send_result(&inner, &*self.link, call, &execution, false, outcome);
         }
         if let Err(error) = state.store.begin(&execution, op.kind(), lease.as_deref()) {
@@ -686,21 +990,20 @@ impl Session {
                     stdin,
                     timeout_s,
                 },
-                Committed::Bytes(bytes),
+                Committed::Input(input),
             ) => {
-                let input = stdin.then_some(bytes);
+                let input = input
+                    .filter(|_| stdin)
+                    .map(|file| Box::new(file) as Box<dyn Read + Send>);
                 self.start_command(&mut state, &execution, kind, &command, input, timeout_s)
             }
-            (Op::Script { timeout_s }, Committed::Bytes(bytes)) => {
+            (Op::Script { timeout_s }, Committed::Input(input)) => {
                 let command = guest_actions::script_command();
-                self.start_command(
-                    &mut state,
-                    &execution,
-                    kind,
-                    command,
-                    Some(bytes),
-                    timeout_s,
-                )
+                let input = Some(match input {
+                    Some(file) => Box::new(file) as Box<dyn Read + Send>,
+                    None => Box::new(std::io::empty()),
+                });
+                self.start_command(&mut state, &execution, kind, command, input, timeout_s)
             }
             (Op::Write { .. }, Committed::File(sealed)) => {
                 let outcome = match sealed.rename() {
@@ -728,13 +1031,13 @@ impl Session {
                 let live = new_live(kind);
                 state.live.insert(execution.clone(), Arc::clone(&live));
                 drop(state);
-                return self.start_read(call, execution, live, path, false);
+                return self.start_read(call, execution, live, path, false, offset);
             }
             (Op::ReadTree { path }, _) => {
                 let live = new_live(kind);
                 state.live.insert(execution.clone(), Arc::clone(&live));
                 drop(state);
-                return self.start_read(call, execution, live, path, true);
+                return self.start_read(call, execution, live, path, true, offset);
             }
             (Op::Cancel { target }, _) => {
                 let found = self.cancel(&state, &target);
@@ -754,13 +1057,13 @@ impl Session {
             }
         };
         drop(state);
-        self.answer(call, execution, known, false);
+        self.answer(call, execution, known, false, offset);
     }
 
-    /// A restart commits only while nothing else runs or waits for its end
-    /// on this link, so no execution is in flight when the process is
-    /// replaced; otherwise it is refused with `busy` and not recorded. Its
-    /// record holds the status before the restart, so the agent that
+    /// A restart commits only while nothing else runs or is being answered,
+    /// so no execution is in flight when the process is replaced; otherwise
+    /// it is refused with `busy` and not recorded.
+    /// Its record holds the status before the restart, so the agent that
     /// starts answers a repeated ID from it and never restarts twice.
     fn restart(
         &mut self,
@@ -779,7 +1082,9 @@ impl Session {
                 "this agent cannot restart itself",
             );
         };
-        let others = self.active.lock().unwrap().len() + self.pending.len();
+        // Held uploads do not count: their spools survive the restart, and
+        // their senders continue them on the next session (RP-15).
+        let others = self.active.lock().unwrap().len();
         if !state.live.is_empty() || others > 0 {
             let running = state.live.len() + others;
             drop(state);
@@ -812,6 +1117,10 @@ impl Session {
         for link in inner.links.lock().unwrap().values() {
             link.flush(Duration::from_secs(2));
         }
+        let uploads: Vec<_> = inner.uploads().values().cloned().collect();
+        for upload in uploads {
+            let _ = lock(&upload).sync();
+        }
         let error = restart();
         // The process was not replaced: carry on as before.
         eprintln!("relay-agent: the restart failed: {error}");
@@ -827,20 +1136,15 @@ impl Session {
         if state.store.get(target).is_some() {
             return CancelFound::Completed;
         }
-        let pending: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| pending.execution == target)
-            .map(|(number, _)| *number)
-            .collect();
-        if pending.is_empty() {
-            return CancelFound::Unknown;
+        self.calls.retain(|_, feeding| feeding.execution != target);
+        if self
+            .inner
+            .discard_upload(target, "cancelled", "cancelled before its end")
+        {
+            CancelFound::Discarded
+        } else {
+            CancelFound::Unknown
         }
-        for number in pending {
-            self.pending.remove(&number);
-            self.refuse(number, target, "cancelled", "cancelled before its end");
-        }
-        CancelFound::Discarded
     }
 
     fn start_command(
@@ -849,7 +1153,7 @@ impl Session {
         execution: &str,
         kind: OpKind,
         command: &str,
-        stdin: Option<Vec<u8>>,
+        stdin: Option<Box<dyn Read + Send>>,
         timeout_s: f64,
     ) -> Known {
         let options = &self.inner.options;
@@ -909,7 +1213,7 @@ impl Session {
         thread::spawn(move || {
             let live = supervised;
             let mut tally = Tally::default();
-            let exit = spawned.supervise(stdin, Duration::from_secs_f64(timeout_s), |bytes| {
+            let exit = spawned.supervise_from(stdin, Duration::from_secs_f64(timeout_s), |bytes| {
                 if output.write_all(bytes).is_err() {
                     return false;
                 }
@@ -941,26 +1245,27 @@ impl Session {
         Known::Running(live)
     }
 
-    /// Stream a file's bytes, or a folder's tar stream when `tree` is set.
-    fn start_read(&self, call: u64, execution: String, live: Arc<Live>, path: String, tree: bool) {
+    /// Stream a file's bytes, or a folder's tar stream when `tree` is set,
+    /// from byte `offset` on; the end names the whole stream.
+    fn start_read(
+        &self,
+        call: u64,
+        execution: String,
+        live: Arc<Live>,
+        path: String,
+        tree: bool,
+        offset: u64,
+    ) {
         let inner = Arc::clone(&self.inner);
         let link = Arc::clone(&self.link);
         let active = Arc::clone(&self.active);
+        let flow = Arc::clone(&self.flow);
         active.lock().unwrap().insert(call);
         thread::spawn(move || {
             let path = guest_actions::resolve(&path, &inner.options.home);
-            let send = |bytes: &[u8]| {
-                !live.cancelled.load(Ordering::SeqCst)
-                    && link
-                        .send(
-                            Message::Chunk {
-                                call,
-                                data: bytes.to_vec(),
-                            }
-                            .encode(),
-                        )
-                        .is_ok()
-            };
+            let mut stream = Outgoing::new(call, offset, &*link, &flow);
+            let cancelled = || live.cancelled.load(Ordering::SeqCst);
+            let send = |bytes: &[u8]| !cancelled() && stream.send(bytes, &cancelled);
             let read = if tree {
                 guest_actions::read_tree(&path, MAX_CHUNK, send)
             } else {
@@ -990,16 +1295,19 @@ impl Session {
             };
             inner.settle(&execution, &live, outcome.clone());
             send_result(&inner, &*link, call, &execution, false, outcome);
+            flow.forget(call);
             active.lock().unwrap().remove(&call);
         });
     }
 
     /// Answer a call from what its execution ID has: replay a command's
-    /// recorded output and follow it while it runs, then send the outcome.
-    fn answer(&self, call: u64, execution: String, known: Known, replayed: bool) {
+    /// recorded output from byte `offset` and follow it while it runs, then
+    /// send the outcome.
+    fn answer(&self, call: u64, execution: String, known: Known, replayed: bool, offset: u64) {
         let inner = Arc::clone(&self.inner);
         let link = Arc::clone(&self.link);
         let active = Arc::clone(&self.active);
+        let flow = Arc::clone(&self.flow);
         let op = match &known {
             Known::Running(live) => live.op,
             Known::Completed(op, _) => *op,
@@ -1007,7 +1315,8 @@ impl Session {
         active.lock().unwrap().insert(call);
         thread::spawn(move || {
             let streamed = if op.streams_output() {
-                stream_output(&inner, &*link, call, &execution, &known)
+                let stream = Outgoing::new(call, offset, &*link, &flow);
+                stream_output(&inner, stream, &execution, &known)
             } else {
                 Ok(())
             };
@@ -1018,8 +1327,57 @@ impl Session {
                 };
                 send_result(&inner, &*link, call, &execution, replayed, outcome);
             }
+            flow.forget(call);
             active.lock().unwrap().remove(&call);
         });
+    }
+}
+
+/// The stream of one call's answer as the agent sends it: bytes before
+/// `offset` are counted and not sent, and with protocol 2 at most
+/// [`UPLOAD_WINDOW`] bytes are sent beyond the broker's acknowledgement.
+struct Outgoing<'a> {
+    call: u64,
+    offset: u64,
+    /// Bytes of the stream so far, sent or skipped.
+    position: u64,
+    link: &'a dyn Link,
+    flow: &'a Flow,
+}
+
+impl<'a> Outgoing<'a> {
+    fn new(call: u64, offset: u64, link: &'a dyn Link, flow: &'a Flow) -> Outgoing<'a> {
+        Outgoing {
+            call,
+            offset,
+            position: 0,
+            link,
+            flow,
+        }
+    }
+
+    /// Send the stream's next bytes; false when nobody can receive them.
+    fn send(&mut self, bytes: &[u8], stop: &dyn Fn() -> bool) -> bool {
+        let start = self.position;
+        self.position += bytes.len() as u64;
+        if self.position <= self.offset {
+            return true;
+        }
+        let skip = self.offset.saturating_sub(start) as usize;
+        let fresh = &bytes[skip..];
+        let sent = self.position - self.offset;
+        if !self.flow.wait(self.call, sent, stop) {
+            return false;
+        }
+        self.link
+            .send(
+                Message::Chunk {
+                    call: self.call,
+                    data: fresh.to_vec(),
+                }
+                .encode(),
+            )
+            .is_ok()
     }
 }
 
@@ -1117,19 +1475,21 @@ fn send_result(
 }
 
 /// Send a command's output from its record, following the record while the
-/// command runs, then the end with the size and SHA-256 of what was sent.
+/// command runs, then the end with the size and SHA-256 of the whole
+/// output.
 fn stream_output(
     inner: &Inner,
-    link: &dyn Link,
-    call: u64,
+    mut stream: Outgoing<'_>,
     execution: &str,
     known: &Known,
 ) -> Result<(), LinkError> {
+    let (call, link) = (stream.call, stream.link);
     let path = inner.lock().store.output(execution);
     let mut file = File::open(path).ok();
     let mut tally = Tally::default();
     let mut offset = 0u64;
     let mut buffer = vec![0u8; MAX_CHUNK];
+    let stop = || inner.stopping.load(Ordering::SeqCst);
     loop {
         let (available, done) = match known {
             Known::Running(live) => {
@@ -1162,17 +1522,13 @@ fn stream_output(
             };
             tally.update(&buffer[..count]);
             offset += count as u64;
-            link.send(
-                Message::Chunk {
-                    call,
-                    data: buffer[..count].to_vec(),
-                }
-                .encode(),
-            )?;
+            if !stream.send(&buffer[..count], &stop) {
+                return Err(LinkError::Closed);
+            }
         }
         if file.is_none() {
             // The output record cannot be read; the end reports what was
-            // sent, and the outcome what the command wrote.
+            // read, and the outcome what the command wrote.
             if let Known::Running(live) = known {
                 wait_outcome(live);
             }

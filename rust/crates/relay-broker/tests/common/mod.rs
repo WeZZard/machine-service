@@ -12,7 +12,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use relay_agent::config::Config;
-use relay_agent::protocol::{CallResult, Digest, ExecutionState, Message, Op, Pending, Ready};
+use relay_agent::protocol::{
+    Call, CallResult, Digest, ExecutionState, Message, Op, Pending, Ready, MAX_CHUNK, UPLOAD_WINDOW,
+};
 use relay_agent::session_link::{self, DialOptions};
 use relay_agent::{Agent, AgentOptions};
 use relay_broker::tls::Authority;
@@ -34,6 +36,8 @@ pub struct Options {
     pub agent_wait: Duration,
     pub tls: Option<Arc<Authority>>,
     pub port: u16,
+    /// The session's replay buffer bound, per side.
+    pub max_buffered: Option<usize>,
 }
 
 impl Default for Options {
@@ -43,6 +47,7 @@ impl Default for Options {
             agent_wait: Duration::from_secs(10),
             tls: None,
             port: 0,
+            max_buffered: None,
         }
     }
 }
@@ -73,6 +78,9 @@ impl Harness {
         let mut config = ServerConfig::new(broker.authenticator());
         config.timing = fast_timing();
         config.grace = options.grace;
+        if let Some(max) = options.max_buffered {
+            config.max_buffered = max;
+        }
         if let Some(authority) = &options.tls {
             config.tls = Some(
                 relay_broker::tls::server_config(
@@ -229,6 +237,8 @@ pub struct Collected {
     pub end: Option<Digest>,
     pub result: Option<CallResult>,
     pub query: Option<ExecutionState>,
+    /// Every committed offset the agent reported for an upload.
+    pub progress: Vec<u64>,
 }
 
 impl Collected {
@@ -245,6 +255,8 @@ pub struct TestClient {
     pub session: Session,
     pub ready: Ready,
     calls: Mutex<HashMap<u64, Collected>>,
+    /// Calls whose bytes are only counted and hashed, not kept.
+    hashing: Mutex<HashMap<u64, (u64, sha2::Sha256)>>,
     pub revoked: Mutex<Option<String>>,
 }
 
@@ -253,6 +265,46 @@ pub fn client_config(url: &str, credential: &str) -> ClientConfig {
     config.attributes = serde_json::json!({"role": "client"});
     config.timing = fast_timing();
     config
+}
+
+/// A client that speaks protocol 2: resumable uploads in a window (RP-15).
+pub fn client_config_v2(url: &str, credential: &str) -> ClientConfig {
+    let mut config = client_config(url, credential);
+    config.attributes = serde_json::json!({"role": "client", "protocol": 2});
+    config
+}
+
+/// A stream an upload reads from: `read(offset, buffer)` fills the buffer
+/// with the stream's bytes from `offset`.
+pub trait Source {
+    fn size(&self) -> u64;
+    fn sha256(&self) -> String;
+    fn read(&self, offset: u64, buffer: &mut [u8]);
+}
+
+impl Source for [u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+    fn sha256(&self) -> String {
+        guest_actions::sha256_hex(self)
+    }
+    fn read(&self, offset: u64, buffer: &mut [u8]) {
+        let at = offset as usize;
+        buffer.copy_from_slice(&self[at..at + buffer.len()]);
+    }
+}
+
+/// How a protocol-2 upload of one call went.
+#[derive(Debug, PartialEq)]
+pub enum Streamed {
+    /// Every byte and the end went out; the call's chunks started here.
+    Sent { from: u64 },
+    /// The bytes up to `at` went out and the sender stopped, as a lost
+    /// client would.
+    Stopped { from: u64, at: u64 },
+    /// The call's result came before its stream ended.
+    Answered { from: u64 },
 }
 
 impl TestClient {
@@ -273,6 +325,7 @@ impl TestClient {
             session,
             ready,
             calls: Mutex::default(),
+            hashing: Mutex::default(),
             revoked: Mutex::default(),
         })
     }
@@ -281,11 +334,99 @@ impl TestClient {
         self.session.send(message.encode()).unwrap();
     }
 
+    /// Upload `source` under protocol 2 as call `call`, in the window beyond
+    /// the agent's progress. A call that resumes waits for the agent's
+    /// committed offset and continues there. With `stop_at`, the sender
+    /// stops once that many bytes of the stream went out, without its end.
+    pub fn stream(
+        &self,
+        call: u64,
+        execution: &str,
+        op: Op,
+        source: &(impl Source + ?Sized),
+        resume: bool,
+        stop_at: Option<u64>,
+    ) -> Streamed {
+        self.send(&Message::Call(Call {
+            lease: None,
+            resume,
+            offset: 0,
+            call,
+            execution: execution.into(),
+            op,
+        }));
+        let progressed = |client: &TestClient| {
+            let calls = client.calls.lock().unwrap();
+            let seen = calls.get(&call);
+            (
+                seen.and_then(|c| c.progress.last().copied()),
+                seen.is_some_and(|c| c.result.is_some()),
+            )
+        };
+        let from = if resume {
+            loop {
+                match progressed(self) {
+                    (_, true) => return Streamed::Answered { from: 0 },
+                    (Some(at), _) => break at,
+                    _ => {
+                        self.pump(Duration::from_millis(200)).unwrap();
+                    }
+                }
+            }
+        } else {
+            0
+        };
+        let size = source.size();
+        let mut sent = from;
+        let mut buffer = vec![0u8; MAX_CHUNK];
+        while sent < size {
+            if let Some(stop) = stop_at {
+                if sent >= stop {
+                    return Streamed::Stopped { from, at: sent };
+                }
+            }
+            loop {
+                let (committed, answered) = progressed(self);
+                if answered {
+                    return Streamed::Answered { from };
+                }
+                if sent < committed.unwrap_or(from) + UPLOAD_WINDOW {
+                    break;
+                }
+                self.pump(Duration::from_millis(200)).unwrap();
+            }
+            while self.pump(Duration::ZERO).unwrap() {}
+            let mut want = (size - sent).min(MAX_CHUNK as u64);
+            if let Some(stop) = stop_at {
+                want = want.min(stop - sent);
+            }
+            let piece = &mut buffer[..want as usize];
+            source.read(sent, piece);
+            self.send(&Message::Chunk {
+                call,
+                data: piece.to_vec(),
+            });
+            sent += want;
+        }
+        if stop_at.is_some() {
+            return Streamed::Stopped { from, at: sent };
+        }
+        self.send(&Message::End {
+            call,
+            execution: execution.into(),
+            size,
+            sha256: source.sha256(),
+        });
+        Streamed::Sent { from }
+    }
+
     /// Send a call with its upload and end, when its operation uploads.
     pub fn call(&self, call: u64, execution: &str, op: Op, upload: &[u8]) {
         let uploads = op.kind().uploads();
         self.send(&Message::Call(relay_agent::protocol::Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call,
             execution: execution.into(),
             op,
@@ -306,6 +447,20 @@ impl TestClient {
         }
     }
 
+    /// Count and hash `call`'s bytes instead of keeping them.
+    pub fn hash_only(&self, call: u64) {
+        self.hashing
+            .lock()
+            .unwrap()
+            .insert(call, (0, sha2::Digest::new()));
+    }
+
+    /// The size and SHA-256 of a hashed call's bytes.
+    pub fn hashed(&self, call: u64) -> (u64, String) {
+        let (size, hasher) = self.hashing.lock().unwrap().remove(&call).unwrap();
+        (size, guest_actions::hex(&sha2::Digest::finalize(hasher)))
+    }
+
     pub fn query(&self, call: u64, execution: &str) {
         self.send(&Message::Query {
             call,
@@ -313,13 +468,22 @@ impl TestClient {
         });
     }
 
-    fn pump(&self, timeout: Duration) -> Result<bool, remote_session::Error> {
+    pub fn pump(&self, timeout: Duration) -> Result<bool, remote_session::Error> {
         let Some(body) = self.session.recv_timeout(timeout)? else {
             return Ok(false);
         };
         let mut calls = self.calls.lock().unwrap();
         match Message::decode(&body).unwrap() {
-            Message::Chunk { call, data } => calls.entry(call).or_default().bytes.extend(data),
+            Message::Chunk { call, data } => {
+                let mut hashing = self.hashing.lock().unwrap();
+                match hashing.get_mut(&call) {
+                    Some((size, hasher)) => {
+                        *size += data.len() as u64;
+                        sha2::Digest::update(hasher, &data);
+                    }
+                    None => calls.entry(call).or_default().bytes.extend(data),
+                }
+            }
             Message::End {
                 call, size, sha256, ..
             } => calls.entry(call).or_default().end = Some(Digest { size, sha256 }),
@@ -333,6 +497,9 @@ impl TestClient {
             Message::Pending(pending) => {
                 calls.entry(pending.call).or_default().pending.push(pending)
             }
+            Message::Progress {
+                call, committed, ..
+            } => calls.entry(call).or_default().progress.push(committed),
             Message::Revoked { reason } => *self.revoked.lock().unwrap() = Some(reason),
             other => panic!("unexpected message {other:?}"),
         }

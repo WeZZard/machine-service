@@ -80,6 +80,14 @@ impl MemoryLink {
     pub fn is_closed(&self) -> bool {
         self.shared.0.lock().unwrap().closed
     }
+
+    /// The bytes of the messages waiting for this end to receive them.
+    pub fn queued_bytes(&self) -> usize {
+        self.shared.0.lock().unwrap().queues[self.side]
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
 }
 
 impl Link for MemoryLink {

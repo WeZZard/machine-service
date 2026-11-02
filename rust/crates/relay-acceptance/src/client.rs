@@ -8,6 +8,11 @@
 //! their times, so a scenario can tell how often and how fast it resumed, and
 //! counts every `result` per call number, so a result that arrives twice is
 //! seen.
+//!
+//! The client speaks protocol 2 (RP-15): it keeps an upload within the
+//! window beyond the agent's progress, and [`RelayClient::push`] continues
+//! an upload that ended `upload_incomplete` from the agent's committed
+//! offset.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -19,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use relay_agent::protocol::{
     Call, CallResult, ExecutionState, Message, Op, Outcome, Pending, Ready, MAX_CHUNK,
+    UPLOAD_WINDOW,
 };
 use remote_session::{ClientConfig, LinkEvent, Resolver, Session, SessionEnd, Timing};
 use sha2::{Digest as _, Sha256};
@@ -47,7 +53,7 @@ impl ClientOptions {
         let roots: Vec<&[u8]> = self.roots_pem.iter().map(|pem| pem.as_bytes()).collect();
         let tls = remote_session::tls::client_config(&roots).map_err(|e| e.to_string())?;
         let mut config = ClientConfig::new(&self.url, &self.credential);
-        let mut attributes = serde_json::json!({"role": self.role});
+        let mut attributes = serde_json::json!({"role": self.role, "protocol": 2});
         if let Some(grace) = self.grace_ms {
             attributes["grace_ms"] = serde_json::json!(grace);
         }
@@ -81,6 +87,8 @@ pub struct Answer {
     pub pending: Vec<Pending>,
     /// When each chunk arrived, from the call's start, and its length.
     pub chunks: Vec<(Duration, usize)>,
+    /// Every committed offset the agent reported for an upload.
+    pub progress: Vec<u64>,
     /// How long the call took until its result.
     pub elapsed: Duration,
 }
@@ -256,6 +264,38 @@ impl RelayClient {
             .map_err(|e| e.to_string())
     }
 
+    /// The agent's latest progress for `call`, or `Err` once the call has
+    /// its result.
+    fn committed(&self, call: u64) -> Result<Option<u64>, ()> {
+        let calls = lock(&self.shared.calls);
+        match calls.open.get(&call) {
+            Some(open) => Ok(open.answer.progress.last().copied()),
+            None => Err(()),
+        }
+    }
+
+    /// Wait until `call` may send up to `sent` bytes: within the window
+    /// beyond the agent's progress, which starts at `from`. `Err` once the
+    /// call has its result.
+    fn window(&self, call: u64, from: u64, sent: u64) -> Result<(), ()> {
+        let mut calls = lock(&self.shared.calls);
+        loop {
+            let Some(open) = calls.open.get(&call) else {
+                return Err(());
+            };
+            let committed = open.answer.progress.last().copied().unwrap_or(from);
+            if sent <= committed.max(from) + UPLOAD_WINDOW || calls.ended.is_some() {
+                return Ok(());
+            }
+            calls = self
+                .shared
+                .changed
+                .wait_timeout(calls, Duration::from_millis(500))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
     /// Send a call with its upload read from `upload`, and return its number.
     pub fn call_from(
         &self,
@@ -264,6 +304,24 @@ impl RelayClient {
         upload: &mut dyn Read,
         keep: bool,
     ) -> Result<u64, String> {
+        self.call_with(execution, op, upload, keep, false, None)
+            .map(|(call, _)| call)
+    }
+
+    /// Send a call, and its upload from `upload` within the window. With
+    /// `resume`, the call continues the upload the agent holds: the client
+    /// waits for the agent's committed offset and `skip` reads the source
+    /// to there. The end names `whole` when given, else the bytes read.
+    /// Returns the call's number and the offset its chunks started at.
+    fn call_with(
+        &self,
+        execution: &str,
+        op: Op,
+        upload: &mut dyn Read,
+        keep: bool,
+        resume: bool,
+        whole: Option<(u64, String)>,
+    ) -> Result<(u64, u64), String> {
         let uploads = op.kind().uploads();
         let call = self.open(keep);
         self.send(&Message::Call(Call {
@@ -273,10 +331,38 @@ impl RelayClient {
             // The broker names the lease itself and overwrites any value a
             // client sends (DC-174).
             lease: None,
+            resume,
+            offset: 0,
         }))?;
+        let mut from = 0;
+        if uploads && resume {
+            // The agent's committed offset comes first; the chunks start
+            // there.
+            loop {
+                match self.committed(call) {
+                    Err(()) => return Ok((call, 0)),
+                    Ok(Some(at)) => {
+                        from = at;
+                        break;
+                    }
+                    Ok(None) => {
+                        let calls = lock(&self.shared.calls);
+                        if calls.ended.is_some() {
+                            return Err("the session ended".into());
+                        }
+                        let _ = self
+                            .shared
+                            .changed
+                            .wait_timeout(calls, Duration::from_millis(500));
+                    }
+                }
+            }
+            std::io::copy(&mut upload.take(from), &mut std::io::sink())
+                .map_err(|e| format!("read the upload: {e}"))?;
+        }
         if uploads {
             let mut hasher = Sha256::new();
-            let mut size = 0u64;
+            let mut size = from;
             let mut buffer = vec![0u8; MAX_CHUNK];
             loop {
                 let mut filled = 0;
@@ -291,6 +377,10 @@ impl RelayClient {
                 if filled == 0 {
                     break;
                 }
+                if self.window(call, from, size + filled as u64).is_err() {
+                    // The call has its result already.
+                    return Ok((call, from));
+                }
                 hasher.update(&buffer[..filled]);
                 size += filled as u64;
                 self.send(&Message::Chunk {
@@ -301,14 +391,56 @@ impl RelayClient {
                     break;
                 }
             }
+            let (size, sha256) = whole.unwrap_or_else(|| (size, hex(&hasher.finalize())));
             self.send(&Message::End {
                 call,
                 execution: execution.into(),
                 size,
-                sha256: hex(&hasher.finalize()),
+                sha256,
             })?;
         }
-        Ok(call)
+        Ok((call, from))
+    }
+
+    /// Upload a stream that `open` reads from its first byte, whose size and
+    /// SHA-256 are `whole`, and wait for the outcome. An upload that ends
+    /// `upload_incomplete`, as after a lost session of the relay agent,
+    /// continues from the agent's committed offset (RP-15); returns the
+    /// answer and the offsets each continuation started at.
+    pub fn push(
+        &self,
+        execution: &str,
+        op: Op,
+        open: &dyn Fn() -> Box<dyn Read>,
+        whole: (u64, String),
+        wait: Duration,
+    ) -> Result<(Answer, Vec<u64>), String> {
+        let mut resumed = Vec::new();
+        let mut resume = false;
+        for _ in 0..20 {
+            let mut source = open();
+            let (call, from) = self.call_with(
+                execution,
+                op.clone(),
+                &mut *source,
+                false,
+                resume,
+                Some(whole.clone()),
+            )?;
+            if resume {
+                resumed.push(from);
+            }
+            let answer = self.wait(call, wait)?;
+            let incomplete = matches!(
+                answer.outcome()?,
+                Outcome::Failed { code, committed: false, .. } if code == "upload_incomplete"
+            );
+            if !incomplete {
+                return Ok((answer, resumed));
+            }
+            resume = true;
+        }
+        Err(format!("{execution} did not complete in 20 continuations"))
     }
 
     /// Send a call with `upload`, and return its number.
@@ -477,6 +609,13 @@ fn read_loop(session: Session, shared: Arc<Shared>) {
                     open.answer.pending.push(pending);
                 }
             }
+            Message::Progress {
+                call, committed, ..
+            } => {
+                if let Some(open) = calls.open.get_mut(&call) {
+                    open.answer.progress.push(committed);
+                }
+            }
             Message::Revoked { reason } => calls.revoked = Some(reason),
             _ => {}
         }
@@ -589,6 +728,7 @@ mod tests {
         };
         let config = options.config().unwrap();
         assert_eq!(config.attributes["role"], "client");
+        assert_eq!(config.attributes["protocol"], 2);
         assert_eq!(config.attributes["grace_ms"], 2000);
         let resolve = config.resolver.unwrap();
         assert_eq!(

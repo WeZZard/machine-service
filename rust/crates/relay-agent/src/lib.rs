@@ -4,7 +4,7 @@
 //! - [`protocol`]: the relay messages and their encoding.
 //! - [`link`]: the transport trait, an in-memory link and a stream link.
 //! - [`agent`]: the operations, with at-most-once execution IDs kept in
-//!   [`store`].
+//!   [`store`] and resumable uploads kept in [`uploads`].
 //! - [`config`]: the broker URL and agent credential, and waiting for them.
 //! - [`dial`]: the dial-out loop that serves each link a dialer opens.
 //! - [`driver`]: the broker's end of one link.
@@ -21,6 +21,7 @@ pub mod link;
 pub mod protocol;
 pub mod session_link;
 pub mod store;
+pub mod uploads;
 
 pub use agent::{Agent, AgentOptions};
 pub use link::{memory_pair, Link, LinkError, MemoryLink, StreamLink};

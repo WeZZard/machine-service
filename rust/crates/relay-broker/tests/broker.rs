@@ -11,7 +11,7 @@ use common::*;
 use relay_agent::protocol::{ExecutionState, Op, OpKind, Outcome};
 use relay_agent::session_link::DialOptions;
 use relay_broker::tls::Authority;
-use relay_broker::{Role, RunError, Target};
+use relay_broker::{Role, RunError, Target, Upload};
 use remote_session::RejectCode;
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -122,7 +122,7 @@ fn a_repeated_execution_id_never_runs_twice() {
     assert_eq!(again.wait(1, WAIT).bytes, b"out-1\n");
     let answer = h
         .broker
-        .run(&a.target, "once", exec(command), Vec::new(), WAIT)
+        .run(&a.target, "once", exec(command), Upload::None, WAIT)
         .unwrap();
     assert!(answer.replayed && answer.end_matches());
     assert_eq!(answer.bytes, b"out-1\n");
@@ -227,7 +227,7 @@ fn revocation_ends_sessions_and_refuses_every_credential() {
     assert!(!h.broker.has_credential(&a.target, Role::Agent));
     let answer = h
         .broker
-        .run(&a.target, "after", exec("true"), Vec::new(), WAIT)
+        .run(&a.target, "after", exec("true"), Upload::None, WAIT)
         .unwrap();
     assert_eq!(failed_code(&answer.outcome), ("revoked", false));
 }
@@ -384,6 +384,8 @@ fn uploads_are_checked_and_files_round_trip() {
     client.send(&relay_agent::protocol::Message::Call(
         relay_agent::protocol::Call {
             lease: None,
+            resume: false,
+            offset: 0,
             call: 4,
             execution: "bad".into(),
             op: write,
@@ -424,16 +426,26 @@ fn uploads_are_checked_and_files_round_trip() {
     ));
 }
 
+/// RP-9, RP-15: a call may end before its stream does, so a chunk or an
+/// end for a call that is not open is dropped, and the session carries on.
 #[test]
-fn a_chunk_for_a_call_that_is_not_open_ends_the_session() {
+fn a_chunk_for_a_call_that_is_not_open_is_dropped() {
     let h = Harness::start(Options::default());
     let a = lease(&h.broker, "vm-a");
+    let _agent = TestAgent::start(&h.url("ws"), &a.agent, None);
     let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
     client.send(&relay_agent::protocol::Message::Chunk {
         call: 9,
         data: b"x".to_vec(),
     });
-    assert!(client.wait_end(WAIT));
+    client.send(&relay_agent::protocol::Message::End {
+        call: 9,
+        execution: "none".into(),
+        size: 1,
+        sha256: guest_actions::sha256_hex(b"x"),
+    });
+    client.call(1, "after-stray", exec("echo on"), b"");
+    assert_eq!(client.wait(1, WAIT).bytes, b"on\n");
 }
 
 #[test]
@@ -496,7 +508,7 @@ fn an_in_process_run_times_out_without_losing_the_outcome() {
             &a.target,
             "t",
             exec("sleep 1; echo ok"),
-            Vec::new(),
+            Upload::None,
             Duration::from_millis(100)
         ),
         Err(RunError::Timeout)
@@ -507,7 +519,7 @@ fn an_in_process_run_times_out_without_losing_the_outcome() {
     )));
     let answer = h
         .broker
-        .run(&a.target, "t", exec("sleep 1; echo ok"), Vec::new(), WAIT)
+        .run(&a.target, "t", exec("sleep 1; echo ok"), Upload::None, WAIT)
         .unwrap();
     assert_eq!(answer.bytes, b"ok\n");
     assert!(answer.replayed);
@@ -666,7 +678,7 @@ fn a_purge_removes_one_leases_records_from_the_agent_and_the_broker() {
     assert!(h.broker.wait_for_agent(&target, WAIT).is_some());
     let run = |execution: &str| {
         h.broker
-            .run(&target, execution, exec("echo out"), Vec::new(), WAIT)
+            .run(&target, execution, exec("echo out"), Upload::None, WAIT)
             .unwrap()
     };
 

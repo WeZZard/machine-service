@@ -50,3 +50,8 @@ tar = { version = "0.4", default-features = false }
 
 [profile.release]
 strip = true
+
+# The tests hash and move gigabytes (RP-15); an unoptimized SHA-256 would
+# take minutes over them.
+[profile.dev.package.sha2]
+opt-level = 3

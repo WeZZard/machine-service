@@ -10,6 +10,7 @@ name = "relay_broker"
 path = "src/lib.rs"
 
 [dependencies]
+byte-transfer = { path = "../byte-transfer" }
 remote-session = { path = "../remote-session" }
 relay-agent = { path = "../relay-agent" }
 guest-actions = { path = "../guest-actions" }

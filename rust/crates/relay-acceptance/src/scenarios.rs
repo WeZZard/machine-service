@@ -745,23 +745,162 @@ fn ac58(ctx: &mut Ctx<'_>) -> Verdict {
             || format!("{} bytes, {} against {want}", pulled.size, pulled.sha256),
         ),
     );
+    // 2 GB pushed as a stream that continues after any loss (RP-15).
+    let size: u64 = 1908 << 20;
+    let want = Seeded::sha256(5858, size);
+    let started = Instant::now();
+    let (written, resumed) = client
+        .push(
+            &new_id("push-2g"),
+            Op::Write {
+                path: "acc58-2g-up.bin".into(),
+                name: String::new(),
+                mode: Some(0o644),
+            },
+            &|| Box::new(Seeded::new(5858, size)),
+            (size, want.clone()),
+            Duration::from_secs(4 * 3600),
+        )
+        .map_err(Stop::Failed)?;
+    ctx.record("push_2gb_seconds", json!(started.elapsed().as_secs_f64()));
+    ctx.record("push_2gb_continued_from", json!(resumed));
+    let in_guest = client.run(&format!("cat ~/acc58-2g-up.bin | {sha}"))?;
+    let _ = client.run("rm -f ~/acc58-2g-up.bin");
     ctx.check(
         "a 2 GB file is pushed with its SHA-256",
-        Err(Stop::Blocked(
-            "an upload holds at most 256 MiB (RP-5), so a 2 GB push needs a transfer of large \
-             files over the relay link, which is not built yet"
-                .into(),
-        )),
+        expect(
+            matches!(written.outcome()?, Outcome::Written(d) if d.sha256 == want && d.size == size)
+                && in_guest.trim() == want,
+            || format!("written {:?}, guest {}", written.outcome(), in_guest.trim()),
+        ),
     );
+
+    // A tree of 10,000 files each way, as one tar stream (RP-13).
     ctx.check(
         "a tree of 10,000 files moves each way",
-        Err(Stop::Blocked(
-            "a folder moves by scp on a relay lease (DC-151); folder transfer over the relay \
-             link is being built (M3c)"
-                .into(),
-        )),
+        ac58_tree(&client, os),
     );
     Ok(())
+}
+
+/// The files of AC-58's tree: 100 folders of 100 files, each a different
+/// size.
+fn tree_files() -> impl Iterator<Item = (String, Vec<u8>)> {
+    (0..100).flat_map(|folder| {
+        (0..100).map(move |file| {
+            let n = folder * 100 + file;
+            let line = format!("acc58 tree d{folder:03}/f{file:03}\n");
+            let content = line.repeat(1 + (n * 7919) % 97).into_bytes();
+            (format!("d{folder:03}/f{file:03}.txt"), content)
+        })
+    })
+}
+
+/// The SHA-256 of a tree's sorted relative file paths, one per line, and
+/// of its files' contents in that order: what the guest computes with
+/// `find`, `sort` and `cat`.
+fn tree_manifest(root: &std::path::Path) -> Result<(usize, String, String), String> {
+    fn walk(
+        root: &std::path::Path,
+        at: &std::path::Path,
+        out: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(root.join(at))? {
+            let entry = entry?;
+            let relative = at.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                walk(root, &relative, out)?;
+            } else {
+                out.push(format!("./{}", relative.display()));
+            }
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    walk(root, std::path::Path::new(""), &mut paths).map_err(|e| e.to_string())?;
+    paths.sort();
+    let mut names = Sha256::new();
+    let mut contents = Sha256::new();
+    for path in &paths {
+        names.update(path.as_bytes());
+        names.update(b"\n");
+        let bytes = std::fs::read(root.join(&path[2..])).map_err(|e| e.to_string())?;
+        contents.update(&bytes);
+    }
+    Ok((
+        paths.len(),
+        hex(&names.finalize()),
+        hex(&contents.finalize()),
+    ))
+}
+
+fn ac58_tree(client: &RelayClient, os: crate::guest::Os) -> Result<(), Stop> {
+    let sha = os.sha256_stdin();
+    let scratch = tempfile::tempdir().map_err(|e| Stop::Failed(e.to_string()))?;
+    let source = scratch.path().join("acc58-tree");
+    for (path, content) in tree_files() {
+        let path = source.join(path);
+        std::fs::create_dir_all(path.parent().expect("a folder"))
+            .and_then(|()| std::fs::write(&path, content))
+            .map_err(|e| Stop::Failed(e.to_string()))?;
+    }
+    let want = tree_manifest(&source).map_err(Stop::Failed)?;
+    let archive = scratch.path().join("up.tar");
+    byte_transfer::pack(&source, &archive).map_err(Stop::Failed)?;
+    let whole = byte_transfer::hash_file(&archive).map_err(|e| Stop::Failed(e.to_string()))?;
+    let (written, _) = client
+        .push(
+            &new_id("tree-up"),
+            Op::WriteTree {
+                path: "acc58-tree".into(),
+                name: String::new(),
+            },
+            &|| match std::fs::File::open(&archive) {
+                Ok(file) => Box::new(file),
+                Err(_) => Box::new(std::io::empty()),
+            },
+            whole.clone(),
+            Duration::from_secs(3600),
+        )
+        .map_err(Stop::Failed)?;
+    expect(
+        matches!(written.outcome()?, Outcome::Written(d) if d.sha256 == whole.1),
+        || format!("the tree's upload: {:?}", written.outcome()),
+    )?;
+    let in_guest = client.run(&format!(
+        "cd ~/acc58-tree && find . -type f | LC_ALL=C sort > ../acc58-tree.list && \
+         wc -l < ../acc58-tree.list | tr -d ' ' && cat ../acc58-tree.list | {sha} && \
+         tr '\\n' '\\0' < ../acc58-tree.list | xargs -0 cat | {sha}; rm -f ../acc58-tree.list"
+    ))?;
+    let lines: Vec<&str> = in_guest.lines().map(str::trim).collect();
+    expect(
+        lines
+            == [
+                want.0.to_string().as_str(),
+                want.1.as_str(),
+                want.2.as_str(),
+            ],
+        || format!("the guest's tree: {lines:?}, the client's: {want:?}"),
+    )?;
+    let call = client.call(
+        &new_id("tree-down"),
+        Op::ReadTree {
+            path: "acc58-tree".into(),
+        },
+        b"",
+        true,
+    )?;
+    let read = client.wait(call, Duration::from_secs(3600))?;
+    let _ = client.run("rm -rf ~/acc58-tree");
+    expect(read.end_matches(), || {
+        "the tree's stream does not match its end".into()
+    })?;
+    let back = scratch.path().join("down.tar");
+    std::fs::write(&back, &read.bytes).map_err(|e| Stop::Failed(e.to_string()))?;
+    let copy = scratch.path().join("copy");
+    byte_transfer::unpack(&back, &copy).map_err(Stop::Failed)?;
+    let got = tree_manifest(&copy).map_err(Stop::Failed)?;
+    expect(got == want, || format!("pulled {got:?}, pushed {want:?}"))
 }
 
 // AC-59: a long action completes.

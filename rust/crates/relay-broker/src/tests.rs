@@ -1,26 +1,32 @@
 //! TL-1: execution records without sessions.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use relay_agent::protocol::{CallResult, Digest, ExecutionState, Op, OpKind, Outcome};
 
 use crate::credentials::Target;
-use crate::job::{Job, JobEvent};
+use crate::job::{Events, Feed, Job, JobEvent, JobSpec, Upload};
 
-fn exec_job() -> Job {
-    Job::new(
-        Target::Lease("vm".into()),
-        "vm".into(),
-        "e".into(),
-        Op::Exec {
-            command: "true".into(),
-            stdin: false,
-            timeout_s: 1.0,
+fn exec_job() -> Arc<Job> {
+    Arc::new(Job::new(
+        JobSpec {
+            target: Target::Lease("vm".into()),
+            lease: "vm".into(),
+            execution: "e".into(),
+            op: Op::Exec {
+                command: "true".into(),
+                stdin: false,
+                timeout_s: 1.0,
+            },
+            feed: Feed::Local(Upload::None),
+            resume: false,
+            offset: 0,
+            transient: false,
         },
-        Vec::new(),
-        false,
         8,
-    )
+        Arc::default(),
+    ))
 }
 
 fn exit() -> Outcome {
@@ -45,19 +51,19 @@ fn result(replayed: bool, outcome: Outcome) -> CallResult {
     }
 }
 
-fn drain(rx: &std::sync::mpsc::Receiver<JobEvent>) -> Vec<JobEvent> {
-    rx.try_iter().collect()
+fn drain(events: &Events) -> Vec<JobEvent> {
+    events.drain()
 }
 
 #[test]
 fn a_resent_calls_replay_is_not_delivered_twice() {
     let job = exec_job();
     let origin = job.subscribe(true).unwrap();
-    let (_, _) = job.hand_on_for_test();
+    job.mark_handed_for_test();
     let mut seen = 0;
     job.on_chunk_for_test(&mut seen, b"abc");
     // The session ends; the next session's replay starts from byte 0.
-    let (before, _) = job.hand_on_for_test();
+    let before = job.mark_handed_for_test();
     assert!(before);
     let mut seen = 0;
     job.on_chunk_for_test(&mut seen, b"ab");
@@ -89,7 +95,7 @@ fn a_resent_calls_replay_is_not_delivered_twice() {
 fn late_callers_get_the_kept_output_and_a_replay_flag() {
     let job = exec_job();
     let _origin = job.subscribe(true).unwrap();
-    job.hand_on_for_test();
+    job.mark_handed_for_test();
     let mut seen = 0;
     job.on_chunk_for_test(&mut seen, b"abcd");
     let late = job.subscribe(false).unwrap();
@@ -114,7 +120,7 @@ fn late_callers_get_the_kept_output_and_a_replay_flag() {
 fn a_refusal_forgets_the_record_and_an_agent_replay_is_reported() {
     let job = exec_job();
     let origin = job.subscribe(true).unwrap();
-    job.hand_on_for_test();
+    job.mark_handed_for_test();
     assert!(job.on_result_for_test(
         result(false, Outcome::refused("checksum_mismatch", "no")),
         false
@@ -130,7 +136,7 @@ fn a_refusal_forgets_the_record_and_an_agent_replay_is_reported() {
     // The agent had the ID before this broker did: a replay for the origin.
     let job = exec_job();
     let origin = job.subscribe(true).unwrap();
-    job.hand_on_for_test();
+    job.mark_handed_for_test();
     assert!(!job.on_result_for_test(result(true, exit()), false));
     assert!(matches!(
         drain(&origin)[0],
