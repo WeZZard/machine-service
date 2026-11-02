@@ -628,7 +628,7 @@ fn tail_chars(text: &str, max: usize) -> String {
 }
 
 /// The end of a virtual machine lease's relay credentials, from its record
-/// (DC-1xx-DUR2-2); `None` for a record without a TTL.
+/// (DC-214); `None` for a record without a TTL.
 fn credential_until(record: &Value) -> Option<f64> {
     let ttl = record.get("ttl_expires_at").and_then(Value::as_f64)?;
     Some(crate::ops::relay_credential_until(

@@ -116,7 +116,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do ss -H -ltn 'sport = :22' | grep -q . || { echo
     /// Restart the relay agent's job as its service manager starts it in a
     /// new desktop session: `launchctl kickstart -k` of its LaunchAgent, or a
     /// restart of its user unit. This is a durable Mac's stand-in for a
-    /// reboot (DC-1xx-DUR2-4).
+    /// reboot (DC-216).
     pub fn restart_agent_job(self, label: &str) -> String {
         match self {
             Os::Macos => format!("launchctl kickstart -k gui/$(id -u)/{}", shell_quote(label)),

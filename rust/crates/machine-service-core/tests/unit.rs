@@ -1924,7 +1924,7 @@ fn test_resolvers_that_cannot_be_set_fail_the_acquisition() {
     );
 }
 
-/// DM-6, DC-1xx-DUR2-2: the reclamation grace is the instance's setting,
+/// DM-6, DC-214: the reclamation grace is the instance's setting,
 /// `MACHINE_SERVICE_GRACE_HOURS`, 6 hours unless set; anything but a
 /// number of hours, 0 or more, is refused.
 #[test]
@@ -1940,7 +1940,7 @@ fn the_grace_period_is_an_instance_setting() {
     }
 }
 
-/// RP-3, DC-1xx-DUR2-2: a lease's relay credentials end at the end of its
+/// RP-3, DC-214: a lease's relay credentials end at the end of its
 /// TTL plus its grace, and the grace is bounded by the TTL itself, so a
 /// 6-minute lease's credentials end at most 6 minutes after it.
 #[test]

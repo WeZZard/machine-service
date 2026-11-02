@@ -452,7 +452,7 @@ fn in3_a_current_durable_lease_refuses_the_relay_agent() {
     assert!(stderr.contains("a durable lease is current"), "{stderr}");
 }
 
-/// TL-6, DC-1xx-DUR2-1: `relay-agent` installs a second instance's relay
+/// TL-6, DC-213: `relay-agent` installs a second instance's relay
 /// agent under the label and home its state folder names, with its own
 /// session port, and never touches machine-service's LaunchAgent or the
 /// installed instance's agent in the operator's home; `remove-relay-agent`

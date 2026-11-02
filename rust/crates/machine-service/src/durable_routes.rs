@@ -35,7 +35,7 @@ fn durable_target(machine: &DurableMachine) -> Target {
 /// Accept the durable machine's relay agent on the broker, when exposure is
 /// on (RA-4), route the lease's exec, push and pull through it while it has
 /// a session and runs the installed release's build (M4, RA-8), and bring
-/// this instance's own agent up (DC-1xx-DUR2-1).
+/// this instance's own agent up (DC-213).
 pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
     let Some(machine) = machine() else { return };
     if !machine.exposed() {
@@ -84,7 +84,7 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
 }
 
 /// Bring this instance's own relay agent to the state it wants, on a thread
-/// of its own (DC-1xx-DUR2-1): the release's build, the machine's
+/// of its own (DC-213): the release's build, the machine's
 /// credential and this broker's URL, loaded in the desktop session. The
 /// agent's label and home derive from the state folder, so a second
 /// instance gets an agent of its own exactly as the installed one does and

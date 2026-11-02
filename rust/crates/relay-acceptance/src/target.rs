@@ -127,7 +127,7 @@ impl AgentPlace {
 
     /// The agent a lease record names in `relay_agent` (`label`, `root`), as
     /// a durable Mac's instance derives it from its state folder
-    /// (DC-1xx-DUR2-1); a record without them names a guest's agent.
+    /// (DC-213); a record without them names a guest's agent.
     pub fn of_record(record: &Value) -> AgentPlace {
         let agent = &record["relay_agent"];
         match (agent["label"].as_str(), agent["root"].as_str()) {
@@ -366,7 +366,7 @@ impl RealTarget {
         let Some(agent) = agent else {
             self.client = Some(client);
             // Every instance with durable exposure on brings its own relay
-            // agent up (DC-1xx-DUR2-1), so a missing one is a failure, with
+            // agent up (DC-213), so a missing one is a failure, with
             // the instance's own reason.
             return Err(Stop::Failed(format!(
                 "the lease's relay agent has no session with the broker: link {:?}, {}",
@@ -446,7 +446,7 @@ impl RealTarget {
     /// Acquire a lease of the shortest TTL, 0.1 hours, beside the suite's
     /// own, and return it with the end of its relay credentials as the
     /// instance derives it: the end of the TTL plus the instance's grace
-    /// bounded by the TTL (RP-3, DC-1xx-DUR2-2).
+    /// bounded by the TTL (RP-3, DC-214).
     pub fn short_lease(&mut self) -> Result<ShortLease, Stop> {
         let grace = self.instance.machines()?["limits"]["grace_hours"]
             .as_f64()

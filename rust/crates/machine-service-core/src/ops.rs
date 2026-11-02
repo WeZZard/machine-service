@@ -54,7 +54,7 @@ pub fn grace_hours() -> f64 {
     })
 }
 
-/// The end of a lease's relay credentials (RP-3, DC-1xx-DUR2-2): the end of
+/// The end of a lease's relay credentials (RP-3, DC-214): the end of
 /// its TTL plus a grace that is the instance's reclamation grace bounded by
 /// the TTL itself, so a short lease's credentials never outlive it by more
 /// than its own length. A renewal moves the TTL, and with it this end;

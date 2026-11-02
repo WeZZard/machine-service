@@ -1358,7 +1358,7 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
 // never paused (DC-25), is not rebooted, nor logged out, which would end the
 // runner too. Its stand-in is what launchd does in a new desktop session:
 // the agent's LaunchAgent job started afresh (`launchctl kickstart -k`),
-// after which the agent registers again by itself (DC-1xx-DUR2-4).
+// after which the agent registers again by itself (DC-216).
 fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_client(ctx)?;
     let os = ctx.target.os();

@@ -54,7 +54,7 @@ pub struct DurableRelay {
     /// that is shorter.
     pub purge_wait: Duration,
     /// Which relay agent is this instance's own, as its state folder names
-    /// it (DC-1xx-DUR2-1).
+    /// it (DC-213).
     pub agent: crate::durable::relay_agent::Identity,
 }
 

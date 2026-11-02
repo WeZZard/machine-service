@@ -67,7 +67,7 @@ fn a_client_reaches_only_its_own_leases_agent() {
     drop((agent_a, agent_b));
 }
 
-/// RP-3, DC-1xx-DUR2-2: a lease's credentials end at the end the lease
+/// RP-3, DC-214: a lease's credentials end at the end the lease
 /// gives them; a hello after it is refused like a revoked credential's, a
 /// renewal that moves the end takes it back, and the end of one role leaves
 /// the other's alone.

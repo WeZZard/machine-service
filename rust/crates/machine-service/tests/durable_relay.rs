@@ -148,7 +148,7 @@ impl Lab {
     }
 
     /// A second instance whose `launchctl` is the fake launchd, so it
-    /// brings its own relay agent up (DC-1xx-DUR2-1).
+    /// brings its own relay agent up (DC-213).
     fn provisioning(release_of: &Path) -> Lab {
         Lab::with_launchd(release_of, true)
     }
@@ -461,7 +461,7 @@ impl Drop for Lab {
     }
 }
 
-/// DC-1xx-DUR2-1: a second instance with durable exposure on and the relay
+/// DC-213: a second instance with durable exposure on and the relay
 /// link brings its own relay agent up, without an installer: the release's
 /// build, the machine's credential, its own broker, under a label and a home
 /// its state folder names. Nothing of it lies in the operator's home, where

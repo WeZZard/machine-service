@@ -1,5 +1,5 @@
 //! The durable Mac's own relay agent (`docs/arch/relay-agent.md` RA-2, RA-4;
-//! `docs/arch/installation.md` IN-3; DC-140, DC-1xx-DUR2-1).
+//! `docs/arch/installation.md` IN-3; DC-140, DC-213).
 //!
 //! Every instance with durable exposure on has one relay agent of its own,
 //! and the instance names it: the agent's label and files derive from the
@@ -64,7 +64,7 @@ pub struct Identity {
     /// installed instance's agent, `<state>/relay/agent` for any other.
     pub root: PathBuf,
     /// The `PATH` its commands get: the operator's login shell's, as a
-    /// terminal of the desktop session has it (DC-1xx-DUR2-6); `None`
+    /// terminal of the desktop session has it (DC-218); `None`
     /// leaves launchd's.
     pub path: Option<String>,
 }

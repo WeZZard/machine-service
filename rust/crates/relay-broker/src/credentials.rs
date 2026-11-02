@@ -88,7 +88,7 @@ pub(crate) struct Grant {
     pub target: Target,
     pub valid: Option<Validity>,
     /// The end of the credential, in seconds since the epoch: a hello at or
-    /// after it is refused, until the owner moves it (DC-1xx-DUR2-2).
+    /// after it is refused, until the owner moves it (DC-214).
     pub until: Option<f64>,
 }
 

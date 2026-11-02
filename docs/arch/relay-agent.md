@@ -31,7 +31,7 @@ flowchart LR
 
 - On macOS, the relay agent is a per-user LaunchAgent with `LimitLoadToSessionType` set to `Aqua`, so launchd starts it in the desktop session of the user who logs in automatically and keeps it running with `KeepAlive`.
 - On Ubuntu, the relay agent is a systemd user service that is wanted by `graphical-session.target`, so it starts in the desktop session of the user who logs in automatically.
-- On a durable Mac, the relay agent is a LaunchAgent of the operator's account, and it replaces machine-service's own in-session exec of [DM-4](durable-machine.md#dm-4-exec). Each instance with exposure on has its own, named by the instance's state folder, which the daemon brings up at startup ([IN-3](installation.md#in-3-the-durable-macs-relay-agent), DC-1xx-DUR2-1).
+- On a durable Mac, the relay agent is a LaunchAgent of the operator's account, and it replaces machine-service's own in-session exec of [DM-4](durable-machine.md#dm-4-exec). Each instance with exposure on has its own, named by the instance's state folder, which the daemon brings up at startup ([IN-3](installation.md#in-3-the-durable-macs-relay-agent), DC-213).
 - Every action runs as a child process of the relay agent, so it inherits the desktop session: the unlocked login keychain, the window server, the session bus on Ubuntu, and the environment that launchd or systemd gives the session.
 - macOS attributes the TCC permissions of an action to the relay agent's signed executable, so the image grants permissions to the relay agent once instead of to `sshd-keygen-wrapper`.
 - The relay agent never listens on a network port.
@@ -42,7 +42,7 @@ flowchart LR
 - The relay agent and the broker run the resumable session of [RS](remote-session.md): sequence numbers, acknowledgements, a replay buffer, heartbeats and a grace period.
 - After a lost connection, the relay agent reconnects with exponential backoff from 250 ms to 5 s with random jitter, and it resumes its session.
 - A relay agent that finds its session expired starts a new session and reports the execution IDs that it had in flight, with their outcomes when it has them.
-- `relay-agent run` dials the `broker_url` of `~/.config/relay-agent/config.json` as role `agent` with its `agent_credential`, trusting the public roots and the configuration's `broker_ca_pem`. `RELAY_AGENT_ROOT`, when set, replaces `~` for the agent's own files, its configuration and its records, and leaves `HOME` to its commands; a durable Mac's second instance runs its agent so (DC-1xx-DUR2-1). It resolves the broker's host name on every attempt and reads the file again before every dial, so a rotated credential or a moved broker takes effect without a restart. `RELAY_AGENT_CA_BUNDLE` adds a PEM file of authorities and `RELAY_AGENT_RESOLVE` one `host:port:address` resolution, for a test rig's name and edge (DC-150).
+- `relay-agent run` dials the `broker_url` of `~/.config/relay-agent/config.json` as role `agent` with its `agent_credential`, trusting the public roots and the configuration's `broker_ca_pem`. `RELAY_AGENT_ROOT`, when set, replaces `~` for the agent's own files, its configuration and its records, and leaves `HOME` to its commands; a durable Mac's second instance runs its agent so (DC-213). It resolves the broker's host name on every attempt and reads the file again before every dial, so a rotated credential or a moved broker takes effect without a restart. `RELAY_AGENT_CA_BUNDLE` adds a PEM file of authorities and `RELAY_AGENT_RESOLVE` one `host:port:address` resolution, for a test rig's name and edge (DC-150).
 
 ## RA-4: Identity and authorization
 
@@ -50,7 +50,7 @@ flowchart LR
 - A virtual machine's relay agent gets a new agent credential for each lease, which machine-service generates at acquisition and writes into the clone during bootstrap ([RA-7](#ra-7-bootstrap)).
 - A durable Mac's relay agent holds one agent credential per machine, which the instance writes into the agent's configuration and the operator can rotate. It outlives every lease.
 - A client authenticates with the lease credential that the acquisition returns, and the broker routes a client only to the relay agent of that lease.
-- A lease's credentials last as long as the lease is current: until the end of its TTL plus a grace that is the instance's reclamation grace bounded by the TTL itself, which a renewal moves, and at the latest until release or reclamation revokes them ([RP-3](relay-protocol.md#rp-3-roles-and-credentials), DC-1xx-DUR2-2).
+- A lease's credentials last as long as the lease is current: until the end of its TTL plus a grace that is the instance's reclamation grace bounded by the TTL itself, which a renewal moves, and at the latest until release or reclamation revokes them ([RP-3](relay-protocol.md#rp-3-roles-and-credentials), DC-214).
 - The broker refuses an agent credential or a lease credential after release, after expiry, or after rotation.
 - Every credential travels inside the protocol over TLS, and none depends on a client certificate, because a proxy may end TLS on the way ([TC-5](transport-contract.md#tc-5-tls-may-end-in-the-middle)).
 

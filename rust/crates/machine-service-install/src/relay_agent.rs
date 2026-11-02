@@ -1,5 +1,5 @@
 //! The durable Mac's own relay agent at installation (`docs/arch/relay-agent.md`
-//! RA-2, RA-4; `docs/arch/installation.md` IN-3; DC-140, DC-1xx-DUR2-1).
+//! RA-2, RA-4; `docs/arch/installation.md` IN-3; DC-140, DC-213).
 //!
 //! The mechanism is machine-service's own,
 //! [`machine_service_core::durable::relay_agent`], which the daemon also runs
