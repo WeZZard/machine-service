@@ -1262,7 +1262,7 @@ fn a_purge_is_refused_for_another_lease_and_while_the_lease_runs() {
 }
 
 /// The safety bound outlasts any resend: the broker keeps its records for
-/// an hour and an agent session's grace is ten minutes (DC-1xx-PUR-2).
+/// an hour and an agent session's grace is ten minutes (DC-175).
 #[test]
 fn the_safety_bound_outlasts_the_brokers_records_by_far() {
     assert_eq!(

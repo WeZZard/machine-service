@@ -54,7 +54,7 @@ pub struct DurableRelay {
 /// How long a durable release waits for the relay agent to confirm that
 /// the lease's records are gone: long enough for an agent to dial again
 /// after a lost connection (its backoff stops at 5 s) and for the lease's
-/// stopped commands to record their end (DC-1xx-PUR-3).
+/// stopped commands to record their end (DC-176).
 pub const PURGE_WAIT: Duration = Duration::from_secs(60);
 
 /// One relay call's events, gathered as they come.

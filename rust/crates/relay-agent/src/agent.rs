@@ -38,7 +38,7 @@ pub const HEARTBEAT: Duration = Duration::from_secs(10);
 /// The longest the agent keeps a completed execution's record. A record
 /// goes when the broker purges its lease at release (DC-173); this bound
 /// only removes the records of a lease whose purge never came, such as
-/// after a crash of machine-service (DC-1xx-PUR-2).
+/// after a crash of machine-service (DC-175).
 pub const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The largest standard input or script a call may upload.
 pub const MAX_UPLOAD: usize = 256 << 20;
