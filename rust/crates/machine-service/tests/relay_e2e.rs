@@ -616,19 +616,21 @@ fn through_the_rig_under_n1() {
 #[test]
 fn a_long_lived_lease_gets_the_instances_new_relay_agent_build() {
     let session_port = free_session_port();
-    let mut lab = Lab::new(
+    let lab = Lab::new(
         session_port,
         &format!("wss://localhost:{session_port}/relay"),
     );
     // The build this instance holds, and the guest's installed agent: the
     // same bytes at first, so bootstrap uploads nothing.
+    // The instance holds its build as a release (DC-140); the lab's release
+    // already holds this build.
+    let release = lab
+        .env
+        .iter()
+        .find(|(key, _)| key == "MACHINE_SERVICE_RELAY_AGENT_RELEASE")
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .unwrap();
     let held = lab.fixture.root.join("held-relay-agent");
-    std::fs::copy(relay_agent_bin(), &held).unwrap();
-    for (key, value) in lab.env.iter_mut() {
-        if key == "MACHINE_SERVICE_RELAY_AGENT" {
-            *value = held.display().to_string();
-        }
-    }
     let installed = lab
         .guest_home
         .join(".local/libexec/relay-agent/relay-agent");
@@ -672,6 +674,7 @@ fn a_long_lived_lease_gets_the_instances_new_relay_agent_build() {
     build.extend_from_slice(b"a newer build");
     let new = sha256_hex(&build);
     std::fs::write(&held, &build).unwrap();
+    write_relay_release(&release, &held);
     daemon.stop();
     let _daemon = lab.start();
 
