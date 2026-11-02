@@ -65,13 +65,18 @@ for platform in "$@"; do
             # toolchain's llvm-ar archives the ELF objects (DC-154).
             arch_prefix=${target%%-*}
             target_variable=$(echo "$target" | tr 'a-z-' 'a-z_')
-            if ! command -v "$arch_prefix-linux-musl-gcc" >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
+            if ! command -v "$arch_prefix-linux-musl-gcc" >/dev/null 2>&1; then
+                # No musl cross compiler: the clang fallback is the only way,
+                # so its tools must be present, or the build stops here with
+                # the fix instead of failing later inside ring's build.
+                command -v clang >/dev/null 2>&1 || {
+                    echo "error: building $target needs $arch_prefix-linux-musl-gcc or clang" >&2; exit 1; }
                 llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
-                if [ -x "$llvm_bin/llvm-ar" ]; then
-                    export "CC_$target_variable=clang"
-                    export "CFLAGS_$target_variable=--target=$arch_prefix-unknown-linux-gnu"
-                    export "AR_$target_variable=$llvm_bin/llvm-ar"
-                fi
+                [ -x "$llvm_bin/llvm-ar" ] || {
+                    echo "error: building $target needs llvm-ar; run: rustup component add llvm-tools" >&2; exit 1; }
+                export "CC_$target_variable=clang"
+                export "CFLAGS_$target_variable=--target=$arch_prefix-unknown-linux-gnu"
+                export "AR_$target_variable=$llvm_bin/llvm-ar"
             fi
             env "$linker_variable=rust-lld" cargo build --release -p relay-agent --target "$target" ;;
         *) cargo build --release -p relay-agent --target "$target" ;;
