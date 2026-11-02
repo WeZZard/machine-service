@@ -13,7 +13,7 @@
 # the LaunchAgent's label, instead of the linker's per-build identifier. A
 # guest grants privacy permissions to the code requirement
 # `identifier "com.wezzard.relay-agent"`, which every build signed here
-# satisfies, so a new build keeps the grants (decision DC-1xx-REL-1). The
+# satisfies, so a new build keeps the grants (decision DC-135). The
 # signature is ad hoc unless CODESIGN_IDENTITY names a signing identity.
 #
 # Usage: scripts/build-relay-agent.sh [output-dir [platform ...]]
