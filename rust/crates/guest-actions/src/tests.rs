@@ -117,3 +117,134 @@ fn resolve_follows_scp() {
     assert_eq!(resolve("a/b", home), Path::new("/h/a/b"));
     assert_eq!(resolve("/abs", home), Path::new("/abs"));
 }
+
+// ------------------------------------------------------------- ownership
+
+/// A process of its own group that sleeps, as an unrelated process would.
+fn sleeper() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn reap(mut child: std::process::Child) -> std::process::ExitStatus {
+    child.wait().unwrap()
+}
+
+#[test]
+fn dc139_a_start_time_names_one_process() {
+    let own = ownership::process_start(std::process::id() as i32).expect("own start time");
+    assert_eq!(
+        ownership::process_start(std::process::id() as i32).as_deref(),
+        Some(own.as_str()),
+        "stable for one process"
+    );
+    // Linux counts start times in clock ticks (10 ms), so a process started
+    // in the same tick has the same start time; a record matches a process
+    // ID and its start time together, and no ID is reused within a tick.
+    std::thread::sleep(Duration::from_millis(50));
+    let child = sleeper();
+    let pid = child.id() as i32;
+    let other = ownership::process_start(pid).expect("the child's start time");
+    assert_ne!(other, own, "another process has another start time");
+    kill_group(pid);
+    reap(child);
+    assert_eq!(
+        ownership::process_start(pid),
+        None,
+        "a gone process has none"
+    );
+    assert_eq!(ownership::process_start(0), None);
+    assert_eq!(ownership::process_start(-1), None);
+}
+
+#[test]
+fn dc139_a_reused_process_id_is_never_killed() {
+    // The record names the group of a process that has the ID now but
+    // started at another time: an unrelated process that reused the ID.
+    let child = sleeper();
+    let pid = child.id() as i32;
+    let started = ownership::process_start(pid).unwrap();
+    let stale = format!("{started}-earlier");
+    assert_eq!(
+        ownership::stop_group(pid, &stale),
+        ownership::Stopped::Reused
+    );
+    assert_eq!(
+        ownership::Owner::Group {
+            group: pid,
+            started: String::new(),
+        }
+        .stop_leftover(),
+        ownership::Stopped::Reused,
+        "an unknown start time matches nothing"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(alive(pid), "the unrelated process still runs");
+
+    // The same record with the start time it had is the command's group.
+    assert_eq!(
+        ownership::Owner::Group {
+            group: pid,
+            started,
+        }
+        .stop_leftover(),
+        ownership::Stopped::Killed
+    );
+    let status = reap(child);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    assert_eq!(ownership::stop_group(pid, "x"), ownership::Stopped::Gone);
+}
+
+#[test]
+fn dc139_ownership_names_a_scope_per_command_or_says_why_not() {
+    let scopes = ownership::Ownership::Scopes;
+    let first = scopes.scope_for("abc").unwrap();
+    assert!(
+        first.starts_with("relay-agent-abc-") && first.ends_with(".scope"),
+        "{first}"
+    );
+    assert_ne!(
+        scopes.scope_for("abc").unwrap(),
+        first,
+        "unique per command"
+    );
+    assert_eq!(scopes.describe(), "scope");
+    let groups = ownership::Ownership::Groups {
+        reason: "why".into(),
+    };
+    assert_eq!(groups.scope_for("abc"), None);
+    assert_eq!(groups.describe(), "process-group (why)");
+    let detected = ownership::Ownership::detect();
+    if cfg!(target_os = "macos") {
+        assert!(
+            matches!(detected, ownership::Ownership::Groups { reason } if reason.contains("no cgroups"))
+        );
+    }
+    // Records survive encoding.
+    for owner in [
+        ownership::Owner::Scope {
+            unit: "relay-agent-k.scope".into(),
+        },
+        ownership::Owner::Group {
+            group: 42,
+            started: "1.000001".into(),
+        },
+    ] {
+        let text = serde_json::to_string(&owner).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ownership::Owner>(&text).unwrap(),
+            owner
+        );
+    }
+}

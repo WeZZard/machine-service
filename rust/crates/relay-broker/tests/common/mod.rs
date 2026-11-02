@@ -161,6 +161,8 @@ pub fn agent_options(home: &Path) -> AgentOptions {
         build: "test-build".into(),
         heartbeat: Duration::from_secs(5),
         retention: Duration::from_secs(3600),
+        ownership: guest_actions::ownership::Ownership::detect(),
+        executable: std::env::current_exe().unwrap(),
     }
 }
 

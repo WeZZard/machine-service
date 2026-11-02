@@ -375,6 +375,10 @@ pub struct Status {
     pub os: String,
     /// The execution IDs running now.
     pub running: Vec<String>,
+    /// How the operating system owns the agent's commands (DC-139):
+    /// `scope`, or `process-group (<why scopes are not used>)`.
+    #[serde(default)]
+    pub ownership: String,
 }
 
 /// What the agent knows of an execution ID.

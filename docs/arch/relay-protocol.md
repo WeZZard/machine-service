@@ -105,10 +105,10 @@ The same rule, one key naming the variant or a bare string for a variant without
 | cancel | `{"cancel":{"target":"<execution ID>"}}` | no | `result` with `cancel` |
 | status | `"status"` | no | `result` with `status` |
 
-- exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group after `timeout_s` seconds, which must be positive.
+- exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group, and on Linux with its systemd scope, which also holds the processes that left the group, after `timeout_s` seconds, which must be positive.
 - write resolves `path` against the home folder; when `path` names a folder, the file is `name` inside it. The bytes go to a temporary sibling, are checked against the `end`, and are renamed into place. `mode` is an integer file mode, such as `420` for `0644`.
 - read resolves `path` against the home folder. A folder is refused with code `is_directory`.
-- cancel kills the target's process group when it runs, discards it when its upload has not ended, and has its own execution ID like any operation.
+- cancel kills the target's process group (and scope) when it runs, discards it when its upload has not ended, and has its own execution ID like any operation.
 
 ### Outcomes (`outcome`)
 
@@ -118,9 +118,9 @@ The same rule, one key naming the variant or a bare string for a variant without
 | written | `{"written":{"size":<u64>,"sha256":"<hex>"}}` |
 | read | `{"read":{"size":<u64>,"sha256":"<hex>"}}` |
 | cancel | `{"cancel":{"target":"<id>","found":"signalled" \| "discarded" \| "completed" \| "unknown"}}` |
-| status | `{"status":{"protocol":1,"build":"<hex>","os":"macos" \| "linux","running":["<id>", …]}}` |
+| status | `{"status":{"protocol":1,"build":"<hex>","os":"macos" \| "linux","running":["<id>", …],"ownership":"<text>"}}`; `ownership` is `scope` when each command runs in its own systemd scope, else `process-group (<why not scopes>)` |
 | failed | `{"failed":{"code":"<code>","message":"<text>","committed":<bool>}}` |
-| interrupted | `{"interrupted":{"message":"<text>"}}`: the relay agent stopped while the operation ran; its effect is uncertain and it never runs again |
+| interrupted | `{"interrupted":{"message":"<text>"}}`: the relay agent stopped while the operation ran; its effect is uncertain and it never runs again. A restarted agent stops what such a command left running, and the message says so |
 
 ### Execution states (`state`)
 

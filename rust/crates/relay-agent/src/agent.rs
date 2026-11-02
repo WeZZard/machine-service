@@ -23,7 +23,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use guest_actions::{kill_group, AtomicFile, Sealed, Tally};
+use guest_actions::ownership::{Owner, Ownership};
+use guest_actions::{kill_command, AtomicFile, Sealed, Tally};
 
 use crate::link::{Link, LinkError};
 use crate::protocol::{
@@ -58,12 +59,18 @@ pub struct AgentOptions {
     pub heartbeat: Duration,
     /// How long completed records are kept.
     pub retention: Duration,
+    /// How the operating system owns the agent's commands (DC-139).
+    pub ownership: Ownership,
+    /// The executable the agent started from, which a restart executes
+    /// again: the path, not the file, so a build renamed into place runs.
+    pub executable: PathBuf,
 }
 
 impl AgentOptions {
     /// Options from the process environment: `$SHELL`, `$HOME`, the state
     /// directory `~/.local/state/relay-agent`, the hash of the running
-    /// executable, [`HEARTBEAT`] and [`RETENTION`].
+    /// executable, [`HEARTBEAT`], [`RETENTION`], and the ownership this
+    /// machine supports ([`Ownership::detect`]).
     pub fn from_environment() -> AgentOptions {
         let home = guest_actions::user_home();
         AgentOptions {
@@ -73,6 +80,8 @@ impl AgentOptions {
             build: guest_actions::executable_sha256(),
             heartbeat: HEARTBEAT,
             retention: RETENTION,
+            ownership: Ownership::detect(),
+            executable: std::env::current_exe().unwrap_or_default(),
         }
     }
 }
@@ -108,6 +117,8 @@ struct Live {
     op: OpKind,
     /// The process group of a command; 0 for other operations.
     group: AtomicI32,
+    /// The systemd scope of a command that runs in one.
+    scope: Option<String>,
     cancelled: AtomicBool,
     progress: Mutex<Progress>,
     changed: Condvar,
@@ -277,7 +288,7 @@ impl Agent {
         let mut state = self.inner.lock();
         for live in state.live.values() {
             live.cancelled.store(true, Ordering::SeqCst);
-            kill_group(live.group.load(Ordering::SeqCst));
+            live.kill();
         }
         let deadline = Instant::now() + grace;
         while !state.live.is_empty() {
@@ -310,6 +321,7 @@ impl Inner {
             build: self.options.build.clone(),
             os: std::env::consts::OS.to_string(),
             running,
+            ownership: self.options.ownership.describe(),
         }
     }
 
@@ -659,7 +671,7 @@ impl Session {
     fn cancel(&mut self, state: &State, target: &str) -> CancelFound {
         if let Some(live) = state.live.get(target) {
             live.cancelled.store(true, Ordering::SeqCst);
-            kill_group(live.group.load(Ordering::SeqCst));
+            live.kill();
             return CancelFound::Signalled;
         }
         if state.store.get(target).is_some() {
@@ -691,6 +703,10 @@ impl Session {
         timeout_s: f64,
     ) -> Known {
         let options = &self.inner.options;
+        // The scope is named before the command starts, so the record names
+        // it before anything can run in it; a group is known only once the
+        // command has started, and is recorded at once (DC-139).
+        let scope = options.ownership.scope_for(&Store::key(execution));
         let output = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -698,10 +714,24 @@ impl Session {
             .open(state.store.output(execution));
         let started = output
             .map_err(|error| ("record_failed", error.to_string()))
+            .and_then(|output| match &scope {
+                Some(unit) => state
+                    .store
+                    .set_owner(execution, Owner::Scope { unit: unit.clone() })
+                    .map(|()| output)
+                    .map_err(|error| ("record_failed", error.to_string())),
+                None => Ok(output),
+            })
             .and_then(|output| {
-                guest_actions::spawn_shell(&options.shell, &options.home, command, stdin.is_some())
-                    .map(|spawned| (output, spawned))
-                    .map_err(|error| ("spawn_failed", error.to_string()))
+                guest_actions::spawn_shell_in(
+                    &options.shell,
+                    &options.home,
+                    command,
+                    stdin.is_some(),
+                    scope.as_deref(),
+                )
+                .map(|spawned| (output, spawned))
+                .map_err(|error| ("spawn_failed", error.to_string()))
             });
         let (mut output, spawned) = match started {
             Ok(started) => started,
@@ -711,8 +741,17 @@ impl Session {
                 return Known::Completed(kind, outcome);
             }
         };
-        let live = new_live(kind);
-        live.group.store(spawned.group, Ordering::SeqCst);
+        if scope.is_none() {
+            let started = guest_actions::ownership::process_start(spawned.group);
+            let _ = state.store.set_owner(
+                execution,
+                Owner::Group {
+                    group: spawned.group,
+                    started: started.unwrap_or_default(),
+                },
+            );
+        }
+        let live = new_live_command(kind, spawned.group, scope);
         state.live.insert(execution.to_string(), Arc::clone(&live));
         let inner = Arc::clone(&self.inner);
         let execution = execution.to_string();
@@ -830,13 +869,25 @@ impl Session {
 }
 
 fn new_live(op: OpKind) -> Arc<Live> {
+    new_live_command(op, 0, None)
+}
+
+fn new_live_command(op: OpKind, group: i32, scope: Option<String>) -> Arc<Live> {
     Arc::new(Live {
         op,
-        group: AtomicI32::new(0),
+        group: AtomicI32::new(group),
+        scope,
         cancelled: AtomicBool::new(false),
         progress: Mutex::new(Progress::default()),
         changed: Condvar::new(),
     })
+}
+
+impl Live {
+    /// Kill a command's processes: its group, and its scope when it has one.
+    fn kill(&self) {
+        kill_command(self.group.load(Ordering::SeqCst), self.scope.as_deref());
+    }
 }
 
 fn wait_outcome(live: &Live) -> Outcome {

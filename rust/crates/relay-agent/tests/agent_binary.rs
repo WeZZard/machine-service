@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
@@ -230,10 +230,11 @@ fn a_crash_keeps_every_record_and_runs_nothing_twice() {
     let group: i32 = first_line(&mut process.driver, call).parse().unwrap();
     process.signal(libc::SIGKILL);
     process.wait();
-    // A crash cannot kill the command's group; the test does.
-    kill_group(group);
+    // A crash cannot kill the command's group; the restarted agent does
+    // (DC-139).
 
     let mut process = start(home.path());
+    wait_gone(group);
     let reports = &process.driver.hello().in_flight;
     assert!(reports.iter().any(|report| report.execution == "crashed"
         && matches!(
@@ -259,6 +260,130 @@ fn a_crash_keeps_every_record_and_runs_nothing_twice() {
         std::fs::read_to_string(home.path().join("runs")).unwrap(),
         "run\n"
     );
+}
+
+/// A daemon that double-forks and leaves the command's process group and
+/// session, writing its process ID to `daemon.pid`.
+const DAEMON: &str = r#"perl -MPOSIX -e 'fork and exit; POSIX::setsid(); fork and exit; open STDIN, "</dev/null"; open STDOUT, ">/dev/null"; open STDERR, ">/dev/null"; open F, ">daemon.pid.tmp"; print F $$; close F; rename "daemon.pid.tmp", "daemon.pid"; exec "sleep", "300"'"#;
+
+fn read_pid(path: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "no {}", path.display());
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// DC-139 (TL-2): the agent is killed with `SIGKILL` while a command runs,
+/// so it cannot stop anything itself. The command's processes outlive it,
+/// owned by the operating system; the restarted agent stops them, the
+/// command's group and, where the command runs in a systemd scope, the
+/// daemon that double-forked out of the group, and it leaves an unrelated
+/// process alone.
+#[test]
+fn dc139_a_restarted_agent_stops_what_a_killed_agent_left_running() {
+    let ownership = guest_actions::ownership::Ownership::detect();
+    eprintln!("ownership: {}", ownership.describe());
+    let home = tempfile::tempdir().unwrap();
+    let mut unrelated = Command::new("sleep")
+        .arg("300")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let unrelated_pid = unrelated.id() as i32;
+    let mut process = start(home.path());
+    let call = process
+        .driver
+        .start(
+            "left-running",
+            exec(&format!("echo $$; {DAEMON}; sleep 300 & wait")),
+            b"",
+        )
+        .unwrap();
+    let group: i32 = first_line(&mut process.driver, call).parse().unwrap();
+    let daemon = read_pid(&home.path().join("daemon.pid"));
+    // SAFETY: `getpgid` takes a plain integer.
+    let daemon_group = unsafe { libc::getpgid(daemon) };
+    assert_ne!(daemon_group, group, "the daemon left the command's group");
+    process.signal(libc::SIGKILL);
+    process.wait();
+    thread::sleep(Duration::from_millis(200));
+    assert!(alive(group), "the command outlives the killed agent");
+    assert!(alive(daemon), "so does its daemon");
+
+    let mut process = start(home.path());
+    wait_gone(group);
+    eprintln!("the command's group {group} is gone after the restart");
+    match ownership {
+        guest_actions::ownership::Ownership::Scopes => {
+            wait_gone(daemon);
+            eprintln!("the double-forked daemon {daemon} is gone with its scope");
+        }
+        guest_actions::ownership::Ownership::Groups { .. } => {
+            // A process that leaves its group escapes; the lease boundary
+            // stops it (DC-139). The test stops it.
+            assert!(alive(daemon), "a group cannot follow a daemon out of it");
+            kill_group(daemon_group);
+            wait_gone(daemon);
+        }
+    }
+    assert!(alive(unrelated_pid), "an unrelated process is untouched");
+    eprintln!("the unrelated process {unrelated_pid} still runs");
+    match process.driver.query("left-running").unwrap() {
+        ExecutionState::Completed {
+            outcome: Outcome::Interrupted { message },
+            ..
+        } => {
+            eprintln!("left-running: interrupted: {message}");
+            assert!(message.contains("was stopped"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+}
+
+/// DC-139 (TL-2): a timeout kills the whole command; in a scope, that
+/// includes a daemon that left the command's group.
+#[test]
+fn dc139_a_timeout_stops_the_command_and_its_scope() {
+    let ownership = guest_actions::ownership::Ownership::detect();
+    let home = tempfile::tempdir().unwrap();
+    let mut process = start(home.path());
+    let answer = process
+        .driver
+        .run(
+            "timed",
+            Op::Exec {
+                command: format!("{DAEMON}; sleep 300"),
+                stdin: false,
+                timeout_s: 2.0,
+            },
+            b"",
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome(&answer),
+        Outcome::Exit {
+            timed_out: true,
+            ..
+        }
+    ));
+    let daemon = read_pid(&home.path().join("daemon.pid"));
+    if ownership == guest_actions::ownership::Ownership::Scopes {
+        wait_gone(daemon);
+        eprintln!("the timeout stopped the scope and its daemon {daemon}");
+    } else {
+        // SAFETY: `getpgid` takes a plain integer.
+        kill_group(unsafe { libc::getpgid(daemon) });
+        wait_gone(daemon);
+    }
 }
 
 #[test]

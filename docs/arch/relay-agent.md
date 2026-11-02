@@ -58,6 +58,12 @@ flowchart LR
 - The relay agent serves `exec`, `script`, `write`, `read`, `cancel` and `status`, with the semantics of the [guest session agent](guest-session.md#gs-3-the-guest-session-agent): a command line runs through the user's shell, a script runs on standard input, bytes are checked by SHA-256 before a command starts or a file is renamed into place, and each command runs in its own process group.
 - Every operation carries the client's execution ID. The relay agent records each execution ID with its outcome, and it never runs an execution ID twice, so a broker that resends after a reconnect cannot cause a second run.
 - Data is sent in chunks of at most 1 MiB ([TC-8](transport-contract.md#tc-8-a-message-may-be-limited-in-size)).
+- The operating system owns the commands, so their ownership does not depend on the relay agent staying alive (DC-139):
+  - On Linux, each command runs in a transient systemd user scope of its own, `relay-agent-<SHA-256 of the execution ID>-<unique suffix>.scope`, started with `systemd-run --user --scope`, which executes the shell in place. The scope is a cgroup that holds every process the command starts, a daemon that double-forks out of the process group included, and it outlives the agent. The record names the scope before the command starts (DC-1xx-OWN-1).
+  - On macOS, and on a Linux machine whose user manager takes no scopes, each command leads its own process group, and the record keeps the group with the start time that the operating system reports for its leader (DC-1xx-OWN-2). The agent proves at start that the user manager takes a scope, and otherwise logs why it uses groups; `status` names the ownership in effect.
+  - A timeout, a cancel and the agent's own stop kill the command's group and, when it has one, its scope.
+  - A relay agent that starts after another stopped while commands ran, such as after a crash, stops what each of those commands left: the scope by name, the group only while its leader still has the recorded start time, so a process that reused the ID is never signalled. Each such execution is then `interrupted`, and its message says what was stopped.
+  - A process that leaves its group escapes the macOS rule; the lease boundary stops it: a VM is deleted at release, and a durable Mac sweeps leftover processes ([HY](hygiene.md)).
 
 ## RA-6: Delivery and update
 

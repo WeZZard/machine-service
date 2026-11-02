@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+pub mod ownership;
+
 #[cfg(test)]
 mod tests;
 
@@ -88,6 +90,15 @@ pub fn kill_group(group: i32) {
         unsafe {
             libc::killpg(group, libc::SIGKILL);
         }
+    }
+}
+
+/// Kill a command's processes: its process group and, when it runs in
+/// one, its scope, which also holds the processes that left the group.
+pub fn kill_command(group: i32, scope: Option<&str>) {
+    kill_group(group);
+    if let Some(scope) = scope {
+        let _ = ownership::kill_scope(scope);
     }
 }
 
@@ -164,6 +175,8 @@ pub struct Spawned {
     output: PipeReader,
     /// The command's process group, which is also the shell's process ID.
     pub group: i32,
+    /// The systemd scope the command runs in, when it runs in one.
+    pub scope: Option<String>,
 }
 
 /// How a command ended.
@@ -182,11 +195,31 @@ pub struct Exit {
 /// its file name, so the shell's messages read `bash: …`. The command's
 /// standard input is a pipe when `stdin` is true, else `/dev/null`.
 pub fn spawn_shell(shell: &Path, home: &Path, command: &str, stdin: bool) -> io::Result<Spawned> {
+    spawn_shell_in(shell, home, command, stdin, None)
+}
+
+/// [`spawn_shell`], in the systemd user scope `scope` when one is named
+/// (DC-139): `systemd-run --user --scope` registers the scope and then
+/// executes the shell in place, so everything the command starts, a daemon
+/// that leaves the process group included, stays in the scope.
+pub fn spawn_shell_in(
+    shell: &Path,
+    home: &Path,
+    command: &str,
+    stdin: bool,
+    scope: Option<&str>,
+) -> io::Result<Spawned> {
     let (output, writer) = io::pipe()?;
-    let mut process = Command::new(shell);
-    if let Some(name) = shell.file_name() {
-        process.arg0(name);
-    }
+    let mut process = match scope {
+        Some(scope) => ownership::scope_command(scope, shell),
+        None => {
+            let mut process = Command::new(shell);
+            if let Some(name) = shell.file_name() {
+                process.arg0(name);
+            }
+            process
+        }
+    };
     process
         .arg("-c")
         .arg(command)
@@ -203,12 +236,18 @@ pub fn spawn_shell(shell: &Path, home: &Path, command: &str, stdin: bool) -> io:
     let child = spawned?;
     Ok(Spawned {
         group: child.id() as i32,
+        scope: scope.map(str::to_string),
         child,
         output,
     })
 }
 
 impl Spawned {
+    /// The process ID of the command's shell, which leads its group.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Feed `stdin` to the command, pass its output to `on_output` until the
     /// whole group closes the pipe, and wait for it. After `timeout` the
     /// group is killed. `on_output` returning false kills the group too,
@@ -229,10 +268,11 @@ impl Spawned {
         let watchdog = {
             let timed_out = Arc::clone(&timed_out);
             let group = self.group;
+            let scope = self.scope.clone();
             thread::spawn(move || {
                 if let Err(mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(timeout) {
                     timed_out.store(true, Ordering::SeqCst);
-                    kill_group(group);
+                    kill_command(group, scope.as_deref());
                 }
             })
         };
@@ -242,7 +282,7 @@ impl Spawned {
                 Ok(0) => break,
                 Ok(count) => {
                     if !on_output(&buffer[..count]) {
-                        kill_group(self.group);
+                        kill_command(self.group, self.scope.as_deref());
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

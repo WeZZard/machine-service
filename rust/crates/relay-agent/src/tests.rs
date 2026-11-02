@@ -25,6 +25,8 @@ fn options(home: &Path) -> AgentOptions {
         build: "test-build".into(),
         heartbeat: Duration::from_secs(30),
         retention: Duration::from_secs(3600),
+        ownership: guest_actions::ownership::Ownership::detect(),
+        executable: std::env::current_exe().unwrap(),
     }
 }
 
@@ -288,6 +290,7 @@ fn every_message_survives_encoding() {
             build: "b".into(),
             os: "linux".into(),
             running: vec!["a".into()],
+            ownership: "scope".into(),
         }),
         Outcome::refused("checksum_mismatch", "m"),
         Outcome::Interrupted {
@@ -1624,4 +1627,113 @@ fn run_serves_each_dialed_link_and_dials_again_after_failures() {
     agent.shutdown(Duration::from_secs(1));
     let reasons = running.join().unwrap();
     assert!(reasons.contains(&LinkError::Failed("refused".into())));
+}
+
+/// DC-139 (TL-1): an agent that opens the records of one that stopped
+/// while commands ran stops the group whose leader still has its recorded
+/// start time, leaves alone a process that reused a recorded ID, and marks
+/// both executions interrupted.
+#[test]
+fn dc139_a_restarted_agent_stops_only_groups_whose_start_time_matches() {
+    use guest_actions::ownership::{process_start, Owner};
+    use std::os::unix::process::CommandExt;
+    let home = tempfile::tempdir().unwrap();
+    let spawn = || {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let mut ours = spawn();
+    let mut unrelated = spawn();
+    let (ours_pid, unrelated_pid) = (ours.id() as i32, unrelated.id() as i32);
+    {
+        let mut store =
+            crate::store::Store::open(&home.path().join(".state"), Duration::from_secs(3600))
+                .unwrap();
+        store.begin("left-running", OpKind::Exec).unwrap();
+        store
+            .set_owner(
+                "left-running",
+                Owner::Group {
+                    group: ours_pid,
+                    started: process_start(ours_pid).unwrap(),
+                },
+            )
+            .unwrap();
+        store.begin("id-reused", OpKind::Exec).unwrap();
+        store
+            .set_owner(
+                "id-reused",
+                Owner::Group {
+                    group: unrelated_pid,
+                    started: "0.000000".into(),
+                },
+            )
+            .unwrap();
+    }
+    let agent = Agent::open(options(home.path())).unwrap();
+    let status = ours.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "the command's own group is stopped"
+    );
+    assert!(alive(unrelated_pid), "an unrelated process is left alone");
+    for (execution, says) in [("left-running", "was stopped"), ("id-reused", "left alone")] {
+        match agent.query(execution) {
+            ExecutionState::Completed {
+                outcome: Outcome::Interrupted { message },
+                ..
+            } => assert!(message.contains(says), "{execution}: {message}"),
+            other => panic!("{execution}: {other:?}"),
+        }
+    }
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+}
+
+#[test]
+fn dc139_a_command_records_its_owner_and_status_names_the_ownership() {
+    let mut rig = Rig::new();
+    let call = rig
+        .driver
+        .start("owned", exec("echo $$; sleep 30"), b"")
+        .unwrap();
+    let group: i32 = first_line(&mut rig.driver, call).parse().unwrap();
+    let status = rig.run("owned-status", Op::Status, b"");
+    let expected = guest_actions::ownership::Ownership::detect().describe();
+    assert!(matches!(outcome(&status), Outcome::Status(s) if s.ownership == expected));
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            rig.path(".state/executions")
+                .join(crate::store::Store::key("owned"))
+                .join("record.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    if expected == "scope" {
+        let unit = record["owner"]["scope"]["unit"].as_str().unwrap();
+        let prefix = format!("relay-agent-{}-", crate::store::Store::key("owned"));
+        assert!(unit.starts_with(&prefix), "{unit}");
+        // The command runs in that scope.
+        let cgroup = std::fs::read_to_string(format!("/proc/{group}/cgroup")).unwrap();
+        assert!(cgroup.contains(unit), "{cgroup}");
+    } else {
+        assert_eq!(record["owner"]["group"]["group"], group);
+        assert_eq!(
+            record["owner"]["group"]["started"].as_str(),
+            guest_actions::ownership::process_start(group).as_deref()
+        );
+    }
+    rig.run(
+        "owned-cancel",
+        Op::Cancel {
+            target: "owned".into(),
+        },
+        b"",
+    );
+    rig.driver.finish(call).unwrap();
 }

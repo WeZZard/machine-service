@@ -6,6 +6,12 @@
 //! command's combined output, which a repeated call replays. A record is
 //! written to the disk before the operation takes effect, so an agent that
 //! restarts finds every execution it started and runs none of them again.
+//!
+//! A command's record also names who owns its processes (DC-139): its
+//! systemd scope, or its process group and the group leader's start time.
+//! An agent that opens the records of one that stopped while a command ran
+//! stops what that command left: the scope by name, the group only while
+//! its leader still has the recorded start time.
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, File};
@@ -15,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use guest_actions::ownership::{Owner, Stopped};
 
 use crate::protocol::{OpKind, Outcome};
 
@@ -33,6 +41,9 @@ pub struct Record {
     pub finished_ms: Option<u64>,
     /// Whether a link has carried the outcome.
     pub reported: bool,
+    /// Who owns a command's processes, once it has some.
+    #[serde(default)]
+    pub owner: Option<Owner>,
 }
 
 /// The records of one state directory, kept in memory and written through.
@@ -80,19 +91,21 @@ impl Store {
                 }
             }
         }
-        let stale: Vec<String> = store
+        let stale: Vec<(String, Option<Owner>)> = store
             .records
             .values()
             .filter(|record| record.outcome.is_none())
-            .map(|record| record.execution.clone())
+            .map(|record| (record.execution.clone(), record.owner.clone()))
             .collect();
-        for execution in stale {
-            store.complete(
-                &execution,
-                Outcome::Interrupted {
-                    message: "the relay agent stopped while the operation ran".into(),
-                },
-            )?;
+        for (execution, owner) in stale {
+            let message = match owner.as_ref().map(|owner| (owner, owner.stop_leftover())) {
+                None => "the relay agent stopped while the operation ran".to_string(),
+                Some((owner, stopped)) => format!(
+                    "the relay agent stopped while the operation ran; {}",
+                    describe_stop(owner, &stopped)
+                ),
+            };
+            store.complete(&execution, Outcome::Interrupted { message })?;
         }
         store.prune(retention);
         Ok(store)
@@ -106,6 +119,23 @@ impl Store {
     /// Every record.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.records.values()
+    }
+
+    /// The name that stands for `execution` on the disk and in a scope's
+    /// name: the SHA-256 of the ID.
+    pub fn key(execution: &str) -> String {
+        guest_actions::sha256_hex(execution.as_bytes())
+    }
+
+    /// Record who owns the processes of a running `execution`. This reaches
+    /// the disk before the agent answers anything about the command.
+    pub fn set_owner(&mut self, execution: &str, owner: Owner) -> io::Result<()> {
+        let Some(mut record) = self.records.get(execution).cloned() else {
+            return Ok(());
+        };
+        record.owner = Some(owner);
+        self.records.insert(execution.to_string(), record.clone());
+        self.save(&record)
     }
 
     /// The file that holds a command's output.
@@ -134,6 +164,7 @@ impl Store {
             started_ms: now_ms(),
             finished_ms: None,
             reported: false,
+            owner: None,
         };
         self.save(&record)?;
         self.records.insert(execution.to_string(), record);
@@ -182,8 +213,7 @@ impl Store {
     }
 
     fn directory(&self, execution: &str) -> PathBuf {
-        self.root
-            .join(guest_actions::sha256_hex(execution.as_bytes()))
+        self.root.join(Store::key(execution))
     }
 
     fn save(&self, record: &Record) -> io::Result<()> {
@@ -195,5 +225,18 @@ impl Store {
         drop(file);
         fs::rename(&temporary, directory.join("record.json"))?;
         File::open(&directory)?.sync_all()
+    }
+}
+
+/// What a restarted agent did with a command's leftover processes.
+fn describe_stop(owner: &Owner, stopped: &Stopped) -> String {
+    let what = owner.describe();
+    match stopped {
+        Stopped::Killed => format!("its {what} was stopped"),
+        Stopped::Gone => format!("its {what} had already ended"),
+        Stopped::Reused => {
+            format!("its {what} was left alone: the process ID now belongs to another process")
+        }
+        Stopped::Failed(error) => format!("stopping its {what} failed: {error}"),
     }
 }
