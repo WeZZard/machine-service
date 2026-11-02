@@ -162,6 +162,11 @@ impl Instance {
         self.json("POST", &format!("/machines/{name}/heartbeat"), Some(body))
     }
 
+    /// `POST /machines/<name>/exec` (DM-4).
+    pub fn exec(&self, name: &str, body: Value) -> Result<Value, String> {
+        self.json("POST", &format!("/machines/{name}/exec"), Some(body))
+    }
+
     /// `POST /machines/<name>/release`.
     pub fn release(&self, name: &str, body: Value) -> Result<Value, String> {
         self.json("POST", &format!("/machines/{name}/release"), Some(body))

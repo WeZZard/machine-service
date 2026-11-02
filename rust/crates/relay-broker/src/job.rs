@@ -285,7 +285,11 @@ pub(crate) struct Job {
     /// The lease the call belongs to, which the agent's record keeps.
     pub lease: String,
     pub execution: String,
+    /// The operation the relay agent runs.
     pub op: Op,
+    /// When a launcher rewrote the client's operation, the client's kind
+    /// and the launcher to tell when the record settles.
+    pub launched: Option<Launched>,
     /// A replay for one late caller, kept out of the records.
     pub transient: bool,
     /// Whether the first call continues an upload the agent holds.
@@ -313,15 +317,37 @@ pub(crate) struct JobSpec {
     pub resume: bool,
     pub offset: u64,
     pub transient: bool,
+    /// Whether a client sent the call, so that the target's launcher, when
+    /// it has one, starts its command (DC-1xx-LAUNCH-1).
+    pub launch: bool,
+}
+
+/// A client's command that the target's launcher rewrote.
+#[derive(Clone)]
+pub(crate) struct Launched {
+    /// The client's operation, which the record answers queries with.
+    pub kind: OpKind,
+    pub launcher: Arc<dyn crate::Launcher>,
 }
 
 impl Job {
     pub fn new(spec: JobSpec, max_kept: usize, held: Arc<Held>) -> Job {
+        Job::launched(spec, None, max_kept, held)
+    }
+
+    /// A record whose operation `launched` rewrote, when it is `Some`.
+    pub fn launched(
+        spec: JobSpec,
+        launched: Option<Launched>,
+        max_kept: usize,
+        held: Arc<Held>,
+    ) -> Job {
         Job {
             target: spec.target,
             lease: spec.lease,
             execution: spec.execution,
             op: spec.op,
+            launched,
             transient: spec.transient,
             resume: spec.resume,
             client: matches!(spec.feed, Feed::Client),
@@ -346,8 +372,12 @@ impl Job {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The client's operation: a launched command answers as the exec or
+    /// script it was sent as.
     fn kind(&self) -> OpKind {
-        self.op.kind()
+        self.launched
+            .as_ref()
+            .map_or_else(|| self.op.kind(), |launched| launched.kind)
     }
 
     fn client_fed(&self) -> bool {
@@ -703,6 +733,12 @@ impl Job {
                 replayed: !(subscriber.origin && !self.transient) || replayed_for_origin,
                 outcome: outcome.clone(),
             });
+        }
+        drop(state);
+        // Whatever the launcher left for the command is no longer needed:
+        // the command ran, or it never will under this record.
+        if let (Some(launched), false) = (&self.launched, self.transient) {
+            launched.launcher.settled(&self.lease, &self.execution);
         }
         matches!(
             outcome,

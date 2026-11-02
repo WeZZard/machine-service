@@ -11,6 +11,8 @@
 //! agent runs the installed release's build (DC-140).
 
 mod common;
+#[path = "../../relay-broker/tests/common/mod.rs"]
+mod relay_common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,8 @@ use std::time::{Duration, Instant};
 use common::{
     canonical_dir, free_port, http_timeout, relay_agent_bin, try_http, write_relay_release, DAEMON,
 };
+use relay_agent::protocol::{ExecutionState, Op, OpKind, Outcome};
+use relay_common::{client_config_v2, Collected, TestClient};
 use serde_json::{json, Value};
 
 const CLAUDE_KEY: &str = "sk-fake-relay-claude-key-0123456789";
@@ -572,7 +576,7 @@ fn m4_exec_push_and_pull_run_through_the_relay_agent() {
 
     let answer = lab.exec(
         &name,
-        json!({"lease_id": lease, "script": "echo $PPID\necho $MACHINE_SERVICE_LEASE_ID\npwd\necho \"owner=${ANTHROPIC_AUTH_TOKEN:-none}\"\necho \"key=$ANTHROPIC_API_KEY\"\n"}),
+        json!({"lease_id": lease, "script": "ps -o ppid= -p $PPID | tr -d ' '\necho $MACHINE_SERVICE_LEASE_ID\npwd\necho \"owner=${ANTHROPIC_AUTH_TOKEN:-none}\"\necho \"key=$ANTHROPIC_API_KEY\"\n"}),
     );
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(answer.body["link"], "relay");
@@ -582,7 +586,7 @@ fn m4_exec_push_and_pull_run_through_the_relay_agent() {
     assert_eq!(
         lines[0],
         agent.to_string(),
-        "the command is the agent's child"
+        "with keys loaded the command is the child of the launcher, the agent's child (DC-1xx-LAUNCH-3)"
     );
     assert_eq!(lines[1], lease);
     assert!(
@@ -771,8 +775,9 @@ fn relay_records_failure(hygiene: &Value) -> Option<String> {
 }
 
 /// DC-173, AK-5: the relay agent's records keep a command's output as the
-/// agent saw it, keys and all; release has the agent purge the lease's
-/// records, and completes only after the agent confirms.
+/// agent saw it, which the launcher redacted (DC-1xx-LAUNCH-3); release has
+/// the agent purge the lease's records, and completes only after the agent
+/// confirms.
 #[test]
 fn m4_release_purges_the_relay_agents_records_of_the_lease() {
     let mut lab = Lab::new(relay_agent_bin());
@@ -781,14 +786,22 @@ fn m4_release_purges_the_relay_agents_records_of_the_lease() {
     lab.wait_for_relay(&name, &lease);
     let answer = lab.exec(
         &name,
-        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY\"\n"}),
+        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY of $MACHINE_SERVICE_LEASE_ID\"\n"}),
     );
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(answer.body["link"], "relay");
-    assert_eq!(answer.body["output"], "key=[redacted]\n");
+    assert_eq!(
+        answer.body["output"],
+        format!("key=[redacted] of {lease}\n")
+    );
+    let records = agent_records(&lab);
     assert!(
-        agent_records(&lab).contains(CLAUDE_KEY),
-        "the agent's record keeps the output unredacted"
+        records.contains(&format!("key=[redacted] of {lease}")),
+        "the agent's record keeps the output as the agent saw it"
+    );
+    assert!(
+        !records.contains(CLAUDE_KEY),
+        "a key never reaches a record"
     );
 
     let released = lab.release_lease(&name, &lease);
@@ -799,7 +812,7 @@ fn m4_release_purges_the_relay_agents_records_of_the_lease() {
     assert!(records["records"].as_u64().unwrap() >= 2, "{records}");
     assert!(records["bytes"].as_u64().unwrap() > 0, "{records}");
     assert_eq!(relay_records_failure(hygiene), None, "{hygiene}");
-    assert!(!agent_records(&lab).contains(CLAUDE_KEY));
+    assert!(!agent_records(&lab).contains(&lease));
     assert!(alive(agent), "a purge never ends the relay agent");
 
     // The next lease's calls are its own; its release purges them too.
@@ -859,10 +872,11 @@ fn m4_an_unconfirmed_purge_stays_pending_until_the_agent_confirms_it() {
     lab.wait_for_relay(&name, &lease);
     let answer = lab.exec(
         &name,
-        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY\"\n"}),
+        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY of $MACHINE_SERVICE_LEASE_ID\"\n"}),
     );
     assert_eq!(answer.body["link"], "relay", "{}", answer.body);
-    assert!(agent_records(&lab).contains(CLAUDE_KEY));
+    assert!(agent_records(&lab).contains(&format!("of {lease}")));
+    assert!(!agent_records(&lab).contains(CLAUDE_KEY));
 
     // The agent is down at release: the Mac is freed and the purge waits.
     lab.stop_agent();
@@ -877,7 +891,7 @@ fn m4_an_unconfirmed_purge_stays_pending_until_the_agent_confirms_it() {
     // A restart of the instance keeps it pending.
     lab.restart_daemon();
     assert_eq!(lab.pending_purges(&name), std::slice::from_ref(&lease));
-    assert!(agent_records(&lab).contains(CLAUDE_KEY));
+    assert!(agent_records(&lab).contains(&format!("of {lease}")));
     assert_eq!(confirmations(&lab, &lease), 0);
 
     // The agent registers again: the purge is sent and confirmed.
@@ -892,7 +906,7 @@ fn m4_an_unconfirmed_purge_stays_pending_until_the_agent_confirms_it() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(!agent_records(&lab).contains(CLAUDE_KEY));
+    assert!(!agent_records(&lab).contains(&lease));
     assert_eq!(confirmations(&lab, &lease), 1);
     let record = lab.request(
         "GET",
@@ -938,4 +952,209 @@ fn m4_a_purge_confirmed_at_release_is_never_sent_again() {
     lab.wait_for_registrations(registered + 1);
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(confirmations(&lab, &lease), 1, "{}", lab.log());
+}
+
+/// The SHA-256 of `bytes`, as `shasum -a 256` prints it.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A relay client of the lease, as mcp-relay connects one from the
+/// acquisition's answer (RP-1, RP-11).
+fn lease_client(acquired: &Value) -> TestClient {
+    let relay = &acquired["relay"];
+    let pem = relay["ca_pem"].as_str().expect("the answer carries relay");
+    let mut config = client_config_v2(
+        relay["url"].as_str().unwrap(),
+        relay["credential"].as_str().unwrap(),
+    );
+    config.tls = Some(remote_session::tls::client_config(&[pem.as_bytes()]).unwrap());
+    TestClient::connect_with(config).unwrap()
+}
+
+fn exit_rc(answer: &Collected) -> Option<i32> {
+    match &answer.result.as_ref().expect("a result").outcome {
+        Outcome::Exit { rc, .. } => *rc,
+        other => panic!("not an exit: {other:?}"),
+    }
+}
+
+/// What a lease's command sees: its lease, its working directory and
+/// temporary folder, its key as a command sees it and as its SHA-256, the
+/// owner's credential, and its whole environment.
+const PROBE: &str = r#"echo "lease=$MACHINE_SERVICE_LEASE_ID"
+echo "pwd=$(pwd)"
+echo "tmp=$TMPDIR"
+echo "key=$ANTHROPIC_API_KEY"
+printf %s "$ANTHROPIC_API_KEY" | shasum -a 256 | cut -c1-64
+echo "owner=${ANTHROPIC_AUTH_TOKEN:-none}"
+env | LC_ALL=C sort | grep -v '^_='
+"#;
+
+/// DC-1xx-LAUNCH-1, DM-4, AK-5: a relay client's exec and script on a
+/// durable lease start through the lease's launcher, as machine-service's own
+/// exec does: they see the lease's working directory, variables and agent
+/// keys exactly as an HTTP exec sees them, standard input included, and a
+/// query names the client's own operation. No key appears in any relay
+/// message the client receives, in the relay agent's records, spools or log,
+/// in the lease's state or in the service's log. Release stops the client's
+/// commands and what they left, and purges every record of them.
+#[test]
+fn m4_a_relay_clients_commands_run_as_the_leases_http_exec() {
+    let mut lab = Lab::new(relay_agent_bin());
+    let agent = lab.start_agent();
+    let (name, lease, acquired) = lab.acquire("default");
+    lab.wait_for_relay(&name, &lease);
+    let client = lease_client(&acquired);
+    const WAIT: Duration = Duration::from_secs(60);
+
+    // The same script over HTTP and over the broker.
+    let http = lab.exec(&name, json!({"lease_id": lease, "script": PROBE}));
+    assert_eq!(http.status, 200, "{}", http.body);
+    assert_eq!(http.body["link"], "relay");
+    client.call(
+        1,
+        "probe-script",
+        Op::Script { timeout_s: 60.0 },
+        PROBE.as_bytes(),
+    );
+    let relayed = client.wait(1, WAIT);
+    assert_eq!(exit_rc(&relayed), Some(0), "{relayed:?}");
+    assert!(relayed.end_matches());
+    let seen = String::from_utf8(relayed.bytes.clone()).unwrap();
+    assert_eq!(seen, http.body["output"].as_str().unwrap());
+    let work = lab
+        .home
+        .join(format!("machine-service/leases/{lease}/work"));
+    for line in [
+        format!("lease={lease}"),
+        format!("pwd={}", work.display()),
+        "key=[redacted]".to_string(),
+        sha256_hex(CLAUDE_KEY.as_bytes()),
+        "owner=none".to_string(),
+        "ANTHROPIC_API_KEY=[redacted]".to_string(),
+        "ANTHROPIC_BASE_URL=http://<gateway-host>".to_string(),
+        format!("MACHINE_SERVICE_LEASE_ID={lease}"),
+    ] {
+        assert!(
+            seen.lines().any(|seen| seen == line),
+            "no {line:?} in:\n{seen}"
+        );
+    }
+    assert!(
+        seen.contains(&format!(
+            "tmp={}",
+            lab.home
+                .join(format!("machine-service/leases/{lease}/tmp"))
+                .display()
+        )),
+        "{seen}"
+    );
+
+    // An exec, with and without standard input, as an argv over HTTP.
+    let line = r#"echo "$MACHINE_SERVICE_LEASE_ID $(pwd)"; printf %s "$ANTHROPIC_API_KEY" | shasum -a 256 | cut -c1-64; exit 7"#;
+    let http = lab.exec(
+        &name,
+        json!({"lease_id": lease, "argv": ["/bin/zsh", "-c", line]}),
+    );
+    client.call(2, "probe-exec", relay_common::exec(line), b"");
+    let relayed = client.wait(2, WAIT);
+    assert_eq!(exit_rc(&relayed), Some(7));
+    assert_eq!(http.body["rc"], 7, "{}", http.body);
+    assert_eq!(
+        String::from_utf8_lossy(&relayed.bytes),
+        http.body["output"].as_str().unwrap()
+    );
+    let input = vec![b'x'; 300_000];
+    client.call(
+        3,
+        "probe-stdin",
+        Op::Exec {
+            command: "shasum -a 256 | cut -c1-64".into(),
+            stdin: true,
+            timeout_s: 60.0,
+        },
+        &input,
+    );
+    let relayed = client.wait(3, WAIT);
+    assert_eq!(
+        String::from_utf8_lossy(&relayed.bytes).trim(),
+        sha256_hex(&input)
+    );
+    client.query(4, "probe-script");
+    match client.wait(4, WAIT).query.unwrap() {
+        ExecutionState::Completed { op, .. } => assert_eq!(op, OpKind::Script),
+        other => panic!("{other:?}"),
+    }
+
+    // A command that runs on and one that leaves a process behind.
+    client.call(
+        5,
+        "leaves",
+        relay_common::exec("nohup sleep 3600 >/dev/null 2>&1 & echo $!"),
+        b"",
+    );
+    let left = client.wait(5, WAIT);
+    let background: i32 = String::from_utf8_lossy(&left.bytes).trim().parse().unwrap();
+    let _guard = Leftover(background);
+    client.call(
+        6,
+        "runs-on",
+        relay_common::exec("echo started; sleep 300"),
+        b"",
+    );
+    let deadline = Instant::now() + WAIT;
+    while client.seen(6).bytes.is_empty() {
+        assert!(Instant::now() < deadline, "the long command never started");
+    }
+
+    // Nothing the client received, and nothing the agent or the service
+    // kept, holds a key; the launcher's requests are gone.
+    let mut received = format!("{relayed:?}{left:?}{:?}", client.seen(6));
+    received.push_str(&seen);
+    assert!(!received.contains(CLAUDE_KEY));
+    assert!(
+        !tree_text(&lab.agent_home).contains(CLAUDE_KEY),
+        "the agent's files hold a key"
+    );
+    assert!(!std::fs::read_to_string(lab.root.join("agent.log"))
+        .unwrap()
+        .contains(CLAUDE_KEY));
+    assert!(!lab.log().contains(CLAUDE_KEY));
+    let relay_dir = lab.state.join("leases").join(&lease).join("relay");
+    assert!(
+        !tree_text(&relay_dir).contains(CLAUDE_KEY),
+        "a request was left behind"
+    );
+
+    // Release stops both, and purges every record of the client's calls.
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+    assert!(wait_dead(background), "the background process survived");
+    let running = client.wait(6, WAIT);
+    assert!(running.result.is_some());
+    let hygiene = &released.body["hygiene"];
+    let ended: Vec<&Value> = hygiene["stopped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(hygiene["swept"].as_array().unwrap())
+        .collect();
+    assert!(
+        ended.iter().any(|entry| entry["pid"] == background),
+        "{hygiene}"
+    );
+    let records = &hygiene["relay_records"];
+    assert_eq!(records["purged"], true, "{hygiene}");
+    assert!(records["records"].as_u64().unwrap() >= 7, "{records}");
+    assert!(
+        !agent_records(&lab).contains(&lease),
+        "a record of the lease survived the purge"
+    );
+    assert!(!tree_text(&relay_dir).contains(CLAUDE_KEY));
+    assert!(alive(agent), "the relay agent survives the release");
 }

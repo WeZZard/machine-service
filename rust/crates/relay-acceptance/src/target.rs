@@ -438,6 +438,13 @@ impl RealTarget {
         answer
     }
 
+    /// The lease's machine name and lease ID, while the suite holds one.
+    pub fn lease_id(&self) -> Option<(String, String)> {
+        let lease = self.lease.as_ref()?;
+        let id = lease.record.get("lease_id")?.as_str()?;
+        Some((lease.name.clone(), id.to_string()))
+    }
+
     /// Whether the target is a durable Mac.
     pub fn durable(&self) -> bool {
         self.kind == Some(TargetKind::DurableMac)

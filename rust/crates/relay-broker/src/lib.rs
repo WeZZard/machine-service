@@ -8,6 +8,8 @@
 //!   [`remote_session::SessionServer`].
 //! - [`Broker::run`] and [`Broker::query`] are the same calls for a caller in
 //!   the same process, such as machine-service's HTTP exec, push and pull.
+//! - [`Launcher`] lets the owner of a target start every command a client
+//!   sends it, as machine-service starts a durable lease's (DC-1xx-LAUNCH-1).
 //! - [`tls`] makes the broker's authority and certificates; [`net`] reads the
 //!   host's names and addresses.
 
@@ -31,7 +33,7 @@ use crate::agent::{AgentConn, AgentEvent};
 pub use crate::credentials::{credential_sha256, new_credential, Role, Target, Validity};
 use crate::credentials::{Grant, Grants};
 pub use crate::job::{Events, JobEvent, Upload};
-use crate::job::{Feed, Held, Job, JobSpec};
+use crate::job::{Feed, Held, Job, JobSpec, Launched};
 
 /// How the broker behaves.
 #[derive(Debug, Clone)]
@@ -97,6 +99,26 @@ struct Binding {
 /// Called with every relay agent that registers.
 type AgentWatcher = dyn Fn(&Target, &AgentInfo) + Send + Sync;
 
+/// Starts the commands that clients send to one target (DC-1xx-LAUNCH-1).
+///
+/// The broker hands a client's `exec` or `script` to the target's relay
+/// agent as the operation [`Launcher::launch`] answers, once per execution
+/// record: a call that attaches to a record, or that the relay agent answers
+/// from its own, is never launched again. The client's operation is what
+/// the record answers a query with; its call, stream and outcome are the
+/// relay agent's, as for any call.
+pub trait Launcher: Send + Sync {
+    /// The operation the relay agent runs for the client's `op`, an `exec`
+    /// or a `script`, of `lease` under `execution`. An error refuses the
+    /// call with `launch_failed`, before anything ran.
+    fn launch(&self, lease: &str, execution: &str, op: &Op) -> Result<Op, String>;
+
+    /// The record of a launched call has its outcome: whatever the launch
+    /// left for the command and the command did not take may go. It runs
+    /// on the broker's threads and must not block.
+    fn settled(&self, lease: &str, execution: &str);
+}
+
 /// Why a relay agent was not restarted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartError {
@@ -123,6 +145,8 @@ pub(crate) struct Inner {
     next_id: AtomicU64,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
     watchers: Mutex<Vec<Arc<AgentWatcher>>>,
+    /// The targets whose clients' commands a launcher starts.
+    launchers: Mutex<HashMap<Target, Arc<dyn Launcher>>>,
 }
 
 /// What an in-process call answered.
@@ -183,6 +207,7 @@ impl Broker {
                 next_id: AtomicU64::new(1),
                 log: Arc::new(log),
                 watchers: Mutex::new(Vec::new()),
+                launchers: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -335,8 +360,20 @@ impl Broker {
                 resume: false,
                 offset: 0,
                 transient: false,
+                launch: false,
             })
             .0
+    }
+
+    /// Start every `exec` and `script` that a client sends to `target`
+    /// through `launcher` from now on; calls made in this process, with
+    /// [`Self::submit`] or [`Self::run`], are handed on as they are.
+    pub fn launch_through(&self, target: &Target, launcher: Arc<dyn Launcher>) {
+        self.inner
+            .launchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(target.clone(), launcher);
     }
 
     /// Run one call through the lease's relay agent and wait up to `timeout`
@@ -681,9 +718,42 @@ impl Inner {
         let max_kept = self.config.max_kept_output;
         spec.lease = self.lease_of(&spec.target);
         let feeds = matches!(spec.feed, Feed::Client);
-        let mut jobs = self.jobs();
-        let now = Instant::now();
-        jobs.retain(|_, job| !job.expired(now, self.config.retention));
+        let launcher = self
+            .launcher_of(&spec.target)
+            .filter(|_| spec.launch && matches!(spec.op, Op::Exec { .. } | Op::Script { .. }));
+        // A launch writes what the command needs, so it runs without the
+        // records' lock, and only for a call that makes a new record.
+        let mut launched: Option<(Op, Launched)> = None;
+        let mut jobs = loop {
+            let mut jobs = self.jobs();
+            let now = Instant::now();
+            jobs.retain(|_, job| !job.expired(now, self.config.retention));
+            if jobs.contains_key(&key) || launched.is_some() {
+                break jobs;
+            }
+            let Some(launcher) = &launcher else {
+                break jobs;
+            };
+            drop(jobs);
+            match launcher.launch(&spec.lease, &spec.execution, &spec.op) {
+                Ok(op) => {
+                    launched = Some((
+                        op,
+                        Launched {
+                            kind: spec.op.kind(),
+                            launcher: Arc::clone(launcher),
+                        },
+                    ))
+                }
+                Err(message) => {
+                    (self.log)(&format!(
+                        "relay: {}: execution {} not launched: {message}",
+                        spec.target, spec.execution
+                    ));
+                    return self.refused(spec, "launch_failed", &message);
+                }
+            }
+        };
         let existing = jobs.get(&key).cloned();
         if let Some(existing) = existing {
             if existing.uploading() {
@@ -700,7 +770,7 @@ impl Inner {
             }
             // The kept output was dropped for its size: the agent replays
             // it from its own record.
-            let replay = Arc::new(Job::new(
+            let replay = Arc::new(Job::launched(
                 JobSpec {
                     lease: existing.lease.clone(),
                     op: existing.op.clone(),
@@ -709,6 +779,7 @@ impl Inner {
                     transient: true,
                     ..spec
                 },
+                existing.launched.clone(),
                 max_kept,
                 Arc::clone(&self.held),
             ));
@@ -717,7 +788,16 @@ impl Inner {
             std::thread::spawn(move || job::drive(inner, replay));
             return (events, None);
         }
-        let job = Arc::new(Job::new(spec, max_kept, Arc::clone(&self.held)));
+        let launched = launched.map(|(op, launched)| {
+            spec.op = op;
+            launched
+        });
+        let job = Arc::new(Job::launched(
+            spec,
+            launched,
+            max_kept,
+            Arc::clone(&self.held),
+        ));
         jobs.insert(key, Arc::clone(&job));
         drop(jobs);
         let events = job.subscribe(true).expect("a new record takes callers");
@@ -725,6 +805,24 @@ impl Inner {
         let driven = Arc::clone(&job);
         std::thread::spawn(move || job::drive(inner, driven));
         (events, feeds.then_some(job))
+    }
+
+    /// The launcher of `target`'s clients' commands, when it has one.
+    fn launcher_of(&self, target: &Target) -> Option<Arc<dyn Launcher>> {
+        self.launchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(target)
+            .cloned()
+    }
+
+    /// Answer `spec`'s caller with a refusal and keep no record, so its ID
+    /// may be sent again (RP-6).
+    fn refused(&self, spec: JobSpec, code: &str, message: &str) -> (Events, Option<Arc<Job>>) {
+        let job = Arc::new(Job::new(spec, 0, Arc::clone(&self.held)));
+        let events = job.subscribe(true).expect("a new record takes callers");
+        job.refuse(code, message);
+        (events, None)
     }
 
     /// Forget a record that ended without running, so its ID may be sent

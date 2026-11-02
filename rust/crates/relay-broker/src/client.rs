@@ -355,6 +355,7 @@ impl Started<'_> {
             resume,
             offset,
             transient: false,
+            launch: true,
         });
         let session = self.session.clone();
         let open = Arc::clone(self.open);

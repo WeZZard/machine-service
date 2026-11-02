@@ -129,6 +129,11 @@ impl EndpointState {
 pub struct Secret(String);
 
 impl Secret {
+    /// A value to keep out of logs and answers.
+    pub fn new(value: impl Into<String>) -> Secret {
+        Secret(value.into())
+    }
+
     /// The value, for a command's environment and for redaction only.
     pub fn expose(&self) -> &str {
         &self.0
@@ -331,6 +336,87 @@ pub fn redact(text: &str, secrets: &[Secret]) -> String {
     out
 }
 
+/// [`redact`] over a stream that arrives in pieces (DC-1xx-LAUNCH-3): every
+/// occurrence of a value becomes [`REDACTED`], also one split between two
+/// pieces. It holds back only the end of a piece that could begin a value,
+/// so output that cannot hold one passes at once.
+pub struct Redactor {
+    /// The values, longest first, so a value that begins another loses.
+    values: Vec<Vec<u8>>,
+    /// Whether some value begins with the byte.
+    first: [bool; 256],
+    held: Vec<u8>,
+}
+
+impl Redactor {
+    /// A redactor of `values`; empty values are ignored.
+    pub fn new<V: AsRef<[u8]>>(values: impl IntoIterator<Item = V>) -> Redactor {
+        let mut values: Vec<Vec<u8>> = values
+            .into_iter()
+            .map(|value| value.as_ref().to_vec())
+            .filter(|value| !value.is_empty())
+            .collect();
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        let mut first = [false; 256];
+        for value in &values {
+            first[value[0] as usize] = true;
+        }
+        Redactor {
+            values,
+            first,
+            held: Vec::new(),
+        }
+    }
+
+    /// Whether there is nothing to redact.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The redacted bytes of `piece` that can go out now.
+    pub fn push(&mut self, piece: &[u8]) -> Vec<u8> {
+        self.held.extend_from_slice(piece);
+        self.scan(false)
+    }
+
+    /// The rest, at the end of the stream.
+    pub fn finish(mut self) -> Vec<u8> {
+        self.scan(true)
+    }
+
+    fn scan(&mut self, end: bool) -> Vec<u8> {
+        let bytes = std::mem::take(&mut self.held);
+        let mut out = Vec::with_capacity(bytes.len());
+        let (mut start, mut at) = (0, 0);
+        while at < bytes.len() {
+            if !self.first[bytes[at] as usize] {
+                at += 1;
+                continue;
+            }
+            let rest = &bytes[at..];
+            // A longer value that the next piece may complete is waited
+            // for before a shorter one that matches already.
+            let begins = |value: &Vec<u8>| value.len() > rest.len() && value.starts_with(rest);
+            if !end && self.values.iter().any(begins) {
+                out.extend_from_slice(&bytes[start..at]);
+                self.held = rest.to_vec();
+                return out;
+            }
+            if let Some(value) = self.values.iter().find(|value| rest.starts_with(value)) {
+                out.extend_from_slice(&bytes[start..at]);
+                out.extend_from_slice(REDACTED.as_bytes());
+                at += value.len();
+                start = at;
+                continue;
+            }
+            at += 1;
+        }
+        out.extend_from_slice(&bytes[start..]);
+        out
+    }
+}
+
 /// The agents folder's state for the files inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FolderState {
@@ -504,6 +590,33 @@ fn toml_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// DC-1xx-LAUNCH-3: a stream is redacted as a whole would be, however
+    /// it is split, and only a possible beginning of a value is held back.
+    #[test]
+    fn a_stream_is_redacted_however_it_is_split() {
+        let values = ["sk-secret-123", "sk-secret-123456", "zz"];
+        let text = b"a sk-secret-123456 b sk-secret-12 sk-secret-123 zzz s";
+        let want = b"a [redacted] b sk-secret-12 [redacted] [redacted]z s".to_vec();
+        for size in 1..text.len() {
+            let mut redactor = Redactor::new(values);
+            let mut out = Vec::new();
+            for piece in text.chunks(size) {
+                out.extend(redactor.push(piece));
+            }
+            out.extend(redactor.finish());
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&want),
+                "pieces of {size}"
+            );
+        }
+        let mut redactor = Redactor::new(values);
+        assert_eq!(redactor.push(b"plain text\n"), b"plain text\n");
+        assert_eq!(redactor.push(b"key sk-sec"), b"key ");
+        assert_eq!(redactor.push(b"ond"), b"sk-second");
+        assert!(Redactor::new([""]).is_empty());
+    }
 
     const CLAUDE_KEY: &str = "sk-fake-claude-0123456789";
     const CODEX_KEY: &str = "sk-fake-codex-9876543210";

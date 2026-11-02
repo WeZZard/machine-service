@@ -1,4 +1,6 @@
-//! A durable lease's command through the relay agent (DM-4, RA-2, RA-8).
+//! A durable lease's command through the relay agent (DM-4, RA-2, RA-8),
+//! whatever its entry: machine-service's own HTTP exec, or a relay client's
+//! exec or script that the broker hands to this launcher (DC-1xx-LAUNCH-1).
 //!
 //! The relay agent runs a command line in the desktop session as its own
 //! child, in a new process group, with the agent's environment and home.
@@ -10,13 +12,19 @@
 //! machine-service therefore writes a request into the lease's state folder
 //! (mode 600 in a mode-700 folder) and asks the relay agent to run
 //! `exec <machine-service> --durable-launch <request>`. The launcher is the
-//! daemon's own executable: it reads and removes the request, records its
-//! process group with the leader's start time, and replaces itself with the
-//! lease's shell, so the command keeps the relay agent as its parent and the
-//! agent's responsibility for privacy permissions, and the agent sees its
-//! exit status and output as its own command's. The keys reach the command
-//! through its environment only, never through the relay protocol, the
-//! agent's records or a process's arguments (AK-5).
+//! daemon's own executable: it reads the request, records its process
+//! group with the leader's start time, and only then claims the request by
+//! removing it. A release withdraws every request first and reads the
+//! recorded groups after, so a command either is recorded before release
+//! stops the lease's groups or never starts (DC-1xx-LAUNCH-2). The launcher
+//! then replaces itself with the lease's shell, so the command keeps the
+//! relay agent as its parent and the agent's responsibility for privacy
+//! permissions, and the agent sees its exit status and output as its own
+//! command's. When the lease has loaded agent keys, it runs the shell as its
+//! child instead and passes the output on with every key redacted, so no
+//! relay message and no record of the relay agent carries one
+//! (DC-1xx-LAUNCH-3). The keys reach the command through its environment
+//! only, never through the relay protocol or a process's arguments (AK-5).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -28,8 +36,10 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::agents::Redactor;
 use super::exec::Program;
 use super::process::{self, LeaseSession};
+use super::session_env::SessionEnv;
 
 /// The daemon's argument that runs the launcher.
 pub const ARGUMENT: &str = "--durable-launch";
@@ -42,7 +52,8 @@ pub const FAILED: i32 = 125;
 /// One command for the launcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Request {
-    /// `$SHELL -c <line>`, or `zsh -s` with `script` as standard input.
+    /// `$SHELL -c <line>`; or `zsh -s` with `script` as standard input, or
+    /// with the launcher's own standard input when neither is set.
     shell: String,
     line: Option<String>,
     script: Option<PathBuf>,
@@ -50,6 +61,19 @@ struct Request {
     cwd: PathBuf,
     /// Where the launcher records its process group.
     group: PathBuf,
+    /// The values the command's output never carries (AK-5).
+    #[serde(default)]
+    redact: Vec<String>,
+}
+
+/// What the launcher runs.
+#[derive(Debug, Clone, Copy)]
+pub enum Launch<'a> {
+    /// A command line or a script, as machine-service's own exec has it.
+    Program(&'a Program),
+    /// A script that arrives on the launcher's standard input, as the relay
+    /// agent feeds a client's script to the command it runs.
+    ScriptOnInput,
 }
 
 /// The files of one relay execution in a lease's state folder.
@@ -100,29 +124,36 @@ fn private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-/// Write the request for `program`, and answer the command line the relay
-/// agent runs: the launcher of `launcher` on that request.
+/// Write the request for `launch` in the lease's `session`, and answer the
+/// command line the relay agent runs: the launcher of `launcher` on that
+/// request. The line names only the two paths.
 pub fn prepare(
     files: &Files,
     launcher: &Path,
-    program: &Program,
-    env: &BTreeMap<String, String>,
+    launch: Launch<'_>,
+    session: &SessionEnv,
     cwd: &Path,
 ) -> Result<String, String> {
-    let (shell, line, script) = match program {
-        Program::Line { shell, line } => (shell.clone(), Some(line.clone()), None),
-        Program::Script(bytes) => {
+    let (shell, line, script) = match launch {
+        Launch::Program(Program::Line { shell, line }) => (shell.clone(), Some(line.clone()), None),
+        Launch::Program(Program::Script(bytes)) => {
             private_file(&files.script, bytes)?;
             ("/bin/zsh".to_string(), None, Some(files.script.clone()))
         }
+        Launch::ScriptOnInput => ("/bin/zsh".to_string(), None, None),
     };
     let request = Request {
         shell,
         line,
         script,
-        env: env.clone(),
+        env: session.vars.clone(),
         cwd: cwd.to_path_buf(),
         group: files.group.clone(),
+        redact: session
+            .secrets
+            .iter()
+            .map(|secret| secret.expose().to_string())
+            .collect(),
     };
     let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     private_file(&files.request, &bytes)?;
@@ -153,6 +184,13 @@ pub fn recorded_groups(lease_dir: &Path) -> Vec<LeaseSession> {
         })
         .filter_map(|path| recorded_group(&path))
         .collect()
+}
+
+/// Remove what one execution's launcher has not taken: its request and its
+/// script, never its process group's record, which release still needs.
+pub fn withdraw(files: &Files) {
+    let _ = std::fs::remove_file(&files.request);
+    let _ = std::fs::remove_file(&files.script);
 }
 
 /// Remove the requests no launcher has taken yet, so a command the relay
@@ -186,11 +224,18 @@ enum Never {}
 fn launch(path: &Path) -> Result<Never, String> {
     let text = std::fs::read(path)
         .map_err(|error| format!("no lease command at {}: {error}", path.display()))?;
-    // The request holds the session's keys: it is read once and removed
-    // before anything runs.
-    let _ = std::fs::remove_file(path);
     let request: Request = serde_json::from_slice(&text)
         .map_err(|error| format!("{} is not a lease command: {error}", path.display()))?;
+    // The script is opened before the claim, so a release that withdraws it
+    // after the claim cannot take it away from a command that may run.
+    let script = request
+        .script
+        .as_ref()
+        .map(|script| {
+            std::fs::File::open(script)
+                .map_err(|error| format!("cannot open {}: {error}", script.display()))
+        })
+        .transpose()?;
     // SAFETY: `getpgrp` has no preconditions.
     let group = unsafe { libc::getpgrp() };
     let leader =
@@ -202,47 +247,122 @@ fn launch(path: &Path) -> Result<Never, String> {
     };
     let bytes = serde_json::to_vec(&record.to_json()).map_err(|error| error.to_string())?;
     private_file(&request.group, &bytes)?;
-    let mut command = match (&request.line, &request.script) {
+    // The claim: the request holds the session's keys and is removed before
+    // anything runs. A release that withdrew it first has the command start
+    // nothing (DC-1xx-LAUNCH-2).
+    if let Err(error) = std::fs::remove_file(path) {
+        let _ = std::fs::remove_file(&request.group);
+        return Err(format!(
+            "the lease command at {} was withdrawn: {error}",
+            path.display()
+        ));
+    }
+    if let Some(script) = &request.script {
+        let _ = std::fs::remove_file(script);
+    }
+    let mut command = Command::new(&request.shell);
+    match (&request.line, script) {
         (Some(line), _) => {
-            let mut command = Command::new(&request.shell);
             command.arg("-c").arg(line);
-            command
         }
-        (None, Some(script)) => {
-            let file = std::fs::File::open(script)
-                .map_err(|error| format!("cannot open {}: {error}", script.display()))?;
-            let _ = std::fs::remove_file(script);
-            let mut command = Command::new(&request.shell);
+        (None, Some(file)) => {
             command.arg("-s").stdin(file);
-            command
         }
-        (None, None) => return Err("the lease command has neither a line nor a script".into()),
-    };
+        (None, None) => {
+            command.arg("-s");
+        }
+    }
     command
         .env_clear()
         .envs(&request.env)
         .current_dir(&request.cwd);
-    let error = command.exec();
-    Err(format!("cannot start {}: {error}", request.shell))
+    let redactor = Redactor::new(&request.redact);
+    if redactor.is_empty() {
+        let error = command.exec();
+        return Err(format!("cannot start {}: {error}", request.shell));
+    }
+    supervise(command, redactor)
+}
+
+/// Run `command` as the launcher's child, in the launcher's process group,
+/// with its standard output and standard error on one pipe, and pass the
+/// output on redacted; then end as the command ended, with its exit status
+/// or its signal, so the relay agent sees what it would have seen of the
+/// command itself.
+fn supervise(mut command: Command, mut redactor: Redactor) -> Result<Never, String> {
+    let shell = command.get_program().to_string_lossy().to_string();
+    let (mut output, writer) = std::io::pipe().map_err(|error| error.to_string())?;
+    command
+        .stdout(writer.try_clone().map_err(|error| error.to_string())?)
+        .stderr(writer);
+    let spawned = command.spawn();
+    // The parent's copies of the pipe's write end go, so the read ends when
+    // the command's group closes it.
+    drop(command);
+    let mut child = spawned.map_err(|error| format!("cannot start {shell}: {error}"))?;
+    let mut out = std::io::stdout().lock();
+    let mut open = true;
+    let mut pass = |out: &mut std::io::StdoutLock<'_>, bytes: &[u8]| {
+        // A reader that went away takes nothing more; the command is still
+        // drained, so it never blocks on a full pipe.
+        if open && !bytes.is_empty() {
+            open = out.write_all(bytes).and_then(|_| out.flush()).is_ok();
+        }
+    };
+    let mut buffer = vec![0u8; 64 << 10];
+    loop {
+        match std::io::Read::read(&mut output, &mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let redacted = redactor.push(&buffer[..count]);
+                pass(&mut out, &redacted);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    pass(&mut out, &redactor.finish());
+    drop(out);
+    let status = child
+        .wait()
+        .map_err(|error| format!("cannot wait for {shell}: {error}"))?;
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        // SAFETY: resetting a signal's disposition and signalling this
+        // process have no preconditions; the launcher has nothing to clean.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+        }
+        std::process::exit(128 + signal);
+    }
+    std::process::exit(status.code().unwrap_or(FAILED));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn session() -> SessionEnv {
+        SessionEnv {
+            vars: BTreeMap::from([("KEY".to_string(), "secret".to_string())]),
+            secrets: vec![super::super::agents::Secret::new("secret")],
+        }
+    }
+
     #[test]
     fn a_request_is_private_and_names_the_launcher() {
         let lease = tempfile::tempdir().unwrap();
         let files = files(lease.path(), "exec-1");
-        let env = BTreeMap::from([("KEY".to_string(), "secret".to_string())]);
+        let program = Program::Line {
+            shell: "/bin/zsh".into(),
+            line: "echo hi".into(),
+        };
         let line = prepare(
             &files,
             Path::new("/opt/ms/machine-service"),
-            &Program::Line {
-                shell: "/bin/zsh".into(),
-                line: "echo hi".into(),
-            },
-            &env,
+            Launch::Program(&program),
+            &session(),
             lease.path(),
         )
         .unwrap();
@@ -259,8 +379,39 @@ mod tests {
         assert_eq!(mode(&files.request), 0o600);
         assert_eq!(mode(files.request.parent().unwrap()), 0o700);
         assert_ne!(files.request, super::files(lease.path(), "exec-2").request);
+        let request: Request =
+            serde_json::from_slice(&std::fs::read(&files.request).unwrap()).unwrap();
+        assert_eq!(request.redact, vec!["secret".to_string()]);
         withdraw_requests(lease.path());
         assert!(!files.request.exists());
+    }
+
+    /// DC-1xx-LAUNCH-1: a client's script names no file; the launcher's
+    /// shell reads it on standard input. One execution's leftovers are
+    /// withdrawn alone, and its group's record stays for release.
+    #[test]
+    fn a_script_on_input_and_one_executions_withdrawal() {
+        let lease = tempfile::tempdir().unwrap();
+        let one = files(lease.path(), "exec-1");
+        let two = files(lease.path(), "exec-2");
+        for files in [&one, &two] {
+            prepare(
+                files,
+                Path::new("/opt/ms/machine-service"),
+                Launch::ScriptOnInput,
+                &session(),
+                lease.path(),
+            )
+            .unwrap();
+        }
+        let request: Request =
+            serde_json::from_slice(&std::fs::read(&one.request).unwrap()).unwrap();
+        assert_eq!((request.line, request.script), (None, None));
+        std::fs::write(&one.group, b"{}").unwrap();
+        withdraw(&one);
+        assert!(!one.request.exists());
+        assert!(one.group.exists());
+        assert!(two.request.exists());
     }
 
     #[test]

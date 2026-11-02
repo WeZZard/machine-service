@@ -569,6 +569,100 @@ fn ac56(ctx: &mut Ctx<'_>) -> Verdict {
         "every process of a cancelled group exits",
         no_survivors("sleep 356[2]"),
     );
+    if ctx.target.durable() {
+        durable_lease_checks(ctx, &client)?;
+    }
+    Ok(())
+}
+
+/// What a durable lease's command sees: its lease, its working directory
+/// and temporary folder, its agent keys as a command prints them and as
+/// their SHA-256, and its whole environment.
+const LEASE_PROBE: &str = r#"echo "lease=$MACHINE_SERVICE_LEASE_ID"
+echo "pwd=$(pwd)"
+echo "tmp=$TMPDIR"
+for key in ANTHROPIC_API_KEY LITELLM_CODEX_KEY; do
+  eval "value=\${$key:-}"
+  printf '%s sha256=' "$key"; printf %s "$value" | shasum -a 256 | cut -c1-64
+done
+env | LC_ALL=C sort | grep -v '^_='
+"#;
+
+/// AC-56 on a durable Mac (DC-1xx-LAUNCH-1): a command that a relay client
+/// sends runs as the lease's own, through the launcher that machine-service's
+/// HTTP exec uses, so it sees exactly what an HTTP exec of the lease sees,
+/// and no loaded agent key reaches the client unredacted.
+fn durable_lease_checks(ctx: &mut Ctx<'_>, client: &RelayClient) -> Verdict {
+    let (name, lease) = ctx
+        .target
+        .lease_id()
+        .ok_or("the durable lease has no lease_id")?;
+    let http = ctx.target.instance().exec(
+        &name,
+        json!({"lease_id": lease, "script": LEASE_PROBE, "timeout": 120}),
+    )?;
+    let call = client.call(
+        &new_id("ac56-lease"),
+        Op::Script { timeout_s: 120.0 },
+        LEASE_PROBE.as_bytes(),
+        true,
+    )?;
+    let relayed = client.wait(call, Duration::from_secs(300))?;
+    let seen = relayed.text();
+    let over_http = http
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let line = |name: &str| {
+        seen.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let empty = sha256_hex(b"");
+    let loaded: Vec<&str> = ["ANTHROPIC_API_KEY", "LITELLM_CODEX_KEY"]
+        .into_iter()
+        .filter(|key| {
+            seen.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} sha256=")))
+                .is_some_and(|hash| hash != empty)
+        })
+        .collect();
+    ctx.record(
+        "lease_environment",
+        json!({"http_link": http.get("link"), "keys_loaded": loaded, "pwd": line("pwd")}),
+    );
+    ctx.check(
+        "a relay client's command sees the lease's directory, variables and keys as an HTTP exec does",
+        expect(
+            relayed.rc()? == Some(0) && seen == over_http && line("lease") == lease,
+            || {
+                let diff: Vec<String> = seen
+                    .lines()
+                    .filter(|l| !over_http.lines().any(|o| o == *l))
+                    .map(|l| format!("relay only: {l}"))
+                    .chain(
+                        over_http
+                            .lines()
+                            .filter(|o| !seen.lines().any(|l| l == *o))
+                            .map(|o| format!("http only: {o}")),
+                    )
+                    .collect();
+                format!("rc {:?}, lease {:?}; {diff:?}", relayed.rc(), line("lease"))
+            },
+        ),
+    );
+    ctx.check(
+        "a loaded agent key reaches the relay client only as [redacted]",
+        expect(
+            loaded.iter().all(|key| {
+                seen.lines()
+                    .filter_map(|l| l.strip_prefix(&format!("{key}=")))
+                    .all(|value| value == "[redacted]")
+            }),
+            || format!("the environment shows {loaded:?} unredacted"),
+        ),
+    );
     Ok(())
 }
 

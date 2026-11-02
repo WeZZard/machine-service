@@ -102,6 +102,8 @@ A client's `call` names no lease. On the agent's side of the broker, every `call
 
 `agent` in `ready` is `{"os":"macos","arch":"aarch64","build":"<sha256 of the agent executable>","protocol":2}` when the lease's relay agent has a session, else `null`. A client ignores message names it does not know.
 
+On a durable lease, the `call` the relay agent receives for a client's exec or script is an exec of machine-service's launcher, `exec <machine-service> --durable-launch <request>`, with the client's execution ID, `timeout_s` and upload; `stdin` is true for a script, whose upload the launcher's shell reads ([DM-4](durable-machine.md#dm-4-exec)). The relay agent runs it like any exec.
+
 On the agent's side, the broker sends `ready` too, right after the agent's `hello`, with its own `protocol` and `agent` set to `null`; each side speaks the lower of the agent's `hello.protocol` and the broker's. An agent of protocol 1 receives no `progress`, `resume` or `offset`, and the broker reports an upload's progress for it (RP-15).
 
 ### Operations (`op`)
@@ -120,6 +122,7 @@ On the agent's side, the broker sends `ready` too, right after the agent's `hell
 | purge | `{"purge":{"lease":"<lease>"}}` | no | `result` with `purged` ([RP-14](#rp-14-records-belong-to-their-lease)) |
 
 - exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group, and on Linux with its systemd scope, which also holds the processes that left the group, after `timeout_s` seconds, which must be positive.
+- On a durable machine's lease, exec and script run as the lease's own commands, exactly as machine-service's HTTP exec runs them ([DM-4](durable-machine.md#dm-4-exec), DC-1xx-LAUNCH-1): from the lease's working directory (`work/` of the workspace that the acquisition's answer names) instead of the home folder, with the lease's session environment (`MACHINE_SERVICE_LEASE_ID`, `MACHINE_SERVICE_WORKSPACE`, `TMPDIR` and the loaded agent keys of [AK](agent-keys.md)), and with every loaded key's value in the output replaced by `[redacted]`. A client sends the same messages as for any lease and needs nothing else: the broker has machine-service start each new call through the lease's launcher, which takes the environment from machine-service's own state, so no variable or key travels in the protocol. Paths of write, read, write_tree and read_tree still resolve against the home folder, as everywhere; a client that moves files for its commands names absolute paths, or paths under the workspace.
 - write resolves `path` against the home folder; when `path` names a folder, the file is `name` inside it. The bytes go to a hidden temporary sibling named by the execution ID, `.<name>.relay-agent-<first 16 hex digits of the SHA-256 of the ID>.part`, are checked against the `end`, and are renamed into place. `mode` is an integer file mode, such as `420` for `0644`.
 - read resolves `path` against the home folder. A folder is refused with code `is_directory`; read it with read_tree.
 - write_tree and read_tree move a folder as one tar stream ([RP-13](#rp-13-folders)).
@@ -144,7 +147,7 @@ On the agent's side, the broker sends `ready` too, right after the agent's `hell
 
 | State | JSON |
 | --- | --- |
-| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status" \| "restart","outcome":<outcome>}}`; a purge keeps no record, so its ID is never `completed` |
+| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status" \| "restart","outcome":<outcome>}}`; a purge keeps no record, so its ID is never `completed`. `op` is the client's operation while the broker keeps its record (RP-12); on a durable lease a script answered from the relay agent's own record, after that or after a restart of the broker, says `exec`, the operation the agent ran |
 | running | `{"running":{"op":"<op kind>"}}` |
 | unknown | `"unknown"` |
 
@@ -213,6 +216,7 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | `window_exceeded` | broker | false | the client sent more than the upload window beyond the agent's progress ([RP-15](#rp-15-resumable-streams)) |
 | `too_large` | broker | false | an upload of a protocol-1 client exceeds 256 MiB |
 | `revoked` | broker | false, or true once handed on | the lease was released while the call waited or ran |
+| `launch_failed` | broker | false | on a durable lease, machine-service could not start the command as the lease's own, such as while the lease is being released; nothing ran, and the message says why ([DM-4](durable-machine.md#dm-4-exec)) |
 | `invalid_request` | agent | false | a bad execution ID or `timeout_s` |
 | `call_in_use`, `superseded`, `end_mismatch`, `cancelled` | agent | false | the agent refused the call before its commit point |
 | `stopping`, `record_failed` | agent | false | the agent cannot run it now; the broker sends a call refused with `stopping` again to the agent's next session instead of answering it |

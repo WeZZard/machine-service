@@ -9,20 +9,26 @@
 //! [`super::super::launch`], which records its process group before the
 //! release gate is let go, so release stops it and the sweep finds what it
 //! left exactly as for an in-session command (DM-7, HY-3).
+//!
+//! A relay client's exec and script on the lease start through the same
+//! launcher: the broker hands each to [`LeaseLauncher`], which writes the
+//! lease's request as machine-service's own exec does, so a command sees the
+//! lease's working directory, variables and agent keys whatever its entry,
+//! and none of them travels in the relay protocol (DC-1xx-LAUNCH-1).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use relay_agent::protocol::{Op, Outcome};
 use relay_broker::{Broker, Events, JobEvent, Purged, Target, Upload};
 use serde_json::{json, Value};
 
-use super::super::exec::Request;
-use super::super::launch;
+use super::super::exec::{self, Program, Request};
+use super::super::launch::{self, Launch};
 use super::purges::{self, PendingPurge};
 use super::{agents, tail_chars, DurableMachine, Reply, Runtime, MAX_OUTPUT_CHARS};
 use crate::config::unix_now;
@@ -129,6 +135,29 @@ impl Call {
 pub(super) struct Started {
     call: Call,
     execution: String,
+    files: launch::Files,
+}
+
+/// The broker's launcher of this Mac's relay clients' commands
+/// (DC-1xx-LAUNCH-1).
+struct LeaseLauncher(Weak<DurableMachine>);
+
+impl relay_broker::Launcher for LeaseLauncher {
+    fn launch(&self, lease: &str, execution: &str, op: &Op) -> Result<Op, String> {
+        let machine = self
+            .0
+            .upgrade()
+            .ok_or("the durable machine is shutting down")?;
+        machine.launch_client_call(lease, execution, op)
+    }
+
+    fn settled(&self, lease: &str, execution: &str) {
+        if let Some(machine) = self.0.upgrade() {
+            if super::valid_lease_id(lease) {
+                launch::withdraw(&launch::files(&machine.config.lease_dir(lease), execution));
+            }
+        }
+    }
 }
 
 fn failure(outcome: &Outcome) -> String {
@@ -162,6 +191,7 @@ impl DurableMachine {
                 }
             }
         }
+        broker.launch_through(&target, Arc::new(LeaseLauncher(Arc::downgrade(self))));
         let machine = Arc::downgrade(self);
         let own = target.clone();
         broker.on_agent(move |target, _| {
@@ -409,8 +439,8 @@ impl DurableMachine {
         let command = launch::prepare(
             &files,
             &relay.launcher,
-            &request.program,
-            &runtime.env.vars,
+            Launch::Program(&request.program),
+            &runtime.env,
             &request.cwd,
         )
         .map_err(|error| Reply::error(409, error))?;
@@ -437,7 +467,62 @@ impl DurableMachine {
                 RECORD_WAIT.as_secs()
             ));
         }
-        Ok(Started { call, execution })
+        Ok(Started {
+            call,
+            execution,
+            files,
+        })
+    }
+
+    /// The launched form of a relay client's `exec` or `script` on
+    /// `lease` (DC-1xx-LAUNCH-1): the request of machine-service's own exec,
+    /// with the lease's session environment, its keys and its workspace's
+    /// `work/` as the working directory, run by the launcher. A script
+    /// reaches the launcher's shell on standard input, as the relay agent
+    /// feeds it. Under the release gate, like any start, so a release
+    /// withdraws what this writes (DM-7).
+    fn launch_client_call(&self, lease: &str, execution: &str, op: &Op) -> Result<Op, String> {
+        let relay = self.relay.get().ok_or("this instance runs no broker")?;
+        let _gate = self
+            .gate
+            .read()
+            .map_err(|_| "durable gate poisoned".to_string())?;
+        let record = self
+            .current_record()
+            .filter(|record| record["lease_id"] == lease && record["state"] == "leased")
+            .ok_or_else(|| format!("lease {lease} is not the current lease of this Mac"))?;
+        let runtime = self
+            .runtime_for(&record)
+            .map_err(|error| format!("session unavailable: {error}"))?;
+        if runtime.cancel.load(Ordering::SeqCst) {
+            return Err(format!("lease {lease} is being released"));
+        }
+        let cwd = exec::resolve_cwd(&self.config.workspace(lease).join("work"), None)?;
+        let files = launch::files(&self.config.lease_dir(lease), execution);
+        let launched = |launch: Launch<'_>, stdin: bool, timeout_s: f64| {
+            launch::prepare(&files, &relay.launcher, launch, &runtime.env, &cwd).map(|command| {
+                Op::Exec {
+                    command,
+                    stdin,
+                    timeout_s,
+                }
+            })
+        };
+        match op {
+            Op::Exec {
+                command,
+                stdin,
+                timeout_s,
+            } => {
+                let program = Program::Line {
+                    shell: runtime.env.shell(),
+                    line: command.clone(),
+                };
+                launched(Launch::Program(&program), *stdin, *timeout_s)
+            }
+            Op::Script { timeout_s } => launched(Launch::ScriptOnInput, true, *timeout_s),
+            other => Err(format!("{:?} is not a command", other.kind())),
+        }
     }
 
     /// Wait for a relay command started by [`Self::relay_start`].
@@ -452,7 +537,16 @@ impl DurableMachine {
         let Started {
             mut call,
             execution,
+            files,
         } = started;
+        // What the launcher did not take goes when the call ends, however.
+        struct Leftovers(launch::Files);
+        impl Drop for Leftovers {
+            fn drop(&mut self) {
+                launch::withdraw(&self.0);
+            }
+        }
+        let _leftovers = Leftovers(files);
         let bound =
             Duration::from_secs(timeout as u64) + relay.agent_wait + Duration::from_secs(60);
         let deadline = Instant::now() + bound;

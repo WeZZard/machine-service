@@ -21,6 +21,9 @@ Feature: Actions through the relay agent and the broker
     Then the printed hash matches the sent bytes
     When a command that starts child processes exceeds its timeout or is cancelled
     Then every process of its process group has exited
+    When the lease is a durable machine's and the client runs a script that prints the lease's working directory, variables and agent keys' SHA-256
+    Then it prints exactly what the same script prints through machine-service's HTTP exec of the lease
+    And every loaded agent key appears in its environment only as [redacted]
 
   @AC-57 @TL-7 @N0 @N1 @N2 @N3
   Scenario: Large output arrives whole

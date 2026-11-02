@@ -23,6 +23,7 @@ fn exec_job() -> Arc<Job> {
             resume: false,
             offset: 0,
             transient: false,
+            launch: false,
         },
         8,
         Arc::default(),

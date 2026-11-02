@@ -74,7 +74,7 @@ wire_api = "responses"
 - The lease record, the service log, every response and every error carry the key's state (`loaded`, `absent`, `unsafe-mode` or `invalid`) and the file's path, never its value.
 - The service writes no key into the workspace, the hygiene record or any file it creates.
 - Before returning exec output, the service replaces every occurrence of a loaded key's value with `[redacted]`. A session's own command may still write its environment into a file, which the service cannot prevent. This replacement keeps a key out of the responses that clients log.
-- The relay agent's record of a command keeps its output unredacted for a replay. Release purges the lease's records, so that copy does not outlive the lease ([RP-14](relay-protocol.md#rp-14-records-belong-to-their-lease), DC-173).
+- A command through the relay agent, whether machine-service's own exec or a relay client's ([DM-4](durable-machine.md#dm-4-exec)), has its output redacted by the launcher before the relay agent sees it, so no relay message, no relay agent record and no client of the broker receives a key (DC-1xx-LAUNCH-3). Release still purges the lease's records ([RP-14](relay-protocol.md#rp-14-records-belong-to-their-lease), DC-173), which keep the commands' output.
 
 ## AK-6: Virtual machines
 
