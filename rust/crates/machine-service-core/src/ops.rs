@@ -398,7 +398,14 @@ impl Service {
             disk_gb,
             wait,
         )?;
-        self.get_record(&vm)
+        let mut record = self.get_record(&vm)?;
+        // The lease credential travels in this answer only (RP-11).
+        if let Some(relay) = self.relay() {
+            if let Some(credential) = relay.take_credential(&vm) {
+                record["relay"] = relay.answer(&credential);
+            }
+        }
+        Ok(record)
     }
 
     /// Read-only verification that a configured work image exists and is stopped.
@@ -630,6 +637,10 @@ impl Service {
             }
         }
 
+        // RA-7: the relay agent registers before the lease is `running`, or
+        // the lease is served over SSH (RA-8).
+        let link = self.bootstrap_relay(vm, kind, network, &ip, &ssh_user, &key_dir);
+
         let wants_vnc = record
             .get("configuration")
             .and_then(|config| config.get("effective"))
@@ -666,6 +677,11 @@ impl Service {
                 }
                 if let Some(isolation) = &isolation {
                     record["isolation"] = isolation.clone();
+                }
+                if let Some(fields) = link.as_object() {
+                    for (key, value) in fields {
+                        record[key.as_str()] = value.clone();
+                    }
                 }
                 Ok(())
             },
@@ -1008,6 +1024,9 @@ the next GC pass retries"
         )?;
         if proceed {
             self.release_flag(vm).store(true, Ordering::SeqCst);
+            // From the moment it starts releasing, no relay credential of the
+            // lease is accepted (RP-10).
+            self.revoke_relay(vm, expired_only);
         }
         Ok(proceed)
     }
@@ -1218,6 +1237,14 @@ release it and acquire a new lease"
         } else {
             return Err(OpError::new("need 'argv' or 'script'"));
         };
+        if let Some(target) = self.relay_target(&record) {
+            let script = body
+                .get("script")
+                .and_then(Value::as_str)
+                .map(|script| script.as_bytes().to_vec());
+            let command = script.is_none().then(|| remote_cmd.clone());
+            return self.relay_exec(vm, &target, body, command, script, timeout as u64);
+        }
         if self.config.guest_link == GuestLink::SshSession {
             let target = GuestTarget {
                 ip: &ip,
@@ -1268,6 +1295,13 @@ release it and acquire a new lease"
             std::path::Path::new(local),
             true,
         )?;
+        if let Some(target) = self.relay_target(&record) {
+            if let Some(answer) =
+                self.relay_push(vm, &target, body, std::path::Path::new(local), remote)?
+            {
+                return Ok(answer);
+            }
+        }
         if self.config.guest_link == GuestLink::SshSession && !std::path::Path::new(local).is_dir()
         {
             let target = GuestTarget {
@@ -1323,6 +1357,13 @@ release it and acquire a new lease"
         )?;
         if let Some(parent) = std::path::Path::new(local).parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(target) = self.relay_target(&record) {
+            if let Some(answer) =
+                self.relay_pull(vm, &target, body, remote, std::path::Path::new(local))?
+            {
+                return Ok(answer);
+            }
         }
         if self.config.guest_link == GuestLink::SshSession {
             let target = GuestTarget {

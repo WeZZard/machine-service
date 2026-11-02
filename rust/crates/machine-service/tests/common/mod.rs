@@ -624,6 +624,13 @@ pub fn guest_agent_bin() -> &'static PathBuf {
     PATH.get_or_init(|| sibling_bin("guest-session", "guest-session-agent"))
 }
 
+/// Locate the `relay-agent` binary, building it on demand as
+/// [`machctl_bin`] builds `machctl`.
+pub fn relay_agent_bin() -> &'static PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| sibling_bin("relay-agent", "relay-agent"))
+}
+
 /// Build `binary` of `package` into the daemon's target directory unless it
 /// is already there.
 fn sibling_bin(package: &str, binary: &str) -> PathBuf {

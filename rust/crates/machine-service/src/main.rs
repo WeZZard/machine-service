@@ -142,6 +142,9 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
         service.log(&format!("WARN: startup reconciliation failed: {error}"));
     }
     durable_routes::install(&service)?;
+    if service.config.guest_link == GuestLink::Relay {
+        start_relay(&service)?;
+    }
 
     let address = if service.config.host.contains(':') {
         format!("[{}]:{}", service.config.host, service.config.port)
@@ -176,6 +179,24 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
     Ok(())
 }
 
+/// Start the broker on the session listener and install the relay link
+/// (`docs/arch/broker.md`, BK-1). A listener that cannot start stops the
+/// daemon: an instance told to serve the relay link must not silently serve
+/// SSH instead.
+fn start_relay(service: &Arc<Service>) -> Result<(), String> {
+    use machine_service_core::relay::{Relay, RelaySettings};
+    let settings = RelaySettings::from_environment()?;
+    let log_file = service.config.log_file.clone();
+    let log = Arc::new(move |message: &str| {
+        machine_service_core::config::log_to_file(&log_file, message)
+    });
+    let relay = Relay::start(settings, &service.config.state_dir, log)?;
+    durable_routes::install_relay(&relay, &service.config.state_dir);
+    service
+        .install_relay(relay)
+        .map_err(|error| error.to_string())
+}
+
 /// `virtual` needs Tart as well as a catalog: a Mac without Tart offers only
 /// its durable machine (MM-1, AC-38, DC-66).
 fn offers_virtual(service: &Service) -> bool {
@@ -199,7 +220,11 @@ fn advertise(service: &Service, mode: discovery::Mode) -> Option<discovery::dnss
         return None;
     }
     let (instance, machine_id, kinds) = durable_routes::identity(offers_virtual(service))?;
-    let txt = discovery::txt_entries(&instance, &machine_id, &kinds);
+    let mut txt = discovery::txt_entries(&instance, &machine_id, &kinds);
+    if let Some(relay) = service.relay() {
+        let fields = relay.discovery();
+        txt.extend(discovery::relay_txt_entries(&fields[0].1, &fields[1].1));
+    }
     match discovery::dnssd::register(
         &instance,
         discovery::SERVICE_TYPE,
@@ -238,6 +263,10 @@ fn handle(service: &Service, mut request: Request) {
         files::handle(service, request, &name);
         return;
     }
+    if method == Method::Get && url == "/relay/ca.pem" {
+        relay_authority(service, request);
+        return;
+    }
     let response = match method {
         Method::Get => handle_get(service, &mut request, &url),
         Method::Post => handle_post(service, &mut request, &url),
@@ -264,6 +293,25 @@ fn handle(service: &Service, mut request: Request) {
             let _ = send(request, 409, &body);
         }
     }
+}
+
+/// `GET /relay/ca.pem`: the broker's authority, which a client trusts after
+/// checking it against `relay_ca_sha256` (RP-1).
+fn relay_authority(service: &Service, request: Request) {
+    let Some(relay) = service.relay() else {
+        let _ = send(
+            request,
+            404,
+            &json!({"error": "this instance runs no broker"}),
+        );
+        return;
+    };
+    let content_type = Header::from_bytes(&b"Content-Type"[..], &b"application/x-pem-file"[..])
+        .expect("static header");
+    let response = Response::from_string(relay.authority.cert_pem())
+        .with_status_code(200)
+        .with_header(content_type);
+    let _ = request.respond(response);
 }
 
 /// The answer to a request on a removed `/vms` path: HTTP 410 Gone, naming
@@ -361,6 +409,11 @@ fn handle_get(service: &Service, request: &mut Request, url: &str) -> OpResult<(
             body["environment"] = environment.clone();
         }
         durable_routes::health(&mut body, offers_virtual(service));
+        if let Some(relay) = service.relay() {
+            for (key, value) in relay.discovery() {
+                body[key] = json!(value);
+            }
+        }
         return Ok((200, body));
     }
     if path == "/capabilities" {

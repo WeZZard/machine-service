@@ -49,17 +49,25 @@ pub enum GuestLink {
     /// One guest session per lease, carried by `ssh` standard input and
     /// output.
     SshSession,
+    /// The relay agent in the guest's desktop session, through this
+    /// instance's broker (`docs/arch/relay-agent.md`, `docs/arch/broker.md`);
+    /// a lease whose relay agent does not register falls back to [`Ssh`]
+    /// (RA-8).
+    ///
+    /// [`Ssh`]: GuestLink::Ssh
+    Relay,
 }
 
 impl GuestLink {
     /// The accepted configuration values.
-    pub const NAMES: [&'static str; 2] = ["ssh", "ssh-session"];
+    pub const NAMES: [&'static str; 3] = ["ssh", "ssh-session", "relay"];
 
     /// Parse a configuration value.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "ssh" => Ok(GuestLink::Ssh),
             "ssh-session" => Ok(GuestLink::SshSession),
+            "relay" => Ok(GuestLink::Relay),
             other => Err(format!(
                 "MACHINE_SERVICE_GUEST_LINK must be one of {}; got {other:?}",
                 Self::NAMES.join(", ")
@@ -83,6 +91,7 @@ impl GuestLink {
         match self {
             GuestLink::Ssh => "ssh",
             GuestLink::SshSession => "ssh-session",
+            GuestLink::Relay => "relay",
         }
     }
 }

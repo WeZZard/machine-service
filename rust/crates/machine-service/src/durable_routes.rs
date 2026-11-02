@@ -11,9 +11,102 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 
 use machine_service_core::durable::{DurableConfig, DurableMachine, Reply};
+use machine_service_core::relay::Relay;
+use machine_service_core::relay_broker::{Role, Target};
 use machine_service_core::service::Service;
 
 static MACHINE: OnceLock<Arc<DurableMachine>> = OnceLock::new();
+static RELAY: OnceLock<Arc<Relay>> = OnceLock::new();
+
+/// The per-machine agent credential of the durable machine's relay agent,
+/// under the state folder (RA-4). The installer writes it into the relay
+/// agent's configuration; removing it and restarting rotates it.
+const DURABLE_AGENT_CREDENTIAL: &str = "relay/durable-agent.credential";
+
+/// The broker's target for this instance's durable machine: its hardware
+/// UUID, which survives a rename (MI-1), else its name.
+fn durable_target(machine: &DurableMachine) -> Target {
+    Target::Durable(
+        machine
+            .machine_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| machine.name()),
+    )
+}
+
+/// Read the durable machine's agent credential, or make it, mode 600.
+fn durable_agent_credential(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let credential = text.trim().to_string();
+        if !credential.is_empty() {
+            return Ok(credential);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let credential = machine_service_core::relay_broker::new_credential();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    writeln!(file, "{credential}").map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(credential)
+}
+
+/// Accept the durable machine's relay agent on the broker, when exposure is
+/// on (RA-4). Its exec still runs in the session of DM-4 until M4 moves it
+/// to the relay agent.
+pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
+    let Some(machine) = machine() else { return };
+    if !machine.exposed() {
+        return;
+    }
+    let _ = RELAY.set(Arc::clone(relay));
+    let path = state_dir.join(DURABLE_AGENT_CREDENTIAL);
+    match durable_agent_credential(&path) {
+        Ok(credential) => relay.broker.admit(
+            &durable_target(machine),
+            Role::Agent,
+            &machine_service_core::relay_broker::credential_sha256(&credential),
+            None,
+        ),
+        Err(error) => machine_service_core::config::log_to_file(
+            &machine.config.log_file,
+            &format!("WARN: relay: no durable agent credential: {error}"),
+        ),
+    }
+}
+
+/// Add a lease credential to a durable acquisition's answer. It is good
+/// while that lease is the machine's current lease (RA-4).
+fn with_relay_credential(machine: &Arc<DurableMachine>, mut body: Value) -> Value {
+    let (Some(relay), Some(lease_id)) = (
+        RELAY.get(),
+        body.get("lease_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    ) else {
+        return body;
+    };
+    let current = Arc::clone(machine);
+    let valid: machine_service_core::relay_broker::Validity = Arc::new(move || {
+        current.current_record().is_some_and(|record| {
+            record["lease_id"].as_str() == Some(lease_id.as_str()) && record["state"] != "released"
+        })
+    });
+    let credential = relay
+        .broker
+        .issue(&durable_target(machine), Role::Client, Some(valid));
+    body["relay"] = relay.answer(&credential);
+    body
+}
 
 /// Build the durable machine, reconcile it after a restart, and start its
 /// GC loop (DM-6, DM-8). Call once at startup, before serving.
@@ -170,7 +263,11 @@ pub fn post(path: &str, body: &Value, loopback: bool) -> Option<(u16, Value)> {
         if body.get("machine").is_none_or(Value::is_null) {
             return None;
         }
-        return answer(machine.acquire(body));
+        let acquired = machine.acquire(body);
+        if acquired.status == 200 {
+            return reply((200, with_relay_credential(machine, acquired.body)));
+        }
+        return answer(acquired);
     }
     let rest = path.strip_prefix("/machines/")?;
     let mut segments = rest.split('/');
@@ -194,7 +291,17 @@ pub fn post(path: &str, body: &Value, loopback: bool) -> Option<(u16, Value)> {
         "push" => answer(machine.transfer(name, body, true, loopback)),
         "pull" => answer(machine.transfer(name, body, false, loopback)),
         "heartbeat" => answer(machine.heartbeat(name, body)),
-        "release" => answer(machine.release(name, body)),
+        "release" => {
+            let released = machine.release(name, body);
+            if released.status == 200 {
+                if let Some(relay) = RELAY.get() {
+                    relay
+                        .broker
+                        .revoke_clients(&durable_target(machine), "released");
+                }
+            }
+            answer(released)
+        }
         "refresh" => answer(machine.refresh(name, body)),
         // DM-9: the owner views a durable machine with Screen Sharing.
         "console" => reply((

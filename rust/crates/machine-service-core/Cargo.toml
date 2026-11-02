@@ -18,6 +18,9 @@ guest-firewall = { path = "../guest-firewall" }
 application-catalog = { path = "../application-catalog" }
 console = { path = "../console" }
 guest-session = { path = "../guest-session" }
+relay-agent = { path = "../relay-agent" }
+relay-broker = { path = "../relay-broker" }
+remote-session = { path = "../remote-session" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

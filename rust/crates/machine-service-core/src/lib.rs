@@ -17,6 +17,7 @@ pub mod packs;
 pub mod proc;
 pub mod python;
 pub mod reentrant;
+pub mod relay;
 pub mod service;
 pub mod snapshot;
 pub mod ssh;
@@ -38,6 +39,7 @@ pub use control_only;
 pub use environment;
 pub use guest_firewall;
 pub use lease_keys;
+pub use relay_broker;
 
 pub use error::{OpError, OpResult};
 pub use host::{BootProcess, Host, RealHost, TartOutput};
