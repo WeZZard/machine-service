@@ -155,7 +155,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl RelayClient {
     /// Open a session and take the broker's `ready`.
     pub fn connect(options: &ClientOptions) -> Result<RelayClient, String> {
-        let session = remote_session::connect(options.config()?).map_err(|e| e.to_string())?;
+        let session = open_session(options)?;
         let opened = Instant::now();
         let body = session
             .recv_timeout(Duration::from_secs(60))
@@ -504,6 +504,22 @@ pub fn hex(bytes: &[u8]) -> String {
 /// The SHA-256 of `bytes`, hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
+}
+
+/// Open a session. The first connection is retried for up to two minutes
+/// when the network loses it, as a client would (TC-2); a refusal is not.
+fn open_session(options: &ClientOptions) -> Result<Session, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match remote_session::connect(options.config()?) {
+            Ok(session) => return Ok(session),
+            Err(remote_session::Error::Connect(why)) if std::time::Instant::now() < deadline => {
+                eprintln!("relay client: {why}; dialling again");
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 /// Try a hello and report how the broker answered it: `Ok` with the
