@@ -35,8 +35,7 @@
 ## BK-5: Reaching the broker from a virtual machine
 
 - A guest on Tart's shared NAT network reaches its host's broker through the host's address on that network.
-- A guest on the `internet` network is kept off the host by the guest firewall ([DC-14](../decisions.md)), so its relay agent cannot reach the host's broker over the host network today. The ways to open that path are an open question below.
-
-## Open questions
-
-- An `internet` guest's relay agent needs a path to its host's broker. One way is a narrow guest-firewall exception for the broker's port alone; another way is a host-local channel such as Tart's vsock; a third way is to reach the broker only through its public `relay_url`. The owner decides, because the guest firewall is a security boundary (DC-13, DC-14).
+- A guest on the `internet` network is kept off the host by the guest firewall ([DC-14](../decisions.md)), which drops every connection that such a guest opens to the host's own addresses.
+- The guest firewall makes one exception: an `internet` guest may open a TCP connection to the broker's port on its host, and to no other port (DC-107).
+- The exception keeps DC-13's purpose, because the broker accepts only an authenticated relay agent session under TLS and serves no other service, and the guest still reaches no other port of the host and no private network.
+- A host-local channel such as vsock was not chosen, because Tart's vsock transport has dropped guest output on some guests (openai/tart issue 1347), and the relay agent would need a second transport. Reaching the broker only through a public URL was not chosen, because it would make every `internet` lease depend on a tunnel, which is outside the tested scope (DC-101).
