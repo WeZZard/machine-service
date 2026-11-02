@@ -1,5 +1,5 @@
-//! The rig's self-tests (TL-7, M1): each fault, shown on a plain WebSocket
-//! echo server through the real chain.
+//! The rig's self-tests (TL-7): each fault, shown on a plain WebSocket echo
+//! server through the real chain.
 //!
 //! They are `#[ignore]`d because they fetch the pinned Toxiproxy and
 //! mitmproxy into the cache (about 60 MB on macOS, 110 MB on Linux, once)
@@ -14,10 +14,16 @@
 
 use std::time::{Duration, Instant};
 
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+
 use network_rig::cell::{self, Cell, ClientPlatform, Scenario, StandIn, TargetKind, Verdict};
 use network_rig::client::{Dial, Outcome, Session};
-use network_rig::standin::EchoServer;
-use network_rig::{tls, Fault, Phase, Profile, Rig, RigConfig, Stream};
+use network_rig::stage::Hop;
+use network_rig::standin::{EchoServer, Visit};
+use network_rig::{
+    tls, AddressChange, Fault, Phase, Profile, Rig, RigConfig, Select, Side, Stream,
+};
 use rustls::pki_types::{IpAddr as PkiIp, ServerName};
 
 const IO: Duration = Duration::from_secs(10);
@@ -427,7 +433,8 @@ const FAST_CHAOS: &str = r#"{
       { "weight": 2, "fault": "reset", "window_ms": [1500, 2000] },
       { "weight": 2, "fault": "blackhole", "duration_ms": [1500, 2000] },
       { "weight": 1, "fault": "limit_data", "bytes": [64, 512], "window_ms": [1500, 2000] },
-      { "weight": 1, "fault": "address_change" }
+      { "weight": 1, "fault": "address_change" },
+      { "weight": 2, "fault": "cut" }
     ]
   }
 }"#;
@@ -435,12 +442,47 @@ const FAST_CHAOS: &str = r#"{
 /// What the probe saw at one fault: the event, its kind, and the outcomes.
 type Seen = (usize, &'static str, Vec<Outcome>);
 
+/// The stand-in's record of the broker leg of `session`.
+fn broker_visit(chain: &Chain, session: &Session) -> Option<Visit> {
+    let local = session.local_addr()?;
+    let source = chain
+        .rig
+        .control()
+        .connections()
+        .into_iter()
+        .find(|connection| connection.client == local)?
+        .broker_source?;
+    chain
+        .server
+        .visits()
+        .into_iter()
+        .find(|visit| visit.peer == Some(source))
+}
+
+/// How the broker leg whose source was `source` ended, once it has.
+fn broker_end(chain: &Chain, source: SocketAddr, within: Duration) -> Option<Outcome> {
+    let deadline = Instant::now() + within;
+    loop {
+        let end = chain
+            .server
+            .visits()
+            .into_iter()
+            .find(|visit| visit.peer == Some(source))
+            .and_then(|visit| visit.end);
+        if end.is_some() || Instant::now() >= deadline {
+            return end;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Play a seeded schedule and probe the chain at each fault.
 ///
 /// At each fault the probe uses the connection that was open before it: an
-/// address change is watched without writing, so the probe never races the
-/// close; every other fault is met with an echo. While a reset is armed, the
-/// probe also dials a new connection, which must be reset. (A connection
+/// address change and a cut are watched without writing, so the probe never
+/// races the close, and a cut also records how the broker saw its leg end;
+/// every other fault is met with an echo. While a reset is armed, the probe
+/// also dials a new connection, which must be reset. (A connection
 /// dialled under a data limit is cut in the middle of its TLS handshake, and
 /// whether that cut is a FIN or a RST depends on whether the handshake's
 /// last bytes had arrived, so it is not probed.)
@@ -448,11 +490,12 @@ fn failures_for(seed: u64) -> (Vec<Seen>, network_rig::Schedule) {
     let profile = Profile::parse(FAST_CHAOS).unwrap();
     let mut chain = chain_with(profile, |config| {
         config.seed = seed;
-        config.horizon_ms = 20_000;
+        config.horizon_ms = 24_000;
     });
     let schedule = chain.rig.schedule().clone();
     let payload = vec![9u8; 2048];
     let mut session = open(&chain);
+    let mut leg = broker_visit(&chain, &session).and_then(|visit| visit.peer);
     let notes = chain.rig.play();
     let mut seen = Vec::new();
     for note in notes.iter() {
@@ -461,9 +504,16 @@ fn failures_for(seed: u64) -> (Vec<Seen>, network_rig::Schedule) {
                 let fault = note.event.fault;
                 session.set_read_timeout(Duration::from_millis(1000));
                 let mut outcomes = vec![match fault {
-                    Fault::AddressChange => session.wait_for_end(Duration::from_millis(1000)),
+                    Fault::AddressChange | Fault::Cut { .. } => {
+                        session.wait_for_end(Duration::from_millis(1000))
+                    }
                     _ => session.echo(&payload),
                 }];
+                if let Fault::Cut { .. } = fault {
+                    let source = leg.expect("the probe's broker leg");
+                    let end = broker_end(&chain, source, Duration::from_secs(2));
+                    outcomes.push(end.unwrap_or(Outcome::Stalled));
+                }
                 if matches!(fault, Fault::Reset { .. }) {
                     let dialled = Session::open(&dial(&chain), Duration::from_millis(1000))
                         .map(|mut fresh| fresh.echo(&payload));
@@ -471,7 +521,10 @@ fn failures_for(seed: u64) -> (Vec<Seen>, network_rig::Schedule) {
                 }
                 seen.push((note.event.index, fault.kind(), outcomes));
             }
-            Phase::Reverted => session = open(&chain),
+            Phase::Reverted => {
+                session = open(&chain);
+                leg = broker_visit(&chain, &session).and_then(|visit| visit.peer);
+            }
             Phase::Failed(why) => panic!("the rig failed event {}: {why}", note.event.index),
         }
     }
@@ -481,14 +534,15 @@ fn failures_for(seed: u64) -> (Vec<Seen>, network_rig::Schedule) {
 #[test]
 #[ignore = "TL-7 rig: fetches and runs the pinned Toxiproxy and mitmproxy; see the module documentation"]
 fn the_same_seed_replays_the_same_failures() {
-    // Seed 7 draws every kind of fault from the fast menu within 20 s.
-    let seed = 7;
+    // Seed 14 draws every kind of fault from the fast menu within 24 s, and
+    // a cut on each side.
+    let seed = 14;
     let (first, schedule) = failures_for(seed);
     eprintln!("failures for seed {seed}: {first:?}");
     let (again, replayed) = failures_for(seed);
     assert_eq!(schedule, replayed);
     assert_eq!(first.len(), schedule.events.len());
-    for kind in ["reset", "blackhole", "limit_data", "address_change"] {
+    for kind in ["reset", "blackhole", "limit_data", "address_change", "cut"] {
         assert!(
             first.iter().any(|(_, k, _)| *k == kind),
             "no {kind} in {first:?}"
@@ -500,7 +554,189 @@ fn the_same_seed_replays_the_same_failures() {
             .all(|(_, _, outcomes)| outcomes[0] != Outcome::Ok),
         "every fault shows: {first:?}"
     );
+    // A cut resets the probe's connection on the side the seed chose.
+    for (event, (_, _, outcomes)) in schedule.events.iter().zip(&first) {
+        if let Fault::Cut { side, .. } = event.fault {
+            let (client, broker) = (&outcomes[0], &outcomes[1]);
+            if matches!(side, Side::Client | Side::Both) {
+                assert_eq!(*client, Outcome::Reset, "event {}: {side:?}", event.index);
+            }
+            if matches!(side, Side::Broker | Side::Both) {
+                assert_eq!(*broker, Outcome::Reset, "event {}: {side:?}", event.index);
+            }
+        }
+    }
     assert_eq!(first, again, "the same seed must give the same failures");
+}
+
+#[test]
+#[ignore = "TL-7 rig: fetches and runs the pinned Toxiproxy and mitmproxy; see the module documentation"]
+fn a_cut_resets_an_open_websocket_mid_transfer_on_the_chosen_side() {
+    let chain = chain("N1");
+    let control = chain.rig.control();
+    for side in [Side::Client, Side::Broker, Side::Both] {
+        let session = open(&chain);
+        let local = session.local_addr().unwrap();
+        let connection = control
+            .connections()
+            .into_iter()
+            .find(|connection| connection.client == local)
+            .expect("the stage lists the open connection");
+        let source = connection
+            .broker_source
+            .expect("the stage knows the connection's broker leg");
+        // Keep 256 KiB messages flowing both ways until the connection ends.
+        let transfer = std::thread::spawn(move || {
+            let mut session = session;
+            let payload = vec![3u8; 256 * 1024];
+            loop {
+                match session.echo(&payload) {
+                    Outcome::Ok => continue,
+                    other => return other,
+                }
+            }
+        });
+        let deadline = Instant::now() + IO;
+        while chain
+            .server
+            .visits()
+            .iter()
+            .find(|visit| visit.peer == Some(source))
+            .is_none_or(|visit| visit.messages < 3)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{side:?}: the transfer never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            control.cut(Select::Id(connection.id), side),
+            [connection.id]
+        );
+        let client = transfer.join().unwrap();
+        let broker = broker_end(&chain, source, IO);
+        eprintln!("cut {side:?}: the client saw {client:?}, the broker saw {broker:?}");
+        // The chosen side sees ECONNRESET, not a clean close. The other side
+        // sees the chain close; a proxy that closes with data unread may
+        // turn that close into a reset too, so it is not checked.
+        if matches!(side, Side::Client | Side::Both) {
+            assert_eq!(client, Outcome::Reset, "{side:?}: the client");
+        }
+        if matches!(side, Side::Broker | Side::Both) {
+            assert_eq!(broker, Some(Outcome::Reset), "{side:?}: the broker");
+        }
+        // The cut waits for the hop it reset; the rest of the chain closes
+        // the connection's other hop soon after.
+        let deadline = Instant::now() + IO;
+        while control.connections().iter().any(|c| c.id == connection.id) {
+            assert!(
+                Instant::now() < deadline,
+                "{side:?}: the connection stays open"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    // A cut of every connection resets each of them, and the chain still
+    // carries a new one.
+    let mut sessions: Vec<Session> = (0..3).map(|_| open(&chain)).collect();
+    let ids: Vec<u64> = control.connections().iter().map(|c| c.id).collect();
+    assert_eq!(control.cut(Select::All, Side::Client), ids);
+    for session in &mut sessions {
+        assert_eq!(session.wait_for_end(IO), Outcome::Reset);
+    }
+    assert_eq!(open(&chain).echo(b"after"), Outcome::Ok);
+}
+
+#[test]
+#[ignore = "TL-7 rig: fetches and runs the pinned Toxiproxy and mitmproxy; see the module documentation"]
+fn an_address_change_reaches_the_broker_from_a_new_source() {
+    let chain = chain("N1");
+    let control = chain.rig.control();
+    if cfg!(target_os = "linux") {
+        assert_eq!(control.address_change(), AddressChange::SourceAddress);
+    }
+    let mut sources = Vec::new();
+    for round in 0..3 {
+        let mut session = open(&chain);
+        assert_eq!(session.echo(b"hello"), Outcome::Ok);
+        sources.push(broker_visit(&chain, &session).unwrap().peer.unwrap());
+        if round < 2 {
+            control.change_address().unwrap();
+            let end = session.wait_for_end(IO);
+            assert!(matches!(end, Outcome::Closed | Outcome::Reset), "{end:?}");
+        }
+    }
+    eprintln!(
+        "address change ({:?}): the broker saw {sources:?}",
+        control.address_change()
+    );
+    for pair in sources.windows(2) {
+        assert_ne!(pair[0], pair[1]);
+        match control.address_change() {
+            AddressChange::SourceAddress => assert_ne!(pair[0].ip(), pair[1].ip()),
+            AddressChange::SourcePort => assert_eq!(pair[0].ip(), pair[1].ip()),
+        }
+    }
+}
+
+/// A plain TCP echo server for the latency measurement.
+fn tcp_echo() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.set_nodelay(true);
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while let Ok(read @ 1..) = stream.read(&mut buffer) {
+                    if stream.write_all(&buffer[..read]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The median and 99th percentile of `rounds` round trips of 64 bytes.
+fn round_trips(addr: SocketAddr, rounds: usize) -> (Duration, Duration) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (message, mut back) = ([7u8; 64], [0u8; 64]);
+    let mut times: Vec<Duration> = (0..rounds + 100)
+        .map(|_| {
+            let start = Instant::now();
+            stream.write_all(&message).unwrap();
+            stream.read_exact(&mut back).unwrap();
+            start.elapsed()
+        })
+        .skip(100)
+        .collect();
+    times.sort();
+    (times[rounds / 2], times[rounds * 99 / 100])
+}
+
+#[test]
+#[ignore = "TL-7 rig: a timing measurement of the reset stage; see the module documentation"]
+fn the_reset_stage_adds_negligible_latency() {
+    // Both of the stage's hops in a row, as they stand in the chain.
+    let server = tcp_echo();
+    let back = Hop::start(server).unwrap();
+    let front = Hop::start(back.addr()).unwrap();
+    let rounds = 2000;
+    let (direct, direct_p99) = round_trips(server, rounds);
+    let (staged, staged_p99) = round_trips(front.addr(), rounds);
+    eprintln!(
+        "round trip of 64 bytes over loopback, {rounds} rounds: \
+         direct median {direct:?} p99 {direct_p99:?}; \
+         through both hops median {staged:?} p99 {staged_p99:?}; \
+         the stage adds {:?} at the median",
+        staged.saturating_sub(direct)
+    );
+    // N2 alone adds 300 ms to 1 s; the stage must stay far below a millisecond.
+    assert!(staged.saturating_sub(direct) < Duration::from_millis(1));
 }
 
 #[test]

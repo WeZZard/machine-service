@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::prng::SplitMix64;
 use crate::profile::{Chaos, FaultMenu, Span, Stream};
+use crate::stage::Side;
 
 /// A fault the rig applies at one moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,15 @@ pub enum Fault {
     /// Close every connection, so the client dials again from a new source
     /// address or port.
     AddressChange,
+    /// Reset one open connection with a TCP RST on `side`: the open
+    /// connection at `pick` modulo their number, in the order they were
+    /// opened (DC-137).
+    Cut {
+        /// The end that receives the reset.
+        side: Side,
+        /// Which open connection.
+        pick: u64,
+    },
 }
 
 impl Fault {
@@ -48,7 +58,7 @@ impl Fault {
         match *self {
             Fault::Reset { window_ms, .. } | Fault::LimitData { window_ms, .. } => window_ms,
             Fault::Blackhole { duration_ms, .. } => duration_ms,
-            Fault::AddressChange => 0,
+            Fault::AddressChange | Fault::Cut { .. } => 0,
         }
     }
 
@@ -59,6 +69,7 @@ impl Fault {
             Fault::Blackhole { .. } => "blackhole",
             Fault::LimitData { .. } => "limit_data",
             Fault::AddressChange => "address_change",
+            Fault::Cut { .. } => "cut",
         }
     }
 }
@@ -151,6 +162,10 @@ fn draw(rng: &mut SplitMix64, menu: &FaultMenu) -> Fault {
             window_ms: span(rng, window_ms),
         },
         FaultMenu::AddressChange => Fault::AddressChange,
+        FaultMenu::Cut => Fault::Cut {
+            side: [Side::Client, Side::Broker, Side::Both][rng.range(0, 2) as usize],
+            pick: rng.next_u64(),
+        },
     }
 }
 
@@ -226,7 +241,7 @@ mod tests {
                         assert!((4096..=1_048_576).contains(&bytes));
                         assert!((1000..=6000).contains(&window_ms));
                     }
-                    Fault::AddressChange => {}
+                    Fault::AddressChange | Fault::Cut { .. } => {}
                 }
             }
         }

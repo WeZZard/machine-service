@@ -5,7 +5,9 @@
 //! the edge script in `edge/edge.py`, which ends TLS, routes by name, closes
 //! an idle connection and refuses a WebSocket message over the limit. Both
 //! run without root at pinned versions fetched into a cache outside the
-//! repository ([`tools`]). A [`Profile`] says what the chain does; a seeded
+//! repository ([`tools`]). The rig's own reset [`stage`] stands at both ends
+//! of the chain and cuts a chosen open connection with a TCP reset toward the
+//! client, the broker or both (DC-137). A [`Profile`] says what the chain does; a seeded
 //! [`Schedule`] says when faults happen; a [`Control`] sets a fault at an
 //! exact moment. The client reaches the broker only through the chain's one
 //! port and only by a host name, which it resolves to that port itself
@@ -21,6 +23,7 @@ pub mod process;
 pub mod profile;
 pub mod rig;
 pub mod schedule;
+pub mod stage;
 pub mod standin;
 pub mod tls;
 pub mod tools;
@@ -29,6 +32,7 @@ pub mod toxiproxy;
 pub use profile::{EdgeRules, Profile, Stream, Toxic, ToxicKind};
 pub use rig::{ClientSide, Control, Note, Phase, Rig, RigConfig, DEFAULT_BROKER_NAME};
 pub use schedule::{Event, Fault, Schedule};
+pub use stage::{AddressChange, Connection, Select, Side};
 
 /// The rig's errors.
 #[derive(Debug, thiserror::Error)]

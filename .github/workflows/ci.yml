@@ -42,3 +42,54 @@ jobs:
         run: |
           rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
           scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent"
+
+  # The TL-7 network rig's opt-in self-tests run the pinned Toxiproxy and
+  # mitmproxy on every platform the rig pins, so the Linux pins and launch
+  # path stay verified on every change (DC-138).
+  network-rig:
+    name: Network rig self-tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            tools: ~/.cache/machine-service/network-rig
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            tools: ~/.cache/machine-service/network-rig
+          - platform: macos-aarch64
+            runner: macos-latest
+            tools: ~/Library/Caches/machine-service/network-rig
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust
+
+      # The cache key is the pinned versions and SHA-256 hashes, so a new pin
+      # fetches again; the rig checks every hash before use either way.
+      - name: pinned tool key
+        id: pins
+        run: |
+          key=$(grep -E 'VERSION: &str|sha256: "' crates/network-rig/src/tools.rs | shasum -a 256 | cut -c1-16)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # The rig's default cache folder (DC-131).
+          path: ${{ matrix.tools }}
+          key: network-rig-tools-${{ matrix.platform }}-${{ steps.pins.outputs.key }}
+
+      - name: cargo test -p network-rig --test rig_live -- --ignored
+        run: cargo test -p network-rig --test rig_live -- --ignored --nocapture

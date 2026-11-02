@@ -16,6 +16,7 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::Message;
 
+use crate::client::{classify, Outcome};
 use crate::tls::{self, Authority};
 use crate::RigError;
 
@@ -36,6 +37,8 @@ pub struct Visit {
     pub largest_message: usize,
     /// Whether the WebSocket upgrade completed.
     pub upgraded: bool,
+    /// How the connection ended after the upgrade, once it has.
+    pub end: Option<Outcome>,
 }
 
 /// A running stand-in.
@@ -198,6 +201,7 @@ fn serve(
         }
     };
     record(visits, index, |visit| visit.upgraded = true);
+    let end = |outcome: Outcome| record(visits, index, |visit| visit.end = Some(outcome));
     while !stop.load(Ordering::SeqCst) {
         match socket.read() {
             Ok(message @ (Message::Text(_) | Message::Binary(_))) => {
@@ -206,19 +210,21 @@ fn serve(
                     visit.messages += 1;
                     visit.largest_message = visit.largest_message.max(size);
                 });
-                if socket.send(message).is_err() {
-                    return;
+                if let Err(error) = socket.send(message) {
+                    return end(classify(&error));
                 }
             }
-            Ok(Message::Close(_)) => {
+            Ok(Message::Close(frame)) => {
                 let _ = socket.flush();
-                return;
+                return end(frame
+                    .map(|f| Outcome::CloseFrame(f.code.into()))
+                    .unwrap_or(Outcome::Closed));
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(error)) if is_timeout(&error) => {
                 let _ = socket.flush();
             }
-            Err(_) => return,
+            Err(error) => return end(classify(&error)),
         }
     }
 }

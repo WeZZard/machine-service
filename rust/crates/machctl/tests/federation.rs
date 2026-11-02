@@ -31,6 +31,7 @@ impl Fake {
 
     /// A fake on every interface, for an instance found through its Bonjour
     /// advertisement, whose address is this Mac's own network address.
+    #[cfg(target_os = "macos")]
     fn on_all_interfaces(routes: Vec<(&str, Value)>) -> Fake {
         Fake::listening("0.0.0.0:0", routes)
     }
@@ -515,6 +516,7 @@ fn ac47_a_registration_without_metadata_falls_back_to_the_node_name_and_says_so(
 /// An instance that advertises itself on this Mac only, through the Mac's
 /// own DNS-SD service, so nothing is sent on any network (DC-85). The fake
 /// answers `/health` with `answers` and offers one durable machine.
+#[cfg(target_os = "macos")]
 fn advertised(advertise_as: &str, answers: &str) -> (discovery::dnssd::Advertisement, Fake) {
     let fake = Fake::on_all_interfaces(vec![
         (
@@ -541,6 +543,7 @@ fn advertised(advertise_as: &str, answers: &str) -> (discovery::dnssd::Advertise
 /// `machctl list --json` with the discovery mode `mode` (`None` for the
 /// default), no local instance, and a Consul agent that records what it was
 /// asked.
+#[cfg(target_os = "macos")]
 fn list_json(mode: Option<&str>, consul: &Fake) -> (Vec<Value>, String) {
     let home = tempfile::tempdir().unwrap();
     let mut command = Command::new(MACHCTL);
@@ -560,6 +563,7 @@ fn list_json(mode: Option<&str>, consul: &Fake) -> (Vec<Value>, String) {
     (listed, stderr(&output))
 }
 
+#[cfg(target_os = "macos")]
 fn instance<'a>(listed: &'a [Value], name: &str) -> Option<&'a Value> {
     listed.iter().find(|instance| instance["instance"] == name)
 }

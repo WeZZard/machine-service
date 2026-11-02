@@ -356,17 +356,12 @@ struct StatFields {
 }
 
 // The explicit `i64` conversions are identity conversions on 64-bit targets
-// but are required for 32-bit ones, where `time_t`/`c_long` are 32-bit.
+// but are required for 32-bit ones, where `time_t`/`c_long` are 32-bit. The
+// `libc` crate names the fields `st_mtime` and `st_mtime_nsec` on macOS and
+// Linux alike.
 #[allow(clippy::useless_conversion)]
-#[cfg(target_os = "macos")]
 fn stat_mtime_ns(st: &libc::stat) -> i64 {
     i64::from(st.st_mtime) * 1_000_000_000 + i64::from(st.st_mtime_nsec)
-}
-
-#[allow(clippy::useless_conversion)]
-#[cfg(not(target_os = "macos"))]
-fn stat_mtime_ns(st: &libc::stat) -> i64 {
-    i64::from(st.st_mtim.tv_sec) * 1_000_000_000 + i64::from(st.st_mtim.tv_nsec)
 }
 
 fn lstat_fields(path: &Path) -> std::io::Result<StatFields> {

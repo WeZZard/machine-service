@@ -66,23 +66,30 @@ Each behaviour is tested on the lowest layer that contains everything the behavi
 
 ### The network rig
 
-- Every connection between a client and the broker, and between a relay agent and the broker, passes through a chain of two proxies (DC-104).
+- Every connection between a client and the broker, and between a relay agent and the broker, passes through a chain of two proxies (DC-104), with the rig's own reset stage at each end of the chain (DC-137).
 - The first proxy is Toxiproxy, which injects faults at the TCP level: latency with jitter, a bandwidth limit, a blackhole (`timeout`), a reset (`reset_peer`), a close after a number of bytes (`limit_data`) and fragmentation (`slicer`).
 - The second proxy is mitmproxy with an edge script in this repository, which ends TLS and opens a new TLS connection, closes a WebSocket that is idle for 100 seconds, and closes a connection that sends a WebSocket message larger than 1 MiB.
-- Both proxies run without root on the client's machine, at pinned versions, and the broker is reachable only through the chain's one port and only by a host name.
-- Faults follow a seeded schedule, so a failing run can be replayed exactly, and a test can also set a fault at an exact moment through Toxiproxy's HTTP API.
+- The reset stage is a TCP relay in the `network-rig` crate, with one hop in front of Toxiproxy and one between mitmproxy and the broker. It cuts a chosen open connection, or every one, with a TCP RST toward the client, the broker or both, by closing that side's socket with a zero linger time. The hop's other socket closes normally, so the rest of the chain sees an ordinary close, and a reset that reaches a hop from one side is passed on as a reset to the other.
+- The stage pairs a client's connection with the broker connection that the edge opens for it by the random of the client's TLS ClientHello, which the front hop reads as it passes and the edge writes to the run's `edge-pairs.jsonl` with its source port.
+- The stage adds 40 to 70 µs to a round trip over loopback at the median, measured by the self-test `the_reset_stage_adds_negligible_latency` on macOS and Linux.
+- Both proxies and the stage run without root on the client's machine, the proxies at pinned versions, and the broker is reachable only through the chain's one port and only by a host name.
+- Faults follow a seeded schedule, so a failing run can be replayed exactly, and a test can also set a fault at an exact moment through the rig's `Control`, which drives Toxiproxy's HTTP API and the reset stage.
 - The rig is the `network-rig` crate. It pins Toxiproxy 2.13.0 and mitmproxy 12.3.1 for macOS arm64 and Linux arm64 and x86_64, and fetches them into a cache outside the repository, checking each SHA-256 before use. The edge script is `rust/crates/network-rig/edge/edge.py`.
 - A client is told the broker's URL, `wss://broker.relay-rig.test:<port>/relay`, the chain's port to resolve the name to, and the CA bundle of the edge's authority. It resolves the name itself, so no system setting changes. The edge answers `421` to any other name and to an address, and the broker's own certificate never reaches the client.
 - The edge ends TLS under every profile, because AC-66 and AC-68 run under N0. Its idle close counts every byte in either direction, WebSocket pings included, and its message limit closes the WebSocket with code 1009; a message of exactly 1 MiB passes.
-- A reset sends a TCP RST to every connection dialled while it is armed, and cuts an open connection when it next carries data. A blackhole drops data without closing anything, and closes the connection when it ends. An address change closes every connection, so the client dials again from a new source port.
+- A reset is Toxiproxy's `reset_peer`: it sends a TCP RST to every connection dialled while it is armed, and cuts an open connection without a RST when it next carries data. A cut is the stage's: an open connection receives a TCP RST at once, on the side chosen. The edge turns a reset on one of its legs into a WebSocket close with code 1000 on the other, as an edge that ends TLS does. A blackhole drops data without closing anything, and closes the connection when it ends.
+- An address change closes every connection, and the broker sees each new connection come from a new source address and port on Linux, where the stage's back hop moves to the next address of `127.0.0.0/8`, which needs no root. On macOS, whose loopback has one address without root, only the source port changes. The rig records which in `rig.json` as `address_change`.
 - `NETWORK_RIG_SEED` replays a seed. Each run records its profile, seed and schedule in `rig.json`, and the cell runner writes each cell's results to `report.json` under `<evidence>/<cell>/<profile>/`. Toxiproxy's latency jitter is not seeded, so a replay repeats the faults but not each packet's delay.
 - The rig's self-tests are opt-in: `cargo test -p network-rig --test rig_live -- --ignored`. Until the broker exists, they and the cell runner drive a WebSocket echo server under TLS in place of the broker.
+- CI runs the self-tests on every change on Ubuntu x86_64, Ubuntu arm64 and macOS arm64, the three platforms the rig pins, and caches the pinned tools by their versions and hashes (DC-138).
 
 ```mermaid
 flowchart LR
-    Client -->|wss://name| Toxi[Toxiproxy: TCP faults]
+    Client -->|wss://name| Front[reset stage, front hop: RST toward the client]
+    Front --> Toxi[Toxiproxy: TCP faults]
     Toxi --> Mitm[mitmproxy edge script: TLS, idle close, message size]
-    Mitm --> Broker[broker in machine-service]
+    Mitm --> Back[reset stage, back hop: RST toward the broker, source address]
+    Back --> Broker[broker in machine-service]
     Agent[relay agent] -->|through its own chain| Broker
 ```
 
@@ -93,7 +100,7 @@ flowchart LR
 | N0 Clean | The chain is in place and injects no fault: TLS ends at the edge and the broker is reached by name, with no idle close and no message limit. | It gives a baseline and the speed measurement. |
 | N1 Edge | It enforces TC-1, TC-3, TC-5, TC-6 and TC-8 at all times: an idle close at 100 seconds and a limit of 1 MiB per message. | It behaves like a Cloudflare edge. |
 | N2 Long-haul | It adds TC-7 to N1: 300 ms to 1 s of latency with jitter (325 ms ± 175 ms each way), a bandwidth limit of 4096 KB/s each way and fragmentation into pieces of 256 to 1792 bytes. | It behaves like a link between continents. |
-| N3 Chaos | It adds TC-2 and TC-4 to N2: random resets, blackholes, data limits and address changes on a seeded schedule, the first after 10 seconds and then one every 20 to 60 seconds after the previous one ends. | It imposes the worst case of the contract. |
+| N3 Chaos | It adds TC-2 and TC-4 to N2: random resets, cuts, blackholes, data limits and address changes on a seeded schedule, the first after 10 seconds and then one every 20 to 60 seconds after the previous one ends. | It imposes the worst case of the contract. |
 
 The profiles are JSON files in `rust/crates/network-rig/profiles/`.
 

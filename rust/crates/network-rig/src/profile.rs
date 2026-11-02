@@ -170,6 +170,9 @@ pub enum FaultMenu {
     /// Close every connection so the client dials again from a new source
     /// address or port (TC-4).
     AddressChange,
+    /// Reset one open connection with a TCP RST toward the client, the
+    /// broker or both, chosen by the seed (TC-2, DC-137).
+    Cut,
 }
 
 const BUILTIN: [(&str, &str); 4] = [
@@ -228,7 +231,7 @@ impl Profile {
                 FaultMenu::Reset { window_ms } => vec![*window_ms],
                 FaultMenu::Blackhole { duration_ms } => vec![*duration_ms],
                 FaultMenu::LimitData { bytes, window_ms } => vec![*bytes, *window_ms],
-                FaultMenu::AddressChange => vec![],
+                FaultMenu::AddressChange | FaultMenu::Cut => vec![],
             });
             if let Some(span) = spans.chain([chaos.gap_ms]).find(|span| span.0 > span.1) {
                 return bad(format!("the range [{}, {}] is reversed", span.0, span.1));
@@ -316,6 +319,7 @@ mod tests {
         assert!(has(|f| matches!(f, FaultMenu::Blackhole { .. })));
         assert!(has(|f| matches!(f, FaultMenu::LimitData { .. })));
         assert!(has(|f| matches!(f, FaultMenu::AddressChange)));
+        assert!(has(|f| matches!(f, FaultMenu::Cut)));
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! The chain: Toxiproxy, then mitmproxy with the edge script, then the broker.
+//! The chain: the reset stage's front hop, Toxiproxy, mitmproxy with the edge
+//! script, the reset stage's back hop, then the broker.
 //!
 //! ```text
-//! client --wss://<name>:<port>--> Toxiproxy --> mitmdump + edge.py --TLS--> broker
-//!          (dials 127.0.0.1:<port>)  (TCP faults)  (TLS ends, name routing,
-//!                                                   idle close, message limit)
+//! client --wss://<name>:<port>--> front hop --> Toxiproxy --> mitmdump + edge.py --> back hop --TLS--> broker
+//!          (dials 127.0.0.1:<port>)  (resets)    (TCP faults)  (TLS ends, name routing,  (resets,
+//!                                                               idle close, message limit) source address)
 //! ```
 //!
 //! Every process listens on loopback. A client is told only the chain's one
@@ -17,6 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +27,7 @@ use serde_json::json;
 use crate::process::{self, Child};
 use crate::profile::{Profile, Stream, Toxic, ToxicKind};
 use crate::schedule::{Event, Fault, Schedule};
+use crate::stage::{AddressChange, Connection, Select, Side, Stage};
 use crate::tls::Authority;
 use crate::tools::{self, Tool};
 use crate::toxiproxy::Api;
@@ -142,10 +145,12 @@ impl ClientSide {
     }
 }
 
-/// The rig's control: set or clear a fault now, through Toxiproxy's API.
+/// The rig's control: set or clear a fault now, through Toxiproxy's API and
+/// the reset stage.
 #[derive(Debug, Clone)]
 pub struct Control {
     api: Api,
+    stage: Arc<Stage>,
 }
 
 impl Control {
@@ -186,11 +191,42 @@ impl Control {
         self.api.set_enabled(PROXY, true)
     }
 
+    /// Close every connection through the chain, so each is dialled again and
+    /// reaches the broker from a new source address and port, or a new port
+    /// only ([`Control::address_change`]).
+    pub fn change_address(&self) -> Result<(), RigError> {
+        self.stage.change_address();
+        self.drop_connections()
+    }
+
+    /// What an address change changes on this machine.
+    pub fn address_change(&self) -> AddressChange {
+        self.stage.address_change()
+    }
+
+    /// The connections open through the chain, in the order they were opened.
+    pub fn connections(&self) -> Vec<Connection> {
+        self.stage.connections()
+    }
+
+    /// Reset the selected open connections with a TCP RST on `side`, and
+    /// return the IDs of the connections cut (DC-137).
+    pub fn cut(&self, select: Select, side: Side) -> Vec<u64> {
+        self.stage.cut(select, side)
+    }
+
     /// Set `fault` now. A fault stays until [`Control::revert`].
     pub fn apply(&self, fault: &Fault) -> Result<(), RigError> {
-        match fault_toxic(fault) {
-            Some(toxic) => self.add_toxic(&toxic),
-            None => self.drop_connections(),
+        match *fault {
+            Fault::AddressChange => self.change_address(),
+            Fault::Cut { side, pick } => {
+                self.cut(Select::Pick(pick), side);
+                Ok(())
+            }
+            _ => match fault_toxic(fault) {
+                Some(toxic) => self.add_toxic(&toxic),
+                None => Ok(()),
+            },
         }
     }
 
@@ -208,7 +244,7 @@ fn fault_toxic(fault: &Fault) -> Option<Toxic> {
         Fault::Reset { stream, .. } => (stream, ToxicKind::ResetPeer { timeout: 0 }),
         Fault::Blackhole { stream, .. } => (stream, ToxicKind::Timeout { timeout: 0 }),
         Fault::LimitData { stream, bytes, .. } => (stream, ToxicKind::LimitData { bytes }),
-        Fault::AddressChange => return None,
+        Fault::AddressChange | Fault::Cut { .. } => return None,
     };
     Some(Toxic {
         name: format!("fault-{}-{}", fault.kind(), stream.as_str()),
@@ -291,7 +327,10 @@ impl Rig {
         let loopback = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let api_addr = loopback(process::free_port()?);
         let mitm_addr = loopback(process::free_port()?);
-        let chain_addr = loopback(process::free_port()?);
+        let toxiproxy_addr = loopback(process::free_port()?);
+        let pairs = run_dir.join("edge-pairs.jsonl");
+        let stage = Arc::new(Stage::start(toxiproxy_addr, config.upstream, &pairs)?);
+        let broker_side = stage.broker_side();
 
         let mut command = Command::new(&toxiproxy_bin);
         command
@@ -309,7 +348,7 @@ impl Rig {
             .arg("--mode")
             .arg(format!(
                 "reverse:https://{name}:{}@{}",
-                config.upstream.port(),
+                broker_side.port(),
                 mitm_addr.port()
             ))
             .args(["--listen-host", "127.0.0.1"])
@@ -327,7 +366,9 @@ impl Rig {
             .args(["--set", "upstream_cert=false"])
             .args(["--set", "flow_detail=1"])
             .arg("--set")
-            .arg(format!("edge_routes={name}={}", config.upstream))
+            .arg(format!("edge_routes={name}={broker_side}"))
+            .arg("--set")
+            .arg(format!("edge_pairs_file={}", pairs.display()))
             .arg("--set")
             .arg(format!("edge_idle_close_s={idle}"))
             .arg("--set")
@@ -338,7 +379,7 @@ impl Rig {
         let mut mitmdump = Child::spawn("mitmdump", command, &run_dir)?;
         mitmdump.wait_until(READY, || process::accepts(mitm_addr))?;
 
-        api.create_proxy(PROXY, chain_addr, mitm_addr)?;
+        api.create_proxy(PROXY, toxiproxy_addr, mitm_addr)?;
         for toxic in &config.profile.toxics {
             api.add_toxic(PROXY, toxic)?;
         }
@@ -347,6 +388,7 @@ impl Rig {
             Some(chaos) => Schedule::generate(chaos, config.seed, config.horizon_ms),
             None => Schedule::empty(config.seed, config.horizon_ms),
         };
+        let chain_addr = stage.addr();
         let client = ClientSide {
             host: name.clone(),
             port: chain_addr.port(),
@@ -361,6 +403,7 @@ impl Rig {
             "broker_name": name,
             "toxiproxy": tools::TOXIPROXY_VERSION,
             "mitmproxy": tools::MITMPROXY_VERSION,
+            "address_change": stage.address_change(),
             "schedule": schedule,
         });
         write(&run_dir.join("rig.json"), &format!("{:#}\n", record))?;
@@ -369,7 +412,7 @@ impl Rig {
             player: None,
             mitmdump,
             toxiproxy,
-            control: Control { api },
+            control: Control { api, stage },
             client,
             schedule,
             profile: config.profile,

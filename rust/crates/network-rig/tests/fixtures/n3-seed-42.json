@@ -3,58 +3,61 @@
     "index": 0,
     "at_ms": 10000,
     "fault": {
-      "fault": "limit_data",
-      "stream": "downstream",
-      "bytes": 1018490,
-      "window_ms": 4096
+      "fault": "cut",
+      "side": "broker",
+      "pick": 5139283748462763858
     }
   },
   {
     "index": 1,
-    "at_ms": 70828,
+    "at_ms": 48892,
     "fault": {
-      "fault": "address_change"
+      "fault": "reset",
+      "stream": "upstream",
+      "window_ms": 4439
     }
   },
   {
     "index": 2,
-    "at_ms": 113809,
+    "at_ms": 100864,
     "fault": {
-      "fault": "blackhole",
-      "stream": "downstream",
-      "duration_ms": 12518
+      "fault": "cut",
+      "side": "both",
+      "pick": 3779771651426294207
     }
   },
   {
     "index": 3,
-    "at_ms": 173102,
+    "at_ms": 160230,
     "fault": {
-      "fault": "address_change"
+      "fault": "cut",
+      "side": "broker",
+      "pick": 12270025419241524956
     }
   },
   {
     "index": 4,
-    "at_ms": 214979,
+    "at_ms": 213137,
+    "fault": {
+      "fault": "reset",
+      "stream": "downstream",
+      "window_ms": 3895
+    }
+  },
+  {
+    "index": 5,
+    "at_ms": 247366,
     "fault": {
       "fault": "address_change"
     }
   },
   {
-    "index": 5,
-    "at_ms": 253070,
-    "fault": {
-      "fault": "reset",
-      "stream": "downstream",
-      "window_ms": 4099
-    }
-  },
-  {
     "index": 6,
-    "at_ms": 292152,
+    "at_ms": 269778,
     "fault": {
-      "fault": "reset",
-      "stream": "upstream",
-      "window_ms": 2957
+      "fault": "blackhole",
+      "stream": "downstream",
+      "duration_ms": 13125
     }
   }
 ]

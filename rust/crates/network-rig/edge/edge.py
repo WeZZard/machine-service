@@ -10,13 +10,18 @@ The rig starts mitmdump in reverse mode with this script. The script
 - closes a connection that carries no data for `edge_idle_close_s` seconds,
   counting every byte in either direction, WebSocket pings included (TC-3),
 - closes a WebSocket that sends a message larger than `edge_max_message_bytes`,
-  with close code 1009, and never forwards that message (TC-8).
+  with close code 1009, and never forwards that message (TC-8),
+- writes, for each connection it opens toward the broker, a line to
+  `edge_pairs_file` that pairs the random of the client's TLS ClientHello with
+  the source port of that connection, so the rig's reset stage can find the
+  broker leg of a client connection (DC-137).
 
 It is written against one mitmproxy version, pinned by the rig, and refuses to
 load under any other, because the message limit wraps a method of mitmproxy's
 WebSocket layer.
 """
 
+import json
 import logging
 import time
 
@@ -63,6 +68,9 @@ class Edge:
     def __init__(self):
         self.routes = {}
         self.max_message_bytes = 0
+        self.pairs_file = ""
+        # The ClientHello random of each client connection, by its ID.
+        self.randoms = {}
 
     def load(self, loader):
         loader.add_option(
@@ -80,6 +88,13 @@ class Edge:
             1048576,
             "Close a WebSocket that sends a larger message; 0 turns it off.",
         )
+        loader.add_option(
+            "edge_pairs_file",
+            str,
+            "",
+            "Append a JSON line pairing each ClientHello random with the source "
+            "port of the connection opened for it toward the broker.",
+        )
 
     def configure(self, updated):
         if "edge_routes" in updated:
@@ -91,6 +106,25 @@ class Edge:
             ctx.options.update(tcp_timeout=idle if idle > 0 else NO_IDLE_CLOSE_S)
         if "edge_max_message_bytes" in updated:
             self.max_message_bytes = ctx.options.edge_max_message_bytes
+        if "edge_pairs_file" in updated:
+            self.pairs_file = ctx.options.edge_pairs_file
+
+    def tls_clienthello(self, data):
+        # The record header (5), the handshake header (4) and the version (2)
+        # come before the 32 bytes of the random.
+        raw = data.client_hello.raw_bytes(True)
+        self.randoms[data.context.client.id] = raw[11:43].hex()
+
+    def server_connected(self, data):
+        random = self.randoms.get(data.client.id)
+        if not self.pairs_file or random is None or not data.server.sockname:
+            return
+        line = json.dumps({"random": random, "port": data.server.sockname[1]})
+        with open(self.pairs_file, "a", encoding="ascii") as pairs:
+            pairs.write(line + "\n")
+
+    def client_disconnected(self, client):
+        self.randoms.pop(client.id, None)
 
     def requestheaders(self, flow: http.HTTPFlow):
         sni = (flow.client_conn.sni or "").lower()
