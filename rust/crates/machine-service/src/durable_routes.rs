@@ -109,7 +109,7 @@ fn provision_agent(
             return;
         }
     };
-    let spec = relay_agent::Spec {
+    let mut spec = relay_agent::Spec {
         identity: agent,
         state_dir: state_dir.to_path_buf(),
         session_port: relay.settings.session_port,
@@ -117,6 +117,7 @@ fn provision_agent(
         rotate: false,
     };
     std::thread::spawn(move || {
+        spec.identity = spec.identity.clone().with_login_path();
         let may_restart = !relay_agent::durable_lease_current(&spec.state_dir);
         let label = &spec.identity.label;
         match relay_agent::ensure(&spec, may_restart) {
@@ -129,7 +130,7 @@ fn provision_agent(
             )),
             Ok(relay_agent::Ensured::Started { build }) => log(&format!(
                 "relay: the relay agent {label} was started from {} (build {}; broker {})",
-                spec.identity.home.display(),
+                spec.identity.root.display(),
                 build.get(..12).unwrap_or(&build),
                 spec.broker_url()
             )),

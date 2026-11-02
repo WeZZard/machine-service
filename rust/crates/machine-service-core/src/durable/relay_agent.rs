@@ -2,8 +2,8 @@
 //! `docs/arch/installation.md` IN-3; DC-140, DC-1xx-DUR2-1).
 //!
 //! Every instance with durable exposure on has one relay agent of its own,
-//! and the instance names it: the agent's label, home and files derive from
-//! the instance's state folder, so the installed instance and any second
+//! and the instance names it: the agent's label and files derive from the
+//! instance's state folder, so the installed instance and any second
 //! instance on the same Mac never share a label, a configuration, an
 //! executable or execution records.
 //!
@@ -12,11 +12,13 @@
 //!   operator's home, with its LaunchAgent in `~/Library/LaunchAgents`, so
 //!   launchd starts it at every login.
 //! - Any other instance's agent is `com.wezzard.relay-agent.<the first 12 hex
-//!   digits of the SHA-256 of the state folder>`, housed in
-//!   `<state>/relay/agent/`. Its LaunchAgent lies there too, outside
-//!   `~/Library/LaunchAgents`, so launchd runs it only while its instance has
-//!   loaded it and never at a later login, and the state folder holds all of
-//!   it.
+//!   digits of the SHA-256 of the state folder>`, whose files lie under its
+//!   root, `<state>/relay/agent/`, which it is told as `RELAY_AGENT_ROOT`. Its
+//!   LaunchAgent lies there too, outside `~/Library/LaunchAgents`, so launchd
+//!   runs it only while its instance has loaded it and never at a later
+//!   login, and the state folder holds all of it.
+//! - Every agent's `HOME` is the operator's home, because the commands it
+//!   runs are the operator's session's (DM-1).
 //!
 //! [`ensure`] brings an agent to the state its instance wants. The daemon
 //! calls it at startup when it runs the broker, so a second instance gets a
@@ -45,16 +47,26 @@ pub const EXECUTABLE: &str = crate::relay::GUEST_EXECUTABLE;
 pub const RECORDS: &str = ".local/state/relay-agent";
 /// The installed instance's state folder under the operator's home.
 pub const DEFAULT_STATE: &str = ".local/state/machine-service";
-/// The home of a second instance's relay agent, under its state folder.
-pub const INSTANCE_HOME: &str = "relay/agent";
+/// The login shell whose `PATH` the agent's commands get (DM-4).
+pub const LOGIN_SHELL: &str = "/bin/zsh";
+
+/// The root of a second instance's relay agent, under its state folder.
+pub const INSTANCE_ROOT: &str = "relay/agent";
 
 /// Which relay agent an instance has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The LaunchAgent label.
     pub label: String,
-    /// The agent's home: its `HOME`, under which every file of it lies.
+    /// The agent's `HOME`: the operator's home.
     pub home: PathBuf,
+    /// The folder every file of the agent lies under: the home for the
+    /// installed instance's agent, `<state>/relay/agent` for any other.
+    pub root: PathBuf,
+    /// The `PATH` its commands get: the operator's login shell's, as a
+    /// terminal of the desktop session has it (DC-1xx-DUR2-6); `None`
+    /// leaves launchd's.
+    pub path: Option<String>,
 }
 
 impl Identity {
@@ -78,13 +90,42 @@ pub fn identity(state_dir: &Path, home: &Path) -> Identity {
         return Identity {
             label: DEFAULT_LABEL.to_string(),
             home: home.to_path_buf(),
+            root: home.to_path_buf(),
+            path: None,
         };
     }
     let digest = Sha256::digest(state.to_string_lossy().as_bytes());
     let suffix: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
     Identity {
         label: format!("{DEFAULT_LABEL}.{suffix}"),
-        home: state.join(INSTANCE_HOME),
+        home: home.to_path_buf(),
+        root: state.join(INSTANCE_ROOT),
+        path: None,
+    }
+}
+
+/// The `PATH` of the operator's login shell (`zsh -l`), read as DM-4 reads
+/// the session environment; `None` when it cannot be read.
+pub fn login_path(home: &Path) -> Option<String> {
+    let base: Vec<(String, String)> = std::env::vars().collect();
+    super::session_env::capture_login_environment(
+        Path::new(LOGIN_SHELL),
+        &base,
+        home,
+        Duration::from_secs(30),
+    )
+    .ok()?
+    .into_iter()
+    .find(|(name, _)| name == "PATH")
+    .map(|(_, value)| value)
+    .filter(|value| !value.is_empty())
+}
+
+impl Identity {
+    /// This identity, whose commands get the operator's login `PATH`.
+    pub fn with_login_path(mut self) -> Identity {
+        self.path = login_path(&self.home);
+        self
     }
 }
 
@@ -105,24 +146,32 @@ pub struct Paths {
 
 /// The files of the relay agent `identity`.
 pub fn paths(identity: &Identity) -> Paths {
-    let home = &identity.home;
+    let root = &identity.root;
     let label = &identity.label;
     Paths {
-        plist: home.join(format!("Library/LaunchAgents/{label}.plist")),
-        executable: home.join(EXECUTABLE),
-        config: home.join(crate::relay::AGENT_CONFIG),
-        log: home.join(format!("Library/Logs/{label}.log")),
-        records: home.join(RECORDS),
+        plist: root.join(format!("Library/LaunchAgents/{label}.plist")),
+        executable: root.join(EXECUTABLE),
+        config: root.join(crate::relay::AGENT_CONFIG),
+        log: root.join(format!("Library/Logs/{label}.log")),
+        records: root.join(RECORDS),
     }
 }
 
 /// The LaunchAgent of the relay agent: the desktop session only, started at
-/// load and kept alive (RA-2).
+/// load and kept alive (RA-2), with the operator's `HOME` and, for an agent
+/// whose files lie elsewhere, `RELAY_AGENT_ROOT`.
 pub fn plist(identity: &Identity, paths: &Paths) -> Vec<u8> {
+    let mut environment = json!({"HOME": identity.home.to_string_lossy()});
+    if let Some(path) = &identity.path {
+        environment["PATH"] = json!(path);
+    }
+    if identity.root != identity.home {
+        environment[relay_agent::config::ROOT_VARIABLE] = json!(identity.root.to_string_lossy());
+    }
     crate::plist::dumps(&json!({
         "Label": identity.label,
         "ProgramArguments": [paths.executable.to_string_lossy(), "run"],
-        "EnvironmentVariables": {"HOME": identity.home.to_string_lossy()},
+        "EnvironmentVariables": environment,
         "RunAtLoad": true,
         "KeepAlive": true,
         "LimitLoadToSessionType": "Aqua",
@@ -390,7 +439,7 @@ fn remove_tree(path: &Path) -> Result<(), String> {
 }
 
 /// Unload the relay agent `identity` and remove its LaunchAgent,
-/// executable, configuration and records; a second instance's agent home
+/// executable, configuration and records; a second instance's agent root
 /// goes whole. Returns whether there was a LaunchAgent. Nothing to remove
 /// is not a failure.
 pub fn remove(identity: &Identity) -> Result<bool, String> {
@@ -403,7 +452,7 @@ pub fn remove(identity: &Identity) -> Result<bool, String> {
         }
         remove_tree(&paths.records)?;
     } else {
-        remove_tree(&identity.home)?;
+        remove_tree(&identity.root)?;
     }
     Ok(present)
 }
@@ -419,6 +468,7 @@ mod tests {
         let installed = identity(&home.join(DEFAULT_STATE), &home);
         assert_eq!(installed.label, DEFAULT_LABEL);
         assert_eq!(installed.home, home);
+        assert_eq!(installed.root, home);
         assert!(installed.installed());
         let paths = paths(&installed);
         assert_eq!(
@@ -436,7 +486,8 @@ mod tests {
         let second = identity(&state, &home);
         assert!(second.label.starts_with("com.wezzard.relay-agent."));
         assert_eq!(second.label.len(), DEFAULT_LABEL.len() + 13);
-        assert_eq!(second.home, state.join(INSTANCE_HOME));
+        assert_eq!(second.root, state.join(INSTANCE_ROOT));
+        assert_eq!(second.home, home, "its commands keep the operator's HOME");
         assert!(!second.installed());
         // The same folder always names the same agent, another folder another.
         assert_eq!(identity(&state, &home), second);
@@ -460,6 +511,8 @@ mod tests {
         let id = Identity {
             label: "com.example.agent".into(),
             home: PathBuf::from("/home/test"),
+            root: PathBuf::from("/home/test"),
+            path: None,
         };
         let paths = paths(&id);
         let value = crate::plist::parse(&plist(&id, &paths)).unwrap();
@@ -472,6 +525,32 @@ mod tests {
             json!(["/home/test/.local/libexec/relay-agent/relay-agent", "run"])
         );
         assert_eq!(value["EnvironmentVariables"]["HOME"], "/home/test");
+        assert!(value["EnvironmentVariables"]
+            .get("RELAY_AGENT_ROOT")
+            .is_none());
+        // A second instance's agent keeps the operator's HOME and is told
+        // where its own files are.
+        assert!(value["EnvironmentVariables"].get("PATH").is_none());
+        let second = Identity {
+            root: PathBuf::from("/state/relay/agent"),
+            path: Some("/home/test/.local/bin:/usr/bin:/bin".into()),
+            ..id
+        };
+        let paths = super::paths(&second);
+        let value = crate::plist::parse(&plist(&second, &paths)).unwrap();
+        assert_eq!(value["EnvironmentVariables"]["HOME"], "/home/test");
+        assert_eq!(
+            value["EnvironmentVariables"]["RELAY_AGENT_ROOT"],
+            "/state/relay/agent"
+        );
+        assert_eq!(
+            value["EnvironmentVariables"]["PATH"],
+            "/home/test/.local/bin:/usr/bin:/bin"
+        );
+        assert_eq!(
+            value["ProgramArguments"][0],
+            "/state/relay/agent/.local/libexec/relay-agent/relay-agent"
+        );
     }
 
     #[test]

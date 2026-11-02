@@ -104,8 +104,9 @@ case "$1" in
     esac ;;
   bootstrap)
     plist="$3"; label="$(basename "$plist" .plist)"
-    value() { /usr/bin/plutil -extract "$1" raw -o - "$plist"; }
-    HOME="$(value EnvironmentVariables.HOME)" SHELL=/bin/sh \
+    value() { /usr/bin/plutil -extract "$1" raw -o - "$plist" 2>/dev/null; }
+    HOME="$(value EnvironmentVariables.HOME)" \
+      RELAY_AGENT_ROOT="$(value EnvironmentVariables.RELAY_AGENT_ROOT)" SHELL=/bin/sh \
       nohup "$(value ProgramArguments.0)" run >>"$(value StandardErrorPath)" 2>&1 </dev/null &
     echo $! > "$dir/$label.pid"
     exit 0 ;;
@@ -481,8 +482,19 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
         label.starts_with("com.wezzard.relay-agent.") && label.len() == 36,
         "{label}"
     );
-    let home = PathBuf::from(agent["home"].as_str().unwrap());
+    let home = PathBuf::from(agent["root"].as_str().unwrap());
     assert_eq!(home, lab.state.canonicalize().unwrap().join("relay/agent"));
+    // Its commands keep the operator's HOME (DM-1); its files are its own.
+    let seen = lab.exec(
+        &name,
+        json!({"lease_id": lease, "argv": ["/bin/sh", "-c", "echo $HOME"]}),
+    );
+    assert_eq!(seen.body["link"], "relay", "{}", seen.body);
+    assert_eq!(
+        seen.body["output"].as_str().unwrap().trim(),
+        lab.home.to_str().unwrap()
+    );
+    assert!(home.join(".local/state/relay-agent").is_dir());
     assert!(acquired.get("link").is_some(), "{acquired}");
     // Its files are its own: under its state folder, none in the operator's
     // home, and its LaunchAgent is outside ~/Library/LaunchAgents.

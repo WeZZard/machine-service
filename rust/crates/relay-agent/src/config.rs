@@ -21,6 +21,21 @@ pub fn config_path(home: &Path) -> PathBuf {
     home.join(".config/relay-agent/config.json")
 }
 
+/// The variable naming the folder that holds the agent's own files, its
+/// configuration and its records, in place of `HOME`. A durable Mac's second
+/// instance runs its own agent with it, so the agent's files are its
+/// instance's while its commands keep the operator's `HOME` (DC-1xx-DUR2-1).
+pub const ROOT_VARIABLE: &str = "RELAY_AGENT_ROOT";
+
+/// The folder the agent's own files lie under: [`ROOT_VARIABLE`] when it
+/// is set, else the home directory, as in every guest.
+pub fn agent_root() -> PathBuf {
+    std::env::var_os(ROOT_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(guest_actions::user_home)
+}
+
 /// The configuration.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Config {

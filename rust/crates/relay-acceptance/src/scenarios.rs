@@ -259,6 +259,7 @@ fn ac68(ctx: &mut Ctx<'_>) -> Verdict {
 fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
+    let durable = ctx.target.durable();
     let name = |what: &str| format!("{prefix}{what}");
     match os {
         Os::Macos => {
@@ -302,6 +303,12 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                 &name("Finder answers osascript without a consent dialog"),
                 match finder.rc()? {
                     Some(0) => Ok(()),
+                    _ if !agent_events && durable => Err(Stop::Blocked(format!(
+                        "blocked by the Mac's own grants: its operator has not granted Apple \
+                         Events to com.wezzard.relay-agent, so macOS asks for consent on the \
+                         Mac's display ({}); the operator grants it once, as for CuaDriver (CN-3)",
+                        finder.text().trim()
+                    ))),
                     _ if !agent_events => Err(Stop::Blocked(format!(
                         "blocked by the base image: it grants no Apple Events permission to \
                          com.wezzard.relay-agent, so macOS asks for consent ({}); pilot-images M5 \
@@ -327,7 +334,9 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                     Ok(())
                 },
             );
-            let png = format!("/tmp/acc-{prefix}screen.png").replace(' ', "-");
+            // `/tmp` is a link on macOS, and cua-driver refuses an output
+            // path whose existing ancestor is not a folder.
+            let png = format!("/private/tmp/acc-{prefix}screen.png").replace(' ', "-");
             let capture = client.exec(
                 &format!(
                     "rm -f {png}; cua-driver call get_desktop_state '{{\"screenshot_out_file\":\"{png}\",\"max_image_dimension\":640}}' && \

@@ -44,7 +44,7 @@ pub fn release_executable(release_dir: &Path) -> Result<Vec<u8>, InstallError> {
 /// caller has refused a current durable lease already.
 pub fn install(spec: &Spec) -> Result<(), InstallError> {
     let wanted = core::Spec {
-        identity: identity(&spec.state_dir, &spec.home),
+        identity: identity(&spec.state_dir, &spec.home).with_login_path(),
         state_dir: spec.state_dir.clone(),
         session_port: spec.session_port,
         release_dir: spec.release_dir.clone(),

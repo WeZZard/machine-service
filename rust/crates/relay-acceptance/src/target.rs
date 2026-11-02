@@ -104,14 +104,15 @@ pub struct Lease {
     pub agent: AgentPlace,
 }
 
-/// Where a lease's relay agent is: its LaunchAgent label and its home.
+/// Where a lease's relay agent is: its LaunchAgent label and the folder
+/// its own files lie under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPlace {
     /// The LaunchAgent label (macOS).
     pub label: String,
-    /// The agent's home, as a shell word: `~` in a guest, the path the
+    /// The agent's root, as a shell word: `~` in a guest, the path the
     /// instance reports on a durable Mac.
-    pub home: String,
+    pub root: String,
 }
 
 impl AgentPlace {
@@ -120,19 +121,19 @@ impl AgentPlace {
     pub fn guest() -> AgentPlace {
         AgentPlace {
             label: "com.wezzard.relay-agent".into(),
-            home: "~".into(),
+            root: "~".into(),
         }
     }
 
-    /// The agent a lease record names in `relay_agent` (`label`, `home`), as
+    /// The agent a lease record names in `relay_agent` (`label`, `root`), as
     /// a durable Mac's instance derives it from its state folder
     /// (DC-1xx-DUR2-1); a record without them names a guest's agent.
     pub fn of_record(record: &Value) -> AgentPlace {
         let agent = &record["relay_agent"];
-        match (agent["label"].as_str(), agent["home"].as_str()) {
-            (Some(label), Some(home)) => AgentPlace {
+        match (agent["label"].as_str(), agent["root"].as_str()) {
+            (Some(label), Some(root)) => AgentPlace {
                 label: label.into(),
-                home: shell_quote(home),
+                root: shell_quote(root),
             },
             _ => AgentPlace::guest(),
         }
@@ -140,7 +141,7 @@ impl AgentPlace {
 
     /// The agent's configuration file, as a shell word.
     pub fn config(&self) -> String {
-        format!("{}/.config/relay-agent/config.json", self.home)
+        format!("{}/.config/relay-agent/config.json", self.root)
     }
 }
 
@@ -623,7 +624,7 @@ mod tests {
     fn a_durable_record_names_its_relay_agent() {
         let durable = AgentPlace::of_record(&json!({"relay_agent": {
             "label": "com.wezzard.relay-agent.0123456789ab",
-            "home": "/state dir/relay/agent",
+            "root": "/state dir/relay/agent",
         }}));
         assert_eq!(durable.label, "com.wezzard.relay-agent.0123456789ab");
         assert_eq!(

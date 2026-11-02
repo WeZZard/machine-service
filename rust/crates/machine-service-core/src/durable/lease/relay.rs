@@ -385,7 +385,7 @@ impl DurableMachine {
                 "relay_agent": relay.broker.agent(&relay.target).map(|agent| json!({
                     "os": agent.os, "arch": agent.arch, "build": agent.build,
                     "label": relay.agent.label,
-                    "home": relay.agent.home.to_string_lossy(),
+                    "root": relay.agent.root.to_string_lossy(),
                 })),
             }),
             Err(reason) => json!({"link": LINK_IN_SESSION, "link_reason": reason}),

@@ -81,14 +81,15 @@ pub struct AgentOptions {
 
 impl AgentOptions {
     /// Options from the process environment: `$SHELL`, `$HOME`, the state
-    /// directory `~/.local/state/relay-agent`, the hash of the running
+    /// directory `.local/state/relay-agent` under the agent's root
+    /// (`RELAY_AGENT_ROOT`, else `$HOME`), the hash of the running
     /// executable, [`HEARTBEAT`], [`MAX_RETENTION`], and the ownership this
     /// machine supports ([`Ownership::detect`]).
     pub fn from_environment() -> AgentOptions {
         let home = guest_actions::user_home();
         AgentOptions {
             shell: guest_actions::user_shell(),
-            state: state_directory(&home),
+            state: state_directory(&crate::config::agent_root()),
             home,
             build: guest_actions::executable_sha256(),
             heartbeat: HEARTBEAT,

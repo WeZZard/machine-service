@@ -467,7 +467,8 @@ fn tl6_a_second_instance_gets_its_own_relay_agent() {
     let identity = machine_service_install::relay_agent::identity(&state, &harness.home);
     assert!(identity.label.starts_with("com.wezzard.relay-agent."));
     let agent_home = state.canonicalize().unwrap().join("relay/agent");
-    assert_eq!(identity.home, agent_home);
+    assert_eq!(identity.root, agent_home);
+    assert_eq!(identity.home, harness.home);
     let plist = agent_home.join(format!("Library/LaunchAgents/{}.plist", identity.label));
     assert!(plist.exists());
     assert!(!relay_plist(&harness, "com.wezzard.relay-agent").exists());

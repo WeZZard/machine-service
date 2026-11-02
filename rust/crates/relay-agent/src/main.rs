@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use relay_agent::config::{config_path, load, wait_for};
+use relay_agent::config::{agent_root, config_path, load, wait_for};
 use relay_agent::dial::run;
 use relay_agent::session_link::{self, DialOptions};
 use relay_agent::{Agent, AgentOptions, StreamLink};
@@ -64,7 +64,7 @@ fn open_agent() -> Agent {
 
 fn serve_broker() {
     let running = stop_on_signal();
-    let path = config_path(&guest_actions::user_home());
+    let path = config_path(&agent_root());
     let config = wait_for(&path, CONFIG_POLL, |reason| {
         eprintln!("relay-agent: waiting for its configuration: {reason}");
     });
