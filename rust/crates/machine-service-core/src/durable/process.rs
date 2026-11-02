@@ -270,7 +270,7 @@ pub fn parse_procargs(buffer: &[u8]) -> Option<Arguments> {
 /// agent starts each command as a process group in the agent's session, and
 /// a group leader cannot start a session. Such a command is recorded as its
 /// process group, with `group` set, and its members are the processes of
-/// that group (RA-2, DC-1xx-DUR-3).
+/// that group (RA-2, DC-164).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseSession {
     /// The session ID, or the process group ID when `group` is set.
