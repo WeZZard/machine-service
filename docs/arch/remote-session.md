@@ -1,5 +1,7 @@
 # Remote session (RS)
 
+> The [broker](broker.md) runs this protocol twice: once with each client and once with each relay agent ([BK-3](broker.md#bk-3-two-sessions-and-one-execution-record)).
+
 ## Why
 
 - Today a client sends one HTTP request per operation and waits on that TCP connection for the result, for up to 660 s in mcp-vm-relay. When that connection breaks, the client cannot learn whether the operation ran.

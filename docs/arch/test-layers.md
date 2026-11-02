@@ -9,6 +9,7 @@ Each behaviour is tested on the lowest layer that contains everything the behavi
 | TL-3 Network lab | none | real silent packet loss, address change, an HTTPS-only proxy | test VMs with network conditioning, opt-in |
 | TL-4 Live VM | both channels against macOS 26 and Ubuntu 24.04 VMs | none | second instance, `#[ignore]` |
 | TL-5 End to end | Pi's traced Reminders run against the 2026-10-07 baseline | the same run with added network latency | Pi repository, opt-in |
+| TL-7 Relay acceptance | the relay agent in the desktop session | the broker through the network rig | real machines, 6 cells × 4 network profiles, opt-in |
 
 ## TL-1: Unit
 
@@ -56,3 +57,55 @@ Each behaviour is tested on the lowest layer that contains everything the behavi
 - Cases: an acquisition while the machine is leased; exec in the GUI session with the expected `PATH` and no owner credential variables; the agent keys reaching Claude Code and Codex without appearing in any response or log; a leftover application and a leftover background process swept at release while a stand-in CI process survives; the inventory recording an installed Homebrew formula; and a release during a running command.
 - The CLI's federated list runs against the real Consul agent and lists every registered instance, including one that is stopped for the test.
 - TL-6 never pauses the CI runner and never changes the installed instance, as AC-18 requires.
+
+## TL-7: Relay acceptance
+
+- The relay acceptance suite is the final acceptor of the [relay agent](relay-agent.md), the [broker](broker.md) and the [transport contract](transport-contract.md) (DC-103).
+- It runs on real machines with the real relay agent, the real broker and a real client, and it turns sshd off in every guest after acquisition and before the first action.
+- It does not test SSH.
+
+### The network rig
+
+- Every connection between a client and the broker, and between a relay agent and the broker, passes through a chain of two proxies (DC-104).
+- The first proxy is Toxiproxy, which injects faults at the TCP level: latency with jitter, a bandwidth limit, a blackhole (`timeout`), a reset (`reset_peer`), a close after a number of bytes (`limit_data`) and fragmentation (`slicer`).
+- The second proxy is mitmproxy with an edge script in this repository, which ends TLS and opens a new TLS connection, closes a WebSocket that is idle for 100 seconds, and closes a connection that sends a WebSocket message larger than 1 MiB.
+- Both proxies run without root on the client's machine, at pinned versions, and the broker is reachable only through the chain's one port and only by a host name.
+- Faults follow a seeded schedule, so a failing run can be replayed exactly, and a test can also set a fault at an exact moment through Toxiproxy's HTTP API.
+
+```mermaid
+flowchart LR
+    Client -->|wss://name| Toxi[Toxiproxy: TCP faults]
+    Toxi --> Mitm[mitmproxy edge script: TLS, idle close, message size]
+    Mitm --> Broker[broker in machine-service]
+    Agent[relay agent] -->|through its own chain| Broker
+```
+
+### Network profiles
+
+| Profile | What the rig does | Why |
+| --- | --- | --- |
+| N0 Clean | The chain is in place and injects no fault. | It gives a baseline and the speed measurement. |
+| N1 Edge | It enforces TC-1, TC-3, TC-5, TC-6 and TC-8 at all times. | It behaves like a Cloudflare edge. |
+| N2 Long-haul | It adds TC-7 to N1: 300 ms to 1 s of latency with jitter, a bandwidth limit and fragmentation. | It behaves like a link between continents. |
+| N3 Chaos | It adds TC-2 and TC-4 to N2: random resets and blackholes and address changes on a seeded schedule. | It imposes the worst case of the contract. |
+
+### Cells
+
+- The suite runs in 6 cells: a client on macOS or on Ubuntu, against a macOS virtual machine, a durable Mac or an Ubuntu virtual machine.
+- Each cell runs under the 4 profiles, so a full acceptance is 24 runs of the suite.
+- AC-55 to AC-60, AC-66 and AC-68 run under every profile.
+- AC-61 to AC-65, AC-67 and AC-69 run under N1, N2 and N3.
+- AC-70 measures speed under N0 and N2.
+
+### Coverage of the contract
+
+| Rule | Proven by | The suite fails when |
+| --- | --- | --- |
+| TC-1 | every scenario under N1 to N3 | the stack uses another port, UDP or an inbound connection |
+| TC-2 | AC-61, AC-64 and N3 | an operation runs twice or a result is lost |
+| TC-3 | AC-69 | heartbeats are missing or too far apart |
+| TC-4 | AC-63 and N3 | a session is tied to an address or a connection |
+| TC-5 | AC-66 under N1 to N3 | a credential depends on a client certificate |
+| TC-6 | AC-68 under N1 to N3 | discovery or a client needs an IP address |
+| TC-7 | AC-56 to AC-59 under N2 and N3 | a timeout assumes a fast link |
+| TC-8 | AC-57 and AC-58 under N1 to N3 | data is sent in a message larger than 1 MiB |

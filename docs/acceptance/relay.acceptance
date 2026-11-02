@@ -1,0 +1,112 @@
+Feature: Actions through the relay agent and the broker
+  Every scenario runs in the 6 cells of TL-7, under the network profiles its tags name.
+  In every cell, sshd is off in the guest after acquisition and before the first action.
+
+  @AC-55 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: An action runs in the desktop session
+    Given a lease whose relay agent has registered with the broker
+    When the client runs an action on a macOS target
+    Then the action reads a test item from the login keychain without unlocking it
+    And the action drives Finder with osascript without a consent dialog and without a TCC grant for sshd-keygen-wrapper
+    And the action captures the screen through cua-driver
+    When the client runs an action on an Ubuntu target
+    Then the action sees the desktop session's display and session bus
+    And the action reads a test item from the login keyring
+
+  @AC-56 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: A command behaves as it would in a terminal of the desktop session
+    When the client runs commands that exit with the statuses 0, 1 and 127
+    Then the client receives each exit status exactly
+    When the client sends 1 MiB on standard input to a command that prints its SHA-256
+    Then the printed hash matches the sent bytes
+    When a command that starts child processes exceeds its timeout or is cancelled
+    Then every process of its process group has exited
+
+  @AC-57 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: Large output arrives whole
+    When the client runs a command that writes 200 MB to standard output and 1 MB to standard error
+    Then the client receives both streams with the SHA-256 that the command computed
+
+  @AC-58 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: Files move whole or not at all
+    When the client pushes and pulls a 1 KiB file, a 2 GB file and a tree of 10,000 files
+    Then every file arrives with its SHA-256
+    And no reader in the guest ever sees a partly written file
+
+  @AC-59 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: A long action completes
+    When the client runs an action that works for 30 minutes and prints a line every minute
+    Then the client receives every line and the action's exit status
+
+  @AC-60 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: A lease's relay agent registers and its credential ends at release
+    When the client acquires a lease
+    Then the lease reaches running only after its relay agent has registered within its bound
+    When the client releases the lease
+    Then the broker refuses the lease credential and the agent credential
+
+  @AC-61 @TL-7 @N1 @N2 @N3
+  Scenario: A connection cut during an action does not run it twice
+    Given an action in flight that appends one line to a file
+    When the rig resets the client's connection and the relay agent's connection
+    Then both sides resume their sessions
+    And the client receives the action's result once
+    And the file holds one line
+
+  @AC-62 @TL-7 @N1 @N2 @N3
+  Scenario: A silent connection is detected and resumed
+    Given an action in flight
+    When the rig blackholes the connection without closing it
+    Then the dead connection is detected within 15 seconds
+    And the session resumes and the result arrives once
+
+  @AC-63 @TL-7 @N1 @N2 @N3
+  Scenario: A client that changes its address keeps its session
+    Given an action in flight
+    When the client reconnects from a new source address and port
+    Then the broker resumes the same session and the result arrives once
+
+  @AC-64 @TL-7 @N1 @N2 @N3
+  Scenario: A restart of the broker or the relay agent never replays an action
+    Given an action in flight
+    When the broker restarts, or the relay agent restarts
+    Then each side reconnects
+    And the action is reported completed, running or unknown, and is never run again
+
+  @AC-65 @TL-7 @N1 @N2 @N3
+  Scenario: The relay agent returns after a reboot
+    When the guest reboots
+    Then the relay agent registers again from the desktop session without a manual step
+    And AC-55 passes again
+
+  @AC-66 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: Credentials and ports are guarded
+    Then the broker refuses a missing, wrong, expired or released credential
+    And the target has no listening port that the relay agent opened
+    And every hop of the chain runs TLS
+    And the credentials work when a proxy ends TLS on the way
+
+  @AC-67 @TL-7 @N1 @N2 @N3
+  Scenario: An expired session still reports its operations
+    Given a session with a grace period of 2 seconds and an action in flight
+    When the client stays disconnected for 3 seconds and then resumes
+    Then the client is answered expired
+    And a query by execution ID returns the action's outcome
+
+  @AC-68 @TL-7 @N0 @N1 @N2 @N3
+  Scenario: The client finds the broker by name
+    When the client looks up the instance through discovery
+    Then it receives a relay_url that names a host name
+    And the client connects without any address that a person wrote down
+
+  @AC-69 @TL-7 @N1 @N2 @N3
+  Scenario: A silent action survives the edge's idle close
+    When the client runs an action that prints nothing for 5 minutes and then exits
+    Then the session stays open through heartbeats
+    And the client receives the exit status
+
+  @AC-70 @TL-7 @N0 @N2
+  Scenario: The link is the smallest part of an action's time
+    When the client runs 100 short actions
+    Then the suite records the time each action spent in the link and in the guest
+    And it reports the median and the 95th percentile for each cell
