@@ -64,4 +64,9 @@ jobs:
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/*
+        run: |
+          # A tag with a pre-release part (v0.2.0-rc.1) is published as a
+          # pre-release, so it never becomes the repository's latest release.
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag "${flags[@]}" dist/*
