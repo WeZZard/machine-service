@@ -106,7 +106,8 @@ Feature: Actions through the relay agent and the broker
     And the client receives the exit status
 
   @AC-70 @TL-7 @N0 @N2
-  Scenario: The link is the smallest part of an action's time
+  Scenario: Speed is measured, and the protocol adds no round trip of its own
     When the client runs 100 short actions
     Then the suite records the time each action spent in the link and in the guest
-    And it reports the median and the 95th percentile for each cell
+    And it reports the median and the 95th percentile for each cell, with the path's own round-trip time
+    And each action takes one round trip of the client's session, with no extra round trip for a hello, a lookup or an acknowledgement
