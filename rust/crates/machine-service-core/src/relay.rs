@@ -10,7 +10,8 @@
 //!   waits for it to register and to answer a probe command and a
 //!   checksummed transfer (RA-7). A lease whose relay agent does not
 //!   register is served over SSH and says so in its record (RA-8).
-//! - A `relay` lease's exec, push and pull go through its relay agent.
+//! - A `relay` lease's exec, push and pull go through its relay agent; a
+//!   folder travels as a tar stream (RP-13).
 //! - Release and expiry revoke the lease's credentials at once (RP-10).
 
 use std::collections::HashMap;
@@ -949,8 +950,9 @@ impl Service {
         exit_answer(vm, &execution, &answer, timeout_s)
     }
 
-    /// `push` of one file on a `relay` lease. `None` for a folder, which
-    /// still goes by `scp -r`.
+    /// `push` on a `relay` lease: a file as `write`, a folder as
+    /// `write_tree` with its tar stream (RP-13), placed as `scp -r` places
+    /// it and replaced whole in one step.
     pub(crate) fn relay_push(
         &self,
         vm: &str,
@@ -960,7 +962,9 @@ impl Service {
         remote: &str,
     ) -> OpResult<Option<Value>> {
         if local.is_dir() {
-            return Ok(None);
+            return self
+                .relay_push_tree(vm, target, body, local, remote)
+                .map(Some);
         }
         use std::os::unix::fs::PermissionsExt;
         let bytes = std::fs::read(local)
@@ -989,8 +993,48 @@ impl Service {
         }
     }
 
-    /// `pull` of one file on a `relay` lease. `None` for a guest folder,
-    /// which still goes by `scp -r`.
+    fn relay_push_tree(
+        &self,
+        vm: &str,
+        target: &Target,
+        body: &Value,
+        local: &Path,
+        remote: &str,
+    ) -> OpResult<Value> {
+        let stream = byte_transfer::pack_into(local, Vec::new())
+            .map_err(|e| OpError::new(format!("push failed: {e}")))?;
+        let limit = self
+            .relay()
+            .map_or(usize::MAX, |relay| relay.broker.config().max_upload);
+        if stream.len() > limit {
+            return Err(OpError::new(format!(
+                "push failed: the folder's tar stream is {} bytes; the relay carries at most {limit}",
+                stream.len()
+            )));
+        }
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let execution = execution_of(body)?;
+        let op = Op::WriteTree {
+            path: remote.to_string(),
+            name,
+        };
+        let answer = self.relay_run(vm, target, &execution, op, stream, 300)?;
+        match &answer.outcome {
+            Outcome::Written(digest) => Ok(json!({
+                "vm": vm, "pushed": local.display().to_string(), "to": remote,
+                "folder": true, "bytes": digest.size, "sha256": digest.sha256,
+                "link": LINK_RELAY, "execution_id": execution,
+            })),
+            other => Err(outcome_error(other)),
+        }
+    }
+
+    /// `pull` on a `relay` lease: a file as `read`; a guest folder, which
+    /// the read answers with `is_directory`, as `read_tree` (RP-13), placed
+    /// as `scp -r` places it and replaced whole in one step.
     pub(crate) fn relay_pull(
         &self,
         vm: &str,
@@ -1024,10 +1068,72 @@ impl Service {
                     "link": LINK_RELAY, "execution_id": execution,
                 })))
             }
-            Outcome::Failed { code, .. } if code == "is_directory" => Ok(None),
+            Outcome::Failed { code, .. } if code == "is_directory" => self
+                .relay_pull_tree(vm, target, &execution, remote, local)
+                .map(Some),
             other => Err(outcome_error(other)),
         }
     }
+
+    fn relay_pull_tree(
+        &self,
+        vm: &str,
+        target: &Target,
+        read_execution: &str,
+        remote: &str,
+        local: &Path,
+    ) -> OpResult<Value> {
+        // The read's ID already names the read that found a folder; the
+        // folder read takes an ID derived from it, so a repeated request
+        // derives the same one.
+        let execution = format!("tree:{}", sha256_hex(read_execution.as_bytes()));
+        let op = Op::ReadTree {
+            path: remote.to_string(),
+        };
+        let answer = self.relay_run(vm, target, &execution, op, Vec::new(), 300)?;
+        let digest = match &answer.outcome {
+            Outcome::Read(digest) => digest.clone(),
+            other => return Err(outcome_error(other)),
+        };
+        if !answer.end_matches() || digest.size != answer.bytes.len() as u64 {
+            return Err(OpError::new(
+                "pull failed: the folder's stream does not match its SHA-256; pull again",
+            ));
+        }
+        let name = Path::new(remote.trim_end_matches('/'))
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let destination = byte_transfer::tree_destination(local, &name)
+            .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+        place_pulled_tree(&answer.bytes, &destination)
+            .map_err(|e| OpError::new(format!("pull failed: {e}")))?;
+        Ok(json!({
+            "vm": vm, "pulled": remote, "to": destination.display().to_string(),
+            "folder": true, "bytes": digest.size, "sha256": digest.sha256,
+            "link": LINK_RELAY, "execution_id": execution,
+        }))
+    }
+}
+
+/// Unpack a folder's tar stream beside `destination` and put it there in
+/// one step, replacing a folder that is there whole.
+fn place_pulled_tree(stream: &[u8], destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::Builder::new()
+        .prefix(".machine-service-pull-")
+        .tempdir_in(parent)
+        .map_err(|e| e.to_string())?;
+    let archive = scratch.path().join("tree.tar");
+    std::fs::write(&archive, stream).map_err(|e| e.to_string())?;
+    let staged = scratch.path().join("tree");
+    byte_transfer::unpack(&archive, &staged)?;
+    // The staged folder sits one level below the destination's folder; a
+    // rename within one file system keeps the placement atomic.
+    byte_transfer::place_tree(&staged, destination).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

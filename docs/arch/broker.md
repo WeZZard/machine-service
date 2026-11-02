@@ -32,7 +32,7 @@
 - The broker takes a call's whole upload and checks it against its end before it hands the call on, so a resend to a new agent session carries the same bytes. An upload holds at most 256 MiB.
 - The relay agent records execution IDs as well ([RA-5](relay-agent.md#ra-5-operations)), so a resend after either session resumes, or after a broker restart, never runs a command twice.
 - A client asks `query {execution}` after any loss and receives `completed`, `running` or `unknown`; the broker answers from its record, else from the relay agent's.
-- machine-service's own HTTP `exec`, `push` and `pull` on a `relay` lease, and so `machctl`'s, are calls on the same records, made in-process. The HTTP body may carry `execution_id` to make a request idempotent, and the answer names its `execution_id` and `link: relay`. Folders still go by `scp` (DC-151).
+- machine-service's own HTTP `exec`, `push` and `pull` on a `relay` lease, and so `machctl`'s, are calls on the same records, made in-process. The HTTP body may carry `execution_id` to make a request idempotent, and the answer names its `execution_id` and `link: relay`. A folder travels as a tar stream through `write_tree` and `read_tree` ([RP-13](relay-protocol.md#rp-13-folders)), so no action on a `relay` lease uses SSH.
 
 ## BK-4: Discovery of the broker
 

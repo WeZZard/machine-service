@@ -206,6 +206,20 @@ pub enum Op {
         /// The file, resolved against the home directory.
         path: String,
     },
+    /// Write a folder atomically. Chunks with its tar stream follow, and an
+    /// end (`docs/arch/relay-protocol.md`, RP-13).
+    WriteTree {
+        /// The destination, resolved against the home directory.
+        path: String,
+        /// The folder's name to use when `path` is an existing folder.
+        #[serde(default)]
+        name: String,
+    },
+    /// Read a folder; its tar stream comes back as chunks and an end.
+    ReadTree {
+        /// The folder, resolved against the home directory.
+        path: String,
+    },
     /// Cancel another execution.
     Cancel {
         /// The execution ID to cancel.
@@ -223,6 +237,8 @@ impl Op {
             Op::Script { .. } => OpKind::Script,
             Op::Write { .. } => OpKind::Write,
             Op::Read { .. } => OpKind::Read,
+            Op::WriteTree { .. } => OpKind::WriteTree,
+            Op::ReadTree { .. } => OpKind::ReadTree,
             Op::Cancel { .. } => OpKind::Cancel,
             Op::Status => OpKind::Status,
         }
@@ -241,6 +257,10 @@ pub enum OpKind {
     Write,
     /// [`Op::Read`].
     Read,
+    /// [`Op::WriteTree`].
+    WriteTree,
+    /// [`Op::ReadTree`].
+    ReadTree,
     /// [`Op::Cancel`].
     Cancel,
     /// [`Op::Status`].
@@ -255,7 +275,10 @@ impl OpKind {
 
     /// Whether the call uploads chunks and an end before it commits.
     pub fn uploads(self) -> bool {
-        matches!(self, OpKind::Exec | OpKind::Script | OpKind::Write)
+        matches!(
+            self,
+            OpKind::Exec | OpKind::Script | OpKind::Write | OpKind::WriteTree
+        )
     }
 }
 

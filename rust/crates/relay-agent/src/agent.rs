@@ -24,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use guest_actions::ownership::{Owner, Ownership};
-use guest_actions::{kill_command, AtomicFile, Sealed, Tally};
+use guest_actions::{kill_command, AtomicFile, AtomicTree, Sealed, SealedTree, Tally};
 
 use crate::link::{Link, LinkError};
 use crate::protocol::{
@@ -176,12 +176,15 @@ enum Upload {
     Bytes(Vec<u8>, Tally),
     /// Dropping the file removes its temporary sibling.
     File(AtomicFile),
+    /// Dropping the tree removes its spool and its unpacked folder.
+    Tree(AtomicTree),
 }
 
 /// What a call brings to its commit point.
 enum Committed {
     Bytes(Vec<u8>),
     File(Sealed),
+    Tree(SealedTree),
     Nothing,
 }
 
@@ -507,7 +510,20 @@ impl Session {
                     Err(error) => return self.refuse(call, &execution, error.code, error.message),
                 }
             }
-            Op::Read { .. } | Op::Cancel { .. } | Op::Status => {
+            Op::WriteTree { path, name } => {
+                let unique = self.inner.next.fetch_add(1, Ordering::SeqCst);
+                match AtomicTree::create(
+                    path,
+                    name,
+                    &self.inner.options.home,
+                    "relay-agent",
+                    unique,
+                ) {
+                    Ok(tree) => Upload::Tree(tree),
+                    Err(error) => return self.refuse(call, &execution, error.code, error.message),
+                }
+            }
+            Op::Read { .. } | Op::ReadTree { .. } | Op::Cancel { .. } | Op::Status => {
                 return self.commit(call, execution, op, Committed::Nothing);
             }
         };
@@ -537,6 +553,10 @@ impl Session {
                 }
             }
             Upload::File(file) => file
+                .append(data)
+                .err()
+                .map(|error| (error.code, error.message)),
+            Upload::Tree(tree) => tree
                 .append(data)
                 .err()
                 .map(|error| (error.code, error.message)),
@@ -579,6 +599,10 @@ impl Session {
             }
             Upload::File(file) => match file.seal(size, sha256) {
                 Ok(sealed) => Committed::File(sealed),
+                Err(error) => return self.refuse(call, &execution, error.code, error.message),
+            },
+            Upload::Tree(tree) => match tree.seal(size, sha256) {
+                Ok(sealed) => Committed::Tree(sealed),
                 Err(error) => return self.refuse(call, &execution, error.code, error.message),
             },
         };
@@ -641,11 +665,28 @@ impl Session {
                 let _ = state.store.complete(&execution, outcome.clone());
                 Known::Completed(kind, outcome)
             }
+            (Op::WriteTree { .. }, Committed::Tree(sealed)) => {
+                let outcome = match sealed.place() {
+                    Ok(digest) => Outcome::Written(Digest {
+                        size: digest.size,
+                        sha256: digest.sha256,
+                    }),
+                    Err(error) => Outcome::failed(error.code, error.message),
+                };
+                let _ = state.store.complete(&execution, outcome.clone());
+                Known::Completed(kind, outcome)
+            }
             (Op::Read { path }, _) => {
                 let live = new_live(kind);
                 state.live.insert(execution.clone(), Arc::clone(&live));
                 drop(state);
-                return self.start_read(call, execution, live, path);
+                return self.start_read(call, execution, live, path, false);
+            }
+            (Op::ReadTree { path }, _) => {
+                let live = new_live(kind);
+                state.live.insert(execution.clone(), Arc::clone(&live));
+                drop(state);
+                return self.start_read(call, execution, live, path, true);
             }
             (Op::Cancel { target }, _) => {
                 let found = self.cancel(&state, &target);
@@ -791,27 +832,32 @@ impl Session {
         Known::Running(live)
     }
 
-    fn start_read(&self, call: u64, execution: String, live: Arc<Live>, path: String) {
+    /// Stream a file's bytes, or a folder's tar stream when `tree` is set.
+    fn start_read(&self, call: u64, execution: String, live: Arc<Live>, path: String, tree: bool) {
         let inner = Arc::clone(&self.inner);
         let link = Arc::clone(&self.link);
         let active = Arc::clone(&self.active);
         active.lock().unwrap().insert(call);
         thread::spawn(move || {
             let path = guest_actions::resolve(&path, &inner.options.home);
-            let read = guest_actions::open_read(&path).and_then(|file| {
-                guest_actions::read_chunks(file, MAX_CHUNK, |bytes| {
-                    !live.cancelled.load(Ordering::SeqCst)
-                        && link
-                            .send(
-                                Message::Chunk {
-                                    call,
-                                    data: bytes.to_vec(),
-                                }
-                                .encode(),
-                            )
-                            .is_ok()
-                })
-            });
+            let send = |bytes: &[u8]| {
+                !live.cancelled.load(Ordering::SeqCst)
+                    && link
+                        .send(
+                            Message::Chunk {
+                                call,
+                                data: bytes.to_vec(),
+                            }
+                            .encode(),
+                        )
+                        .is_ok()
+            };
+            let read = if tree {
+                guest_actions::read_tree(&path, MAX_CHUNK, send)
+            } else {
+                guest_actions::open_read(&path)
+                    .and_then(|file| guest_actions::read_chunks(file, MAX_CHUNK, send))
+            };
             let outcome = match read {
                 Ok(digest) => {
                     let _ = link.send(

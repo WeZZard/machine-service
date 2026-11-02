@@ -228,6 +228,19 @@ fn every_message_survives_encoding() {
             execution: "e".into(),
             op: Op::Status,
         }),
+        Message::Call(Call {
+            call: 8,
+            execution: "e".into(),
+            op: Op::WriteTree {
+                path: "p".into(),
+                name: "n".into(),
+            },
+        }),
+        Message::Call(Call {
+            call: 9,
+            execution: "e".into(),
+            op: Op::ReadTree { path: "p".into() },
+        }),
         Message::Chunk {
             call: u64::MAX,
             data: vec![0, 1, 2, 255],
@@ -1736,4 +1749,164 @@ fn dc139_a_command_records_its_owner_and_status_names_the_ownership() {
         b"",
     );
     rig.driver.finish(call).unwrap();
+}
+
+// ---------------------------------------------------------------- folders
+
+/// A folder's tar stream, as a client packs it.
+fn folder_stream(source: &Path) -> Vec<u8> {
+    byte_transfer::pack_into(source, Vec::new()).unwrap()
+}
+
+/// RP-13 (TL-1): a folder written as a tar stream lands whole at its end,
+/// reads back as the same files, and its execution IDs replay like a
+/// write's and a read's.
+#[test]
+fn a_folder_written_and_read_back_matches_and_replays() {
+    let mut rig = Rig::new();
+    let source = rig.path("source");
+    std::fs::create_dir_all(source.join("nested/deeper")).unwrap();
+    let big: Vec<u8> = (0..2_500_000u32).map(|n| (n * 7 % 251) as u8).collect();
+    std::fs::write(source.join("nested/deeper/big.bin"), &big).unwrap();
+    std::fs::write(source.join("a.txt"), "alpha").unwrap();
+    std::fs::set_permissions(source.join("a.txt"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    let stream = folder_stream(&source);
+    std::fs::create_dir(rig.path("into")).unwrap();
+    let write = Op::WriteTree {
+        path: "into".into(),
+        name: "copy".into(),
+    };
+    let written = rig.run("t-w", write.clone(), &stream);
+    let digest = Digest {
+        size: stream.len() as u64,
+        sha256: guest_actions::sha256_hex(&stream),
+    };
+    assert_eq!(outcome(&written), &Outcome::Written(digest.clone()));
+    assert_eq!(
+        std::fs::read(rig.path("into/copy/nested/deeper/big.bin")).unwrap(),
+        big
+    );
+    let mode = std::fs::metadata(rig.path("into/copy/a.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o750);
+
+    // The same ID never writes again, even after the folder changed.
+    std::fs::write(rig.path("into/copy/a.txt"), "changed").unwrap();
+    let again = rig.run("t-w", write, &stream);
+    assert!(again.result.as_ref().unwrap().replayed);
+    assert_eq!(
+        std::fs::read_to_string(rig.path("into/copy/a.txt")).unwrap(),
+        "changed"
+    );
+
+    let read = rig.run(
+        "t-r",
+        Op::ReadTree {
+            path: "into/copy".into(),
+        },
+        b"",
+    );
+    assert!(read.end_matches());
+    assert!(read.chunks.len() >= 3 && read.chunks.iter().all(|size| *size <= MAX_CHUNK));
+    assert!(matches!(outcome(&read), Outcome::Read(d) if d.size == read.bytes.len() as u64));
+    let archive = rig.path("back.tar");
+    std::fs::write(&archive, &read.bytes).unwrap();
+    byte_transfer::unpack(&archive, &rig.path("back")).unwrap();
+    assert_eq!(
+        std::fs::read(rig.path("back/nested/deeper/big.bin")).unwrap(),
+        big
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.path("back/a.txt")).unwrap(),
+        "changed"
+    );
+    // A repeated read ID answers its end and result without the bytes.
+    let replayed = rig.run(
+        "t-r",
+        Op::ReadTree {
+            path: "into/copy".into(),
+        },
+        b"",
+    );
+    assert!(replayed.result.as_ref().unwrap().replayed);
+    assert!(replayed.bytes.is_empty());
+    assert_eq!(outcome(&replayed), outcome(&read));
+    assert!(leftovers(&rig.path("into")).is_empty());
+}
+
+/// RP-13 (TL-1): a folder upload that does not match its end, or that is
+/// not a tar stream of files and folders, never lands and is not recorded;
+/// a folder read of a file is refused.
+#[test]
+fn a_bad_folder_upload_never_lands_and_is_not_recorded() {
+    let mut rig = Rig::new();
+    let source = rig.path("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("f"), "x").unwrap();
+    let stream = folder_stream(&source);
+    let call = rig.driver.next_call();
+    rig.driver
+        .send(&Message::Call(Call {
+            call,
+            execution: "bad".into(),
+            op: Op::WriteTree {
+                path: "dest".into(),
+                name: String::new(),
+            },
+        }))
+        .unwrap();
+    rig.driver
+        .send(&Message::Chunk {
+            call,
+            data: stream.clone(),
+        })
+        .unwrap();
+    rig.driver
+        .send(&Message::End {
+            call,
+            execution: "bad".into(),
+            size: stream.len() as u64,
+            sha256: guest_actions::sha256_hex(b"other"),
+        })
+        .unwrap();
+    let refused = rig.driver.finish(call).unwrap();
+    assert!(matches!(
+        outcome(&refused),
+        Outcome::Failed { code, committed: false, .. } if code == "checksum_mismatch"
+    ));
+    assert_eq!(rig.agent.query("bad"), ExecutionState::Unknown);
+    let garbage = vec![7u8; 4096];
+    let refused = rig.run(
+        "garbage",
+        Op::WriteTree {
+            path: "dest".into(),
+            name: String::new(),
+        },
+        &garbage,
+    );
+    assert!(
+        matches!(
+            outcome(&refused),
+            Outcome::Failed { code, committed: false, .. } if code == "bad_archive"
+        ),
+        "{:?}",
+        outcome(&refused)
+    );
+    assert!(!rig.path("dest").exists());
+    let names: Vec<String> = std::fs::read_dir(rig.home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with(".state"))
+        .collect();
+    assert_eq!(names, ["source"], "no spool or staged folder is left");
+    let read = rig.run(
+        "file-as-tree",
+        Op::ReadTree {
+            path: "source/f".into(),
+        },
+        b"",
+    );
+    assert!(matches!(outcome(&read), Outcome::Failed { code, .. } if code == "not_a_directory"));
 }

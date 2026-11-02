@@ -66,29 +66,58 @@ pub fn valid_digest(digest: &str) -> bool {
 /// any entry that is neither a file nor a folder is refused.
 pub fn pack(directory: &Path, out: &Path) -> Result<(), String> {
     let file = File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
-    let mut builder = tar::Builder::new(io::BufWriter::new(file));
-    builder.follow_symlinks(false);
-    add_tree(&mut builder, directory, Path::new(""))?;
-    let mut writer = builder
-        .into_inner()
-        .map_err(|error| format!("{}: {error}", out.display()))?;
+    let mut writer = pack_into(directory, io::BufWriter::new(file))?;
     writer
         .flush()
         .map_err(|error| format!("{}: {error}", out.display()))
 }
 
-fn add_tree(
-    builder: &mut tar::Builder<io::BufWriter<File>>,
-    root: &Path,
-    relative: &Path,
-) -> Result<(), String> {
-    let folder = root.join(relative);
-    let mut entries: Vec<_> = fs::read_dir(&folder)
+/// Write the tar stream of `directory`'s contents to `writer`, and return
+/// the writer. Every entry is judged before the first byte is written, so a
+/// folder that holds a symlink or a device is refused with nothing sent.
+pub fn pack_into<W: Write>(directory: &Path, writer: W) -> Result<W, String> {
+    check_tree(directory, Path::new(""))?;
+    let mut builder = tar::Builder::new(writer);
+    builder.follow_symlinks(false);
+    add_tree(&mut builder, directory, Path::new(""))?;
+    builder
+        .into_inner()
+        .map_err(|error| format!("{}: {error}", directory.display()))
+}
+
+fn sorted_entries(folder: &Path) -> Result<Vec<fs::DirEntry>, String> {
+    let mut entries: Vec<_> = fs::read_dir(folder)
         .map_err(|error| format!("{}: {error}", folder.display()))?
         .collect::<Result<_, _>>()
         .map_err(|error| format!("{}: {error}", folder.display()))?;
     entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
+    Ok(entries)
+}
+
+fn check_tree(root: &Path, relative: &Path) -> Result<(), String> {
+    for entry in sorted_entries(&root.join(relative))? {
+        let path = entry.path();
+        let kind = fs::symlink_metadata(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .file_type();
+        if kind.is_dir() {
+            check_tree(root, &relative.join(entry.file_name()))?;
+        } else if !kind.is_file() {
+            return Err(format!(
+                "{} is not a file or a folder; a transfer carries only those",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn add_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    relative: &Path,
+) -> Result<(), String> {
+    for entry in sorted_entries(&root.join(relative))? {
         let path = entry.path();
         let name = relative.join(entry.file_name());
         let kind = fs::symlink_metadata(&path)
@@ -111,6 +140,91 @@ fn add_tree(
         }
     }
     Ok(())
+}
+
+/// Where a folder copied as `name` lands at `path`, as `scp -r` places it:
+/// inside `path` when `path` is an existing folder, else at `path` itself.
+pub fn tree_destination(path: &Path, name: &str) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err("a folder destination needs a plain folder name".into());
+    }
+    Ok(path.join(name))
+}
+
+/// Put the folder `staged` at `destination` in one step: a rename when
+/// nothing is there, else an atomic exchange with the folder that is there,
+/// which is then removed. A reader sees the old folder or the new one,
+/// never a mix. `staged` must be on the file system of `destination`; a destination
+/// that is not a folder is refused.
+pub fn place_tree(staged: &Path, destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::rename(staged, destination),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.is_dir() => {
+            exchange(staged, destination)?;
+            // `staged` now holds the folder that was replaced.
+            fs::remove_dir_all(staged)
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a folder", destination.display()),
+        )),
+    }
+}
+
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL byte"))
+}
+
+/// Swap two paths atomically.
+#[cfg(target_os = "macos")]
+fn exchange(a: &Path, b: &Path) -> io::Result<()> {
+    let (a, b) = (c_path(a)?, c_path(b)?);
+    // SAFETY: both arguments are NUL-terminated paths that outlive the call.
+    let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Swap two paths atomically.
+#[cfg(target_os = "linux")]
+fn exchange(a: &Path, b: &Path) -> io::Result<()> {
+    const RENAME_EXCHANGE: libc::c_uint = 1 << 1;
+    let (a, b) = (c_path(a)?, c_path(b)?);
+    // SAFETY: both arguments are NUL-terminated paths that outlive the call;
+    // `renameat2` is called through `syscall` because not every C library
+    // the static build links declares it.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn exchange(_a: &Path, _b: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no atomic exchange on this system",
+    ))
 }
 
 /// Whether a tar entry's path stays inside its destination.
@@ -248,6 +362,59 @@ mod tests {
             assert!(!into.exists(), "{name}: {error}");
             assert!(!scratch.path().join("escape.txt").exists());
         }
+    }
+
+    /// A folder placed over an existing one replaces it whole in one step;
+    /// one placed where nothing is lands there; a file is never replaced.
+    #[test]
+    fn a_tree_is_placed_by_rename_or_by_exchange() {
+        let scratch = tempfile::tempdir().unwrap();
+        let destination = scratch.path().join("tree");
+        let staged = scratch.path().join(".tree.staged");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("new.txt"), "new").unwrap();
+        place_tree(&staged, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!staged.exists());
+
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("newer.txt"), "newer").unwrap();
+        place_tree(&staged, &destination).unwrap();
+        assert!(!destination.join("new.txt").exists(), "replaced whole");
+        assert_eq!(
+            fs::read_to_string(destination.join("newer.txt")).unwrap(),
+            "newer"
+        );
+        assert!(!staged.exists(), "the replaced folder is removed");
+
+        let file = scratch.path().join("file");
+        fs::write(&file, "x").unwrap();
+        fs::create_dir(&staged).unwrap();
+        assert!(place_tree(&staged, &file).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "x");
+
+        assert_eq!(
+            tree_destination(scratch.path(), "copy").unwrap(),
+            scratch.path().join("copy")
+        );
+        assert_eq!(tree_destination(&file, "copy").unwrap(), file);
+        assert!(tree_destination(scratch.path(), "../x").is_err());
+    }
+
+    /// The streaming pack refuses a symlink before it writes a byte.
+    #[test]
+    fn pack_into_judges_every_entry_first() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        fs::create_dir_all(source.join("a")).unwrap();
+        fs::write(source.join("a/file"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", source.join("z-link")).unwrap();
+        let mut out = Vec::new();
+        assert!(pack_into(&source, &mut out).is_err());
+        assert!(out.is_empty());
     }
 
     #[test]

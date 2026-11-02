@@ -313,6 +313,56 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
     assert_eq!(pulled.body["sha256"], json!(sha256_hex(&bytes)));
     assert_eq!(std::fs::read(&back).unwrap(), bytes);
 
+    // A folder goes as a tar stream through the relay agent too (RP-13),
+    // placed as `scp -r` places it and replaced whole.
+    let folder = lab.fixture.root.join("tree");
+    std::fs::create_dir_all(folder.join("nested")).unwrap();
+    std::fs::write(folder.join("nested/big.bin"), &bytes).unwrap();
+    std::fs::write(folder.join("top.txt"), "top").unwrap();
+    std::fs::create_dir_all(lab.guest_home.join("work/tree")).unwrap();
+    std::fs::write(lab.guest_home.join("work/tree/stale.txt"), "stale").unwrap();
+    let scp_calls =
+        || std::fs::read_to_string(lab.fixture.tart_home.join("scp-calls.log")).unwrap_or_default();
+    let scp_before = scp_calls();
+    let pushed = lab.post(
+        &format!("/machines/{vm}/push"),
+        &json!({"local_path": folder, "remote_path": "work"}),
+    );
+    assert_eq!(pushed.status, 200, "{}", pushed.body);
+    assert_eq!(pushed.body["link"], "relay");
+    assert_eq!(pushed.body["folder"], true);
+    assert_eq!(
+        std::fs::read(lab.guest_home.join("work/tree/nested/big.bin")).unwrap(),
+        bytes
+    );
+    assert!(
+        !lab.guest_home.join("work/tree/stale.txt").exists(),
+        "the folder is replaced whole"
+    );
+    let landing = lab.fixture.root.join("landing");
+    std::fs::create_dir_all(&landing).unwrap();
+    let pulled = lab.post(
+        &format!("/machines/{vm}/pull"),
+        &json!({"local_path": landing, "remote_path": "work/tree"}),
+    );
+    assert_eq!(pulled.status, 200, "{}", pulled.body);
+    assert_eq!(pulled.body["link"], "relay");
+    assert_eq!(pulled.body["folder"], true);
+    assert_eq!(
+        std::fs::read(landing.join("tree/nested/big.bin")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read_to_string(landing.join("tree/top.txt")).unwrap(),
+        "top"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&landing)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(entries, ["tree"], "nothing is left beside the folder");
+    assert_eq!(scp_calls(), scp_before, "no folder went by scp");
+
     // machctl's exec takes the same route (it calls the HTTP API).
     let cli = run_machctl(
         &["exec", &vm, "--", "sh", "-c", "pwd"],

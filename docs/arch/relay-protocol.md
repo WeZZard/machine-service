@@ -102,12 +102,15 @@ The same rule, one key naming the variant or a bare string for a variant without
 | script | `{"script":{"timeout_s":<number>}}` | yes: the script | output chunks, `end`, `result` with `exit` |
 | write | `{"write":{"path":"<path>","name":"<file name or empty>","mode":<integer or null>}}` | yes: the file's bytes | `result` with `written` |
 | read | `{"read":{"path":"<path>"}}` | no | the file's bytes as chunks, `end`, `result` with `read` |
+| write_tree | `{"write_tree":{"path":"<path>","name":"<folder name or empty>"}}` | yes: the folder's tar stream ([RP-13](#rp-13-folders)) | `result` with `written` |
+| read_tree | `{"read_tree":{"path":"<path>"}}` | no | the folder's tar stream as chunks, `end`, `result` with `read` |
 | cancel | `{"cancel":{"target":"<execution ID>"}}` | no | `result` with `cancel` |
 | status | `"status"` | no | `result` with `status` |
 
 - exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group, and on Linux with its systemd scope, which also holds the processes that left the group, after `timeout_s` seconds, which must be positive.
 - write resolves `path` against the home folder; when `path` names a folder, the file is `name` inside it. The bytes go to a temporary sibling, are checked against the `end`, and are renamed into place. `mode` is an integer file mode, such as `420` for `0644`.
-- read resolves `path` against the home folder. A folder is refused with code `is_directory`.
+- read resolves `path` against the home folder. A folder is refused with code `is_directory`; read it with read_tree.
+- write_tree and read_tree move a folder as one tar stream ([RP-13](#rp-13-folders)).
 - cancel kills the target's process group (and scope) when it runs, discards it when its upload has not ended, and has its own execution ID like any operation.
 
 ### Outcomes (`outcome`)
@@ -126,17 +129,17 @@ The same rule, one key naming the variant or a bare string for a variant without
 
 | State | JSON |
 | --- | --- |
-| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "cancel" \| "status","outcome":<outcome>}}` |
+| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status","outcome":<outcome>}}` |
 | running | `{"running":{"op":"<op kind>"}}` |
 | unknown | `"unknown"` |
 
 ## RP-5: A call
 
 - A client numbers its calls and queries with `call`, any positive integer that is unique among the calls still open in this session; counting up from 1 is simplest. Every message the broker sends about a call carries the client's number.
-- An uploading operation (exec, script, write) sends `call`, then its bytes as chunks of at most 1,044,480 bytes, then `end` with the size and the SHA-256 of all of them. An exec without standard input still sends `end`, with size 0 and the SHA-256 of nothing, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- An uploading operation (exec, script, write, write_tree) sends `call`, then its bytes as chunks of at most 1,044,480 bytes, then `end` with the size and the SHA-256 of all of them. An exec without standard input still sends `end`, with size 0 and the SHA-256 of nothing, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
 - An upload may hold at most 256 MiB.
 - The broker checks the bytes against the `end` before it hands the call on. The `end` is the call's commit point in the relay agent: nothing runs before the bytes match it.
-- The answer to exec, script and read is its stream as chunks, then `end` with the size and the SHA-256 of the whole stream, then `result`. A client checks the stream against its `end`. write, cancel and status answer with `result` alone.
+- The answer to exec, script, read and read_tree is its stream as chunks, then `end` with the size and the SHA-256 of the whole stream, then `result`. A client checks the stream against its `end`. write, cancel and status answer with `result` alone.
 - `result` is always the last message about a call; the call number may be reused after it.
 - Calls run at the same time, and their messages interleave; the broker keeps each call's messages in order.
 - A `call` whose number is 0 or still open is answered `failed`, code `bad_request`, under that number. A `call` with an empty or over-long execution ID is refused the same way; its chunks and `end` are still taken and dropped.
@@ -164,8 +167,8 @@ broker ← {"result":{"call":1,"execution":"7d3c…","replayed":false,"outcome":
 - A `call` with a known execution ID never runs again. The answer has `"replayed": true` and is:
   - for a completed exec or script: its whole output from the first byte, its `end` and its recorded `result`;
   - for a running one: its output so far, then the rest as it comes, then its `end` and `result`;
-  - for a read: the recorded `end` and `result`, without the bytes, because read bytes are not kept; read again under a new execution ID to have them;
-  - for write, cancel and status: the recorded `result`.
+  - for a read or read_tree: the recorded `end` and `result`, without the bytes, because read bytes are not kept; read again under a new execution ID to have them;
+  - for write, write_tree, cancel and status: the recorded `result`.
 - The upload of a call with a known execution ID is still sent and is ignored.
 - `query` asks what is known of an execution ID without sending it again. The answer is the broker's record when it has one, else the relay agent's: `completed` with its outcome, `running`, or `unknown`. `unknown` means neither has a record: the operation never reached its commit point, or its records expired. A client that had sent the call reports such an operation as uncertain.
 - After a lost session, a client recovers each call it had in flight in a new session: it sends `query`, or it sends the same `call` with the same execution ID and upload again and takes the replayed answer. Both survive a broker restart, because the relay agent keeps its records.
@@ -194,6 +197,7 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | `call_in_use`, `superseded`, `end_mismatch`, `cancelled` | agent | false | the agent refused the call before its commit point |
 | `stopping`, `record_failed` | agent | false | the agent cannot run it now |
 | `not_found`, `is_directory`, `write_failed`, `read_failed` | agent | false before the end, true after | a file operation failed |
+| `not_a_directory`, `bad_archive`, `unsupported_entry` | agent | false | a folder operation was refused: the path is a file, the uploaded tar stream is not a folder of files and folders, or the folder to read holds a link or a device ([RP-13](#rp-13-folders)) |
 
 - A body that is not a relay message, or a chunk or `end` for a call that is not open, makes the broker close the session as a protocol error.
 
@@ -239,3 +243,23 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | session grace | 10 min by default (`grace_ms`) |
 | broker record retention | at least 1 h |
 | relay agent record retention | 24 h |
+
+## RP-13: Folders
+
+A folder travels as one tar stream, uploaded by write_tree and answered by read_tree like a file's bytes: in chunks of at most 1,044,480 bytes, checked by the size and SHA-256 of the whole stream in its `end`.
+
+- **The stream** is a POSIX tar archive (ustar headers; a long path in a GNU `L` entry or a PAX `x` header, as common tar libraries write them, such as npm `tar-stream` or Rust `tar`) of the folder's contents, not of the folder itself: entry paths are relative to the folder, such as `a.txt` and `nested/b.bin`, use `/`, and never start with `/` or hold a `..` component. A folder entry is optional when a file inside it names its path.
+- **Entries** are regular files (type `0`) and folders (type `5`) only. A file's mode bits are kept; owners and times may be sent and are not relied on. The archive ends with two 512-byte zero blocks.
+- **write_tree** resolves `path` against the home folder, as write does; when `path` is an existing folder, the folder lands inside it under `name`, as `scp -r` copies a folder into a folder, else it lands at `path`. The relay agent spools the stream to a hidden sibling of the destination, checks it against the `end`, and unpacks it into another hidden sibling: nothing is visible before the commit point. A stream that does not match its `end` is refused with `checksum_mismatch`, and one with an absolute path, a `..`, a link or a device with `bad_archive`, both with `"committed": false`. At the commit point the folder is put in place in one step: a rename, or, when a folder is there already, an atomic exchange with it (`renamex_np` with `RENAME_SWAP` on macOS, `renameat2` with `RENAME_EXCHANGE` on Linux), after which the old folder is removed. The folder is replaced whole, not merged: a reader sees the old folder or the new one. A destination that is a file is refused with `not_a_directory`. The `written` outcome carries the stream's size and SHA-256.
+- **read_tree** resolves `path` against the home folder and answers its tar stream, in the same form. A file is refused with `not_a_directory`, a missing path with `not_found`, and a folder that holds a symbolic link, a device or a socket with `unsupported_entry`, before any byte is sent. The `read` outcome carries the stream's size and SHA-256.
+- The largest upload, 256 MiB, bounds a write_tree's stream; a read_tree's stream has no bound.
+- A client that holds a read_tree's stream unpacks it into a hidden sibling of its own destination and puts it in place the same way. machine-service's `pull` does so, and its `push` of a folder sends write_tree: neither uses SSH on a `relay` lease. When `pull` finds that the guest path is a folder (a read answered `is_directory`), its read_tree takes the execution ID `tree:<SHA-256 of the read's ID>`, so a repeated request derives the same one.
+
+Example: a folder of one file, `a.txt` holding `hi`.
+
+```text
+client → {"call":{"call":5,"execution":"9a1f…","op":{"write_tree":{"path":"work","name":"site"}}}}
+client → 0x01 00 00 00 00 00 00 00 05 <2,048 bytes: a 512-byte header for "a.txt", 512 bytes of data, two zero blocks>
+client → {"end":{"call":5,"execution":"9a1f…","size":2048,"sha256":"<SHA-256 of the 2,048 bytes>"}}
+broker ← {"result":{"call":5,"execution":"9a1f…","replayed":false,"outcome":{"written":{"size":2048,"sha256":"…"}}}}
+```

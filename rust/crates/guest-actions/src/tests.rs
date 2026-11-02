@@ -248,3 +248,130 @@ fn dc139_ownership_names_a_scope_per_command_or_says_why_not() {
         );
     }
 }
+
+// ------------------------------------------------------------------ trees
+
+fn tree_stream(source: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let digest = read_tree(source, 7, |piece| {
+        assert!(piece.len() <= 7);
+        bytes.extend_from_slice(piece);
+        true
+    })
+    .unwrap();
+    assert_eq!(digest.size, bytes.len() as u64);
+    assert_eq!(digest.sha256, sha256_hex(&bytes));
+    bytes
+}
+
+#[test]
+fn a_folder_round_trips_through_its_tar_stream_and_lands_whole() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("source");
+    std::fs::create_dir_all(source.join("nested")).unwrap();
+    std::fs::write(source.join("a.txt"), "alpha").unwrap();
+    std::fs::write(source.join("nested/b.bin"), [0u8, 1, 2]).unwrap();
+    let bytes = tree_stream(&source);
+
+    // Into an existing folder, under the given name, as `scp -r` does.
+    std::fs::create_dir(home.path().join("into")).unwrap();
+    let mut tree = AtomicTree::create("into", "copy", home.path(), "t", 1).unwrap();
+    assert_eq!(tree.destination(), home.path().join("into/copy"));
+    tree.append(&bytes).unwrap();
+    let sealed = tree.seal(bytes.len() as u64, &sha256_hex(&bytes)).unwrap();
+    assert!(
+        !home.path().join("into/copy").exists(),
+        "nothing is visible before the placement"
+    );
+    sealed.place().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("into/copy/a.txt")).unwrap(),
+        "alpha"
+    );
+
+    // Over an existing folder: replaced whole, nothing left beside it.
+    std::fs::write(home.path().join("into/copy/stale"), "old").unwrap();
+    let mut tree = AtomicTree::create("into/copy", "", home.path(), "t", 2);
+    assert!(tree.is_err(), "a folder destination needs a name");
+    tree = AtomicTree::create("~/into", "copy", home.path(), "t", 2);
+    let mut tree = tree.unwrap();
+    tree.append(&bytes).unwrap();
+    tree.seal(bytes.len() as u64, &sha256_hex(&bytes))
+        .unwrap()
+        .place()
+        .unwrap();
+    assert!(!home.path().join("into/copy/stale").exists());
+    let left: Vec<_> = std::fs::read_dir(home.path().join("into"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["copy"], "no temporary is left");
+}
+
+#[test]
+fn a_folder_write_that_fails_its_check_leaves_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("f"), "x").unwrap();
+    let bytes = tree_stream(&source);
+    let mut tree = AtomicTree::create("dest", "", home.path(), "t", 1).unwrap();
+    tree.append(&bytes).unwrap();
+    let error = tree
+        .seal(bytes.len() as u64, &sha256_hex(b"other"))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "checksum_mismatch");
+    let mut tree = AtomicTree::create("dest", "", home.path(), "t", 2).unwrap();
+    tree.append(b"not a tar stream at all, but long enough to be read")
+        .unwrap();
+    let garbage = b"not a tar stream at all, but long enough to be read";
+    let sealed = tree.seal(garbage.len() as u64, &sha256_hex(garbage));
+    assert!(sealed.is_err());
+    let names: Vec<_> = std::fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["source"]);
+    std::fs::write(home.path().join("file"), "x").unwrap();
+    assert_eq!(
+        AtomicTree::create("file", "", home.path(), "t", 3)
+            .err()
+            .unwrap()
+            .code,
+        "not_a_directory"
+    );
+}
+
+#[test]
+fn a_folder_read_refuses_files_missing_paths_and_links_before_any_byte() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("file"), "x").unwrap();
+    let mut sent = 0;
+    let mut count = |_: &[u8]| {
+        sent += 1;
+        true
+    };
+    assert_eq!(
+        read_tree(&home.path().join("file"), 64, &mut count)
+            .err()
+            .unwrap()
+            .code,
+        "not_a_directory"
+    );
+    assert_eq!(
+        read_tree(&home.path().join("none"), 64, &mut count)
+            .err()
+            .unwrap()
+            .code,
+        "not_found"
+    );
+    let linked = home.path().join("linked");
+    std::fs::create_dir(&linked).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", linked.join("link")).unwrap();
+    assert_eq!(
+        read_tree(&linked, 64, &mut count).err().unwrap().code,
+        "unsupported_entry"
+    );
+    assert_eq!(sent, 0);
+}

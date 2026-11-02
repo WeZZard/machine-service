@@ -511,3 +511,60 @@ fn an_in_process_run_times_out_without_losing_the_outcome() {
     assert_eq!(answer.bytes, b"ok\n");
     assert!(answer.replayed);
 }
+
+/// RP-13: a client moves a folder both ways as a tar stream; a repeated
+/// folder read answers its end without the bytes, like a read.
+#[test]
+fn folders_round_trip_as_tar_streams() {
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    std::fs::create_dir_all(source.join("n")).unwrap();
+    let big: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i * 3 % 251) as u8).collect();
+    std::fs::write(source.join("n/big.bin"), &big).unwrap();
+    let stream = byte_transfer::pack_into(&source, Vec::new()).unwrap();
+    client.call(
+        1,
+        "tw",
+        Op::WriteTree {
+            path: "landed".into(),
+            name: String::new(),
+        },
+        &stream,
+    );
+    match client.wait(1, WAIT).result.unwrap().outcome {
+        Outcome::Written(digest) => assert_eq!(digest.size, stream.len() as u64),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(agent.home.join("landed/n/big.bin")).unwrap(),
+        big
+    );
+    for (call, replayed) in [(2, false), (3, true)] {
+        client.call(
+            call,
+            "tr",
+            Op::ReadTree {
+                path: "landed".into(),
+            },
+            b"",
+        );
+        let read = client.wait(call, WAIT);
+        assert_eq!(read.result.as_ref().unwrap().replayed, replayed);
+        if replayed {
+            assert!(read.bytes.is_empty() && read.end.is_some());
+        } else {
+            assert!(read.end_matches());
+            let archive = scratch.path().join("back.tar");
+            std::fs::write(&archive, &read.bytes).unwrap();
+            byte_transfer::unpack(&archive, &scratch.path().join("back")).unwrap();
+            assert_eq!(
+                std::fs::read(scratch.path().join("back/n/big.bin")).unwrap(),
+                big
+            );
+        }
+    }
+}

@@ -496,3 +496,232 @@ pub fn read_chunks(
         }
     }
 }
+
+// --------------------------------------------------------------------- trees
+
+/// A folder being written: its tar stream is spooled to a hidden sibling
+/// of its destination, then checked, unpacked into another hidden sibling,
+/// and only then put in place. Dropping it removes what it made.
+pub struct AtomicTree {
+    spool: PathBuf,
+    staged: PathBuf,
+    destination: PathBuf,
+    file: Option<File>,
+    tally: Tally,
+}
+
+/// A written folder whose stream matched and unpacked, waiting to be put
+/// in place. Dropping it removes the unpacked folder.
+pub struct SealedTree {
+    staged: PathBuf,
+    destination: PathBuf,
+    digest: Digest256,
+    placed: bool,
+}
+
+impl AtomicTree {
+    /// Open a folder write to `path`, resolved against `home`. When `path`
+    /// is an existing folder, the folder goes into it under `name`, as
+    /// `scp -r` copies a folder into a folder.
+    pub fn create(
+        path: &str,
+        name: &str,
+        home: &Path,
+        tag: &str,
+        unique: u64,
+    ) -> Result<AtomicTree, ActionError> {
+        let destination = byte_transfer::tree_destination(&resolve(path, home), name)
+            .map_err(|message| ActionError::new("invalid_request", message))?;
+        let parent = destination
+            .parent()
+            .filter(|parent| parent.is_dir())
+            .ok_or_else(|| {
+                ActionError::new(
+                    "not_found",
+                    format!("no such directory for {}", destination.display()),
+                )
+            })?;
+        let file_name = destination
+            .file_name()
+            .ok_or_else(|| ActionError::new("invalid_request", "destination has no name"))?
+            .to_string_lossy()
+            .into_owned();
+        if destination.exists() && !destination.is_dir() {
+            return Err(ActionError::new(
+                "not_a_directory",
+                format!("{} exists and is not a folder", destination.display()),
+            ));
+        }
+        let stem = format!(".{file_name}.{tag}-{}-{unique}", std::process::id());
+        let spool = parent.join(format!("{stem}.tar.tmp"));
+        let file = File::create(&spool)
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        Ok(AtomicTree {
+            spool,
+            staged: parent.join(format!("{stem}.tree.tmp")),
+            destination,
+            file: Some(file),
+            tally: Tally::default(),
+        })
+    }
+
+    /// The path the folder will be put at.
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Append bytes of the tar stream.
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), ActionError> {
+        let file = self.file.as_mut().expect("an open spool");
+        file.write_all(bytes)
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        self.tally.update(bytes);
+        Ok(())
+    }
+
+    /// Check the stream against the declared size and SHA-256, and unpack
+    /// it beside the destination. A stream that names a path outside the
+    /// folder, a link or a device is refused whole (`bad_archive`).
+    pub fn seal(mut self, size: u64, sha256: &str) -> Result<SealedTree, ActionError> {
+        let digest = std::mem::take(&mut self.tally).finish();
+        drop(self.file.take());
+        if digest.size != size || digest.sha256 != sha256 {
+            return Err(ActionError::new(
+                "checksum_mismatch",
+                "the folder's stream does not match its end",
+            ));
+        }
+        byte_transfer::unpack(&self.spool, &self.staged)
+            .map_err(|message| ActionError::new("bad_archive", message))?;
+        let _ = std::fs::remove_file(&self.spool);
+        Ok(SealedTree {
+            staged: std::mem::take(&mut self.staged),
+            destination: std::mem::take(&mut self.destination),
+            digest,
+            placed: false,
+        })
+    }
+}
+
+impl Drop for AtomicTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.spool);
+        if !self.staged.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.staged);
+        }
+    }
+}
+
+impl SealedTree {
+    /// The size and SHA-256 of the folder's tar stream.
+    pub fn digest(&self) -> &Digest256 {
+        &self.digest
+    }
+
+    /// Put the folder in place: a rename, or an atomic exchange with the
+    /// folder already there, which is then removed. The write's one visible
+    /// effect.
+    pub fn place(mut self) -> Result<Digest256, ActionError> {
+        byte_transfer::place_tree(&self.staged, &self.destination)
+            .map_err(|error| ActionError::new("write_failed", error.to_string()))?;
+        self.placed = true;
+        Ok(self.digest.clone())
+    }
+}
+
+impl Drop for SealedTree {
+    fn drop(&mut self) {
+        if !self.placed {
+            let _ = std::fs::remove_dir_all(&self.staged);
+        }
+    }
+}
+
+/// Send the tar stream of the folder at `path` in pieces of at most `chunk`
+/// bytes, and return the size and SHA-256 of the stream. A file is
+/// answered by `not_a_directory`, a missing path by `not_found`, and a
+/// folder that holds anything but files and folders by
+/// `unsupported_entry`, before any byte is sent. `send` returning false
+/// stops the read with `stopped`.
+pub fn read_tree(
+    path: &Path,
+    chunk: usize,
+    send: impl FnMut(&[u8]) -> bool,
+) -> Result<Digest256, ActionError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(ActionError::new(
+                "not_a_directory",
+                format!("{} is not a folder", path.display()),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ActionError::new(
+                "not_found",
+                format!("no such folder {}", path.display()),
+            ))
+        }
+        Err(error) => return Err(ActionError::new("read_failed", error.to_string())),
+    }
+    let writer = ChunkWriter {
+        buffer: Vec::with_capacity(chunk),
+        chunk,
+        tally: Tally::default(),
+        send,
+        stopped: false,
+    };
+    let mut writer = byte_transfer::pack_into(path, writer).map_err(|message| {
+        if message.contains("not a file or a folder") {
+            ActionError::new("unsupported_entry", message)
+        } else {
+            ActionError::new("read_failed", message)
+        }
+    })?;
+    writer
+        .flush_chunk()
+        .map_err(|_| ActionError::new("stopped", "the read was stopped"))?;
+    Ok(writer.tally.finish())
+}
+
+/// A writer that hands on its bytes in pieces of `chunk` bytes.
+struct ChunkWriter<F: FnMut(&[u8]) -> bool> {
+    buffer: Vec<u8>,
+    chunk: usize,
+    tally: Tally,
+    send: F,
+    stopped: bool,
+}
+
+impl<F: FnMut(&[u8]) -> bool> ChunkWriter<F> {
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.stopped {
+            return Err(io::Error::other("stopped"));
+        }
+        if !self.buffer.is_empty() {
+            self.tally.update(&self.buffer);
+            if !(self.send)(&self.buffer) {
+                self.stopped = true;
+                return Err(io::Error::other("stopped"));
+            }
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+
+impl<F: FnMut(&[u8]) -> bool> Write for ChunkWriter<F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let room = self.chunk - self.buffer.len();
+        let taken = bytes.len().min(room);
+        self.buffer.extend_from_slice(&bytes[..taken]);
+        if self.buffer.len() == self.chunk {
+            self.flush_chunk()?;
+        }
+        Ok(taken)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
