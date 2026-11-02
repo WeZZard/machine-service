@@ -36,7 +36,7 @@
 
 ## RS-5: Grace period
 
-- machine-service keeps a disconnected session for its grace period, 10 minutes by default. A client may ask for a shorter grace for its own session in its hello's `attributes.grace_ms`, never a longer one (DC-1xx-ACC-4). Running operations continue and their results wait in the replay buffer.
+- machine-service keeps a disconnected session for its grace period, 10 minutes by default. A client may ask for a shorter grace for its own session in its hello's `attributes.grace_ms`, never a longer one (DC-186). Running operations continue and their results wait in the replay buffer.
 - When the grace period ends, machine-service drops the session and its buffer. Operations keep their lease semantics: a running command is not cancelled by the loss of a client. Their outcomes stay available to `query` by execution ID.
 - A client that resumes an expired session receives `expired` and starts a new session. It queries the execution IDs it had in flight.
 
