@@ -337,7 +337,14 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
             // `/tmp` is a link on macOS, and cua-driver refuses an output
             // path whose existing ancestor is not a folder; only the output
             // file is named, which every cua-driver release takes.
-            let png = format!("/private/tmp/acc-{prefix}screen.png").replace(' ', "-");
+            let tag: String = prefix
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+                .collect::<String>()
+                .split_whitespace()
+                .map(|word| format!("{word}-"))
+                .collect();
+            let png = format!("/private/tmp/acc-{tag}screen.png");
             let capture = client.exec(
                 &format!(
                     "rm -f {png}; cua-driver call get_desktop_state '{{\"screenshot_out_file\":\"{png}\"}}' && \
@@ -353,8 +360,7 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                     client.call(&new_id("read"), Op::Read { path: png.clone() }, b"", true)?;
                 if let Ok(answer) = client.wait(call, Duration::from_secs(600)) {
                     let _ = std::fs::write(
-                        ctx.run_dir
-                            .join(format!("{prefix}ac55-screen.png").replace(' ', "-")),
+                        ctx.run_dir.join(format!("{tag}ac55-screen.png")),
                         &answer.bytes,
                     );
                 }
