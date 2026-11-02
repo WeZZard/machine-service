@@ -303,7 +303,7 @@ A relay agent's records, and the command output that they keep for a replay, bel
 
 ## RP-15: Resumable streams
 
-Protocol 2 makes every stream resumable, so an upload or a read of any size survives any loss without a byte sent twice, and the broker holds about one window of a stream, never the stream (DC-1xx-UP-1). The commit point does not move: the relay agent checks the SHA-256 of the whole stream against its `end` and renames into place only then, so a stream is at most once and never visible half written.
+Protocol 2 makes every stream resumable, so an upload or a read of any size survives any loss without a byte sent twice, and the broker holds about one window of a stream, never the stream (DC-195). The commit point does not move: the relay agent checks the SHA-256 of the whole stream against its `end` and renames into place only then, so a stream is at most once and never visible half written.
 
 ### Uploads
 
