@@ -78,9 +78,10 @@ Each behaviour is tested on the lowest layer that contains everything the behavi
 - A client is told the broker's URL, `wss://broker.relay-rig.test:<port>/relay`, the chain's port to resolve the name to, and the CA bundle of the edge's authority. It resolves the name itself, so no system setting changes. The edge answers `421` to any other name and to an address, and the broker's own certificate never reaches the client.
 - The edge ends TLS under every profile, because AC-66 and AC-68 run under N0. Its idle close counts every byte in either direction, WebSocket pings included, and its message limit closes the WebSocket with code 1009; a message of exactly 1 MiB passes.
 - A reset is Toxiproxy's `reset_peer`: it sends a TCP RST to every connection dialled while it is armed, and cuts an open connection without a RST when it next carries data. A cut is the stage's: an open connection receives a TCP RST at once, on the side chosen. The edge turns a reset on one of its legs into a WebSocket close with code 1000 on the other, as an edge that ends TLS does. A blackhole drops data without closing anything, and closes the connection when it ends.
-- An address change closes every connection, and the broker sees each new connection come from a new source address and port on Linux, where the stage's back hop moves to the next address of `127.0.0.0/8`, which needs no root. On macOS, whose loopback has one address without root, only the source port changes. The rig records which in `rig.json` as `address_change`.
+- An address change closes every connection, and the broker sees each new connection come from a new source address and port on Linux, where the stage's back hop moves to the next address of `127.0.0.0/8`, which needs no root. On macOS, whose loopback has one address without root, only the source port changes. When the broker is on another machine, which a loopback source cannot reach, only the source port changes as well (DC-1xx-ACC-10). The rig records which in `rig.json` as `address_change`.
 - `NETWORK_RIG_SEED` replays a seed. Each run records its profile, seed and schedule in `rig.json`, and the cell runner writes each cell's results to `report.json` under `<evidence>/<cell>/<profile>/`. Toxiproxy's latency jitter is not seeded, so a replay repeats the faults but not each packet's delay.
-- The rig's self-tests are opt-in: `cargo test -p network-rig --test rig_live -- --ignored`. Until the broker exists, they and the cell runner drive a WebSocket echo server under TLS in place of the broker.
+- The rig's self-tests are opt-in: `cargo test -p network-rig --test rig_live -- --ignored`. They drive a WebSocket echo server under TLS in place of the broker.
+- A relay agent's chain runs on its target's host as `network-rig serve`, in front of the broker, and `network-rig ctl` sets its faults. Guests reach it on their host's address on the guest network (`MACHINE_SERVICE_RELAY_GUEST_PORT`), and its edge, which signs with the broker's authority that the agents trust, serves those addresses as well as its name (DC-1xx-ACC-2, DC-1xx-ACC-3).
 - CI runs the self-tests on every change on Ubuntu x86_64, Ubuntu arm64 and macOS arm64, the three platforms the rig pins, and caches the pinned tools by their versions and hashes (DC-138).
 
 ```mermaid
@@ -111,6 +112,13 @@ The profiles are JSON files in `rust/crates/network-rig/profiles/`.
 - AC-55 to AC-60, AC-66 and AC-68 run under every profile.
 - AC-61 to AC-65, AC-67 and AC-69 run under N1, N2 and N3.
 - AC-70 measures speed under N0 and N2.
+
+### Running the suite
+
+- The suite is the `relay-acceptance` crate: a Rust test client, the real target and the scenarios. `relay-acceptance run --cell <cell> --profile <N0..N3> --instance http://<name>:<port> [--image <image>] [--host-shell <command> --host-script <path>] --evidence <dir>` runs one cell under one profile on the machine of its client platform, and `relay-acceptance summary <dir>` prints the matrix. `cargo test -p relay-acceptance --test live -- --ignored` runs the same from `RELAY_ACCEPTANCE_*` variables.
+- On each target host, `scripts/relay-acceptance-host.sh` runs the second instance with the relay link (`start`, `stop`, `restart`, `clean`) and the agents' chain (`rig-start <profile> <seed>`, `rig-stop`, `rig-ctl <request>`), with everything in one folder. The suite runs it through `--host-shell`, which the operator gives, to start the chain with the cell's profile, to cut the agents' connections and to restart the broker.
+- An Ubuntu client cell runs in a leased ubuntu2404 VM: `scripts/relay-acceptance-ubuntu-client.sh` leases it, puts the static Linux build in it, runs the cell there and brings the evidence home.
+- Each scenario reports named checks. A check that waits for something not built yet or not in the images yet is `blocked`, with the reason, and is not a failure (DC-1xx-ACC-5).
 
 ### Coverage of the contract
 

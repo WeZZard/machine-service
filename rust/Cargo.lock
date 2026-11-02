@@ -940,6 +940,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-acceptance"
+version = "0.1.1"
+dependencies = [
+ "network-rig",
+ "rand",
+ "relay-agent",
+ "remote-session",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "relay-agent"
 version = "0.2.0-rc.3"
 dependencies = [

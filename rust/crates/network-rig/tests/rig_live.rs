@@ -749,7 +749,7 @@ fn the_cell_runner_runs_a_stand_in_cell() {
     };
     let evidence = tempfile::tempdir().unwrap();
     let scenarios = [
-        Scenario {
+        Scenario::<StandIn> {
             id: "echo",
             profiles: &["N0", "N1", "N2", "N3"],
             run: |context| {
@@ -757,7 +757,7 @@ fn the_cell_runner_runs_a_stand_in_cell() {
                 let mut session = Session::open(&dial, IO).map_err(|e| format!("{e:?}"))?;
                 match session.echo(b"cell") {
                     Outcome::Ok => Ok(()),
-                    other => Err(format!("{other:?}")),
+                    other => Err(format!("{other:?}").into()),
                 }
             },
         },

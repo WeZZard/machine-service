@@ -20,6 +20,7 @@ struct Entry<T> {
     principal: String,
     value: T,
     detached_since: Option<Instant>,
+    grace: Duration,
 }
 
 pub(crate) struct SessionTable<T> {
@@ -37,15 +38,29 @@ impl<T: Clone> SessionTable<T> {
         }
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, id: String, principal: String, value: T) {
+        let grace = self.grace;
+        self.insert_with_grace(id, principal, value, grace);
+    }
+
+    /// Insert a session whose own grace period is `grace`, at most the
+    /// table's.
+    pub fn insert_with_grace(&mut self, id: String, principal: String, value: T, grace: Duration) {
         self.live.insert(
             id,
             Entry {
                 principal,
                 value,
                 detached_since: None,
+                grace: grace.min(self.grace),
             },
         );
+    }
+
+    /// The grace period of a live session.
+    pub fn grace_of(&self, id: &str) -> Option<Duration> {
+        self.live.get(id).map(|e| e.grace)
     }
 
     /// Reattach a session. Expiry runs first, so a session past its grace
@@ -75,11 +90,10 @@ impl<T: Clone> SessionTable<T> {
     /// Drop every session detached for longer than the grace period, and
     /// return them so the caller can tell their owners.
     pub fn expire_due(&mut self, now: Instant) -> Vec<T> {
-        let grace = self.grace;
         let due: Vec<String> = self
             .live
             .iter()
-            .filter(|(_, e)| e.detached_since.is_some_and(|t| now >= t + grace))
+            .filter(|(_, e)| e.detached_since.is_some_and(|t| now >= t + e.grace))
             .map(|(id, _)| id.clone())
             .collect();
         self.tombstones
@@ -125,5 +139,19 @@ mod tests {
             t.resume("other", "p"),
             Resolve::Gone(ExpiryReason::Unknown)
         ));
+    }
+
+    #[test]
+    fn a_session_may_have_a_shorter_grace_but_never_a_longer_one() {
+        let t0 = Instant::now();
+        let mut t = SessionTable::new(Duration::from_secs(10));
+        t.insert_with_grace("short".into(), "p".into(), 1, Duration::from_secs(2));
+        t.insert_with_grace("long".into(), "p".into(), 2, Duration::from_secs(60));
+        assert_eq!(t.grace_of("short"), Some(Duration::from_secs(2)));
+        assert_eq!(t.grace_of("long"), Some(Duration::from_secs(10)));
+        t.detach("short", t0);
+        t.detach("long", t0);
+        assert_eq!(t.expire_due(t0 + Duration::from_secs(3)), vec![1]);
+        assert_eq!(t.expire_due(t0 + Duration::from_secs(10)), vec![2]);
     }
 }

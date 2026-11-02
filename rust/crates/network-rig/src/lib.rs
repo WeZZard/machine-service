@@ -30,7 +30,9 @@ pub mod tools;
 pub mod toxiproxy;
 
 pub use profile::{EdgeRules, Profile, Stream, Toxic, ToxicKind};
-pub use rig::{ClientSide, Control, Note, Phase, Rig, RigConfig, DEFAULT_BROKER_NAME};
+pub use rig::{
+    ClientSide, Control, EdgeAuthority, Note, Phase, Rig, RigConfig, DEFAULT_BROKER_NAME,
+};
 pub use schedule::{Event, Fault, Schedule};
 pub use stage::{AddressChange, Connection, Select, Side};
 

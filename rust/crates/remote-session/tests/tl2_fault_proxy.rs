@@ -329,6 +329,33 @@ fn resuming_after_the_grace_period_answers_expired() {
 }
 
 #[test]
+fn a_client_may_ask_for_a_shorter_grace_period() {
+    let cert = Cert::localhost();
+    let timing = Timing {
+        heartbeat: Duration::from_millis(500),
+        dead_after: Duration::from_secs(6),
+        ..fast_timing()
+    };
+    // The server keeps a detached session for a minute, and this client asks
+    // for 1 s; a longer ask would be cut to the server's minute.
+    let server = Server::start(&cert, timing.clone(), Duration::from_secs(60));
+    let proxy = FaultProxy::start(server.addr(), Mode::Tcp);
+    let mut config = client(proxy.url("wss"), &cert, timing);
+    config.attributes = serde_json::json!({"role": "client", "grace_ms": 1000});
+    let session = connect(config).unwrap();
+    let _remote = server.accept();
+
+    proxy.set_refuse(true);
+    proxy.reset();
+    std::thread::sleep(Duration::from_millis(1600));
+    proxy.set_refuse(false);
+    assert_eq!(
+        session.wait_ended(Duration::from_secs(10)),
+        Some(SessionEnd::Expired(ExpiryReason::Expired))
+    );
+}
+
+#[test]
 fn an_unreachable_server_ends_the_session_after_the_grace_period() {
     let cert = Cert::localhost();
     let timing = Timing {

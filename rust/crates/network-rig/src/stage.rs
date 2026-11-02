@@ -128,9 +128,31 @@ impl Stage {
         broker: SocketAddr,
         pairs: &Path,
     ) -> Result<Stage, RigError> {
-        let source = Arc::new(SourceAddress::detect());
-        let back = Hop::start_with(broker, Some(source.clone()), false)?;
-        let front = Hop::start_with(edge_side, None, true)?;
+        Stage::start_on(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            edge_side,
+            broker,
+            pairs,
+        )
+    }
+
+    /// [`Stage::start`] with the front hop, the chain's one port, listening
+    /// on `listen`: a relay agent's chain on a VM host listens where the
+    /// host's guests reach it.
+    pub fn start_on(
+        listen: SocketAddr,
+        edge_side: SocketAddr,
+        broker: SocketAddr,
+        pairs: &Path,
+    ) -> Result<Stage, RigError> {
+        let source = Arc::new(SourceAddress::detect(broker));
+        let back = Hop::start_with(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            broker,
+            Some(source.clone()),
+            false,
+        )?;
+        let front = Hop::start_with(listen, edge_side, None, true)?;
         Ok(Stage {
             front,
             back,
@@ -273,11 +295,13 @@ struct SourceAddress {
 }
 
 impl SourceAddress {
-    /// Rotate through loopback addresses when this machine has a second one
-    /// that a process can bind without root.
-    fn detect() -> SourceAddress {
+    /// Rotate through loopback addresses when the broker is on loopback and
+    /// this machine has a second loopback address that a process can bind
+    /// without root. A loopback source cannot reach a broker on another
+    /// machine, which then sees a new source port only.
+    fn detect(broker: SocketAddr) -> SourceAddress {
         SourceAddress {
-            rotates: TcpListener::bind((loopback(1), 0)).is_ok(),
+            rotates: broker.ip().is_loopback() && TcpListener::bind((loopback(1), 0)).is_ok(),
             epoch: AtomicU32::new(0),
         }
     }
@@ -360,16 +384,22 @@ struct Order {
 impl Hop {
     /// A hop on a free loopback port that forwards to `upstream`.
     pub fn start(upstream: SocketAddr) -> Result<Hop, RigError> {
-        Hop::start_with(upstream, None, false)
+        Hop::start_with(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            upstream,
+            None,
+            false,
+        )
     }
 
     fn start_with(
+        listen: SocketAddr,
         upstream: SocketAddr,
         source: Option<Arc<SourceAddress>>,
         read_hello: bool,
     ) -> Result<Hop, RigError> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .map_err(RigError::io("bind the reset stage"))?;
+        let listener = TcpListener::bind(listen)
+            .map_err(RigError::io(format!("bind the reset stage on {listen}")))?;
         let addr = listener
             .local_addr()
             .map_err(RigError::io("read the reset stage's address"))?;
@@ -917,5 +947,10 @@ mod tests {
             epoch: AtomicU32::new(3),
         };
         assert_eq!(fixed.current(), None);
+        let remote = SourceAddress::detect("192.0.2.1:6241".parse().unwrap());
+        assert!(
+            !remote.rotates,
+            "a loopback source cannot reach another machine"
+        );
     }
 }

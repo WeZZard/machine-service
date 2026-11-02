@@ -45,6 +45,10 @@ pub const RELAY_URL_VARIABLE: &str = "MACHINE_SERVICE_RELAY_URL";
 /// The broker URL written into a guest's relay agent configuration, instead
 /// of the host's address on the guest's network.
 pub const GUEST_URL_VARIABLE: &str = "MACHINE_SERVICE_RELAY_GUEST_URL";
+/// The port of the broker URL written into a guest, on the host's address on
+/// the guest's network, instead of the session port: a test rig's chain in
+/// front of the broker listens there (TL-7).
+pub const GUEST_PORT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_GUEST_PORT";
 /// Seconds a new clone's relay agent gets to register (RA-8).
 pub const REGISTER_TIMEOUT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT";
 /// Seconds a call waits for a relay agent that has no session (RP-8).
@@ -76,6 +80,9 @@ pub struct RelaySettings {
     pub relay_url: String,
     /// The URL guests are given, when not derived from the guest's network.
     pub guest_url: Option<String>,
+    /// The port of the URL derived from the guest's network, when not the
+    /// session port.
+    pub guest_port: Option<u16>,
     /// How long a new clone's relay agent gets to register.
     pub register_timeout: Duration,
     /// How long a call waits for a relay agent without a session.
@@ -118,6 +125,7 @@ pub fn default_relay_url(port: u16) -> String {
 impl RelaySettings {
     /// Read the settings: `MACHINE_SERVICE_SESSION_PORT` (6241),
     /// `MACHINE_SERVICE_RELAY_URL`, `MACHINE_SERVICE_RELAY_GUEST_URL`,
+    /// `MACHINE_SERVICE_RELAY_GUEST_PORT`,
     /// `MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT` (120 s) and
     /// `MACHINE_SERVICE_RELAY_AGENT_WAIT` (600 s).
     pub fn from_environment() -> Result<RelaySettings, String> {
@@ -132,10 +140,22 @@ impl RelaySettings {
             }
             _ => None,
         };
+        let guest_port = match std::env::var(GUEST_PORT_VARIABLE) {
+            Ok(value) if !value.trim().is_empty() => Some(
+                value
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or_else(|| format!("{GUEST_PORT_VARIABLE}={value:?} is not a port"))?,
+            ),
+            _ => None,
+        };
         Ok(RelaySettings {
             session_port,
             relay_url,
             guest_url,
+            guest_port,
             register_timeout: seconds(REGISTER_TIMEOUT_VARIABLE, 120)?,
             agent_wait: seconds(AGENT_WAIT_VARIABLE, 600)?,
         })
@@ -511,18 +531,26 @@ echo "relay-start: state = $(systemctl --user is-active {SYSTEMD_UNIT})"
 /// Where a guest reaches the broker: the override, else the host's address
 /// on the guest's network (BK-5).
 fn guest_url(settings: &RelaySettings, guest_ip: &str) -> Result<String, String> {
+    guest_url_toward(settings, guest_ip, relay_broker::net::address_toward)
+}
+
+fn guest_url_toward(
+    settings: &RelaySettings,
+    guest_ip: &str,
+    address_toward: impl Fn(Ipv4Addr) -> Option<Ipv4Addr>,
+) -> Result<String, String> {
     if let Some(url) = &settings.guest_url {
         return Ok(url.clone());
     }
     let ip: Ipv4Addr = guest_ip
         .parse()
         .map_err(|_| format!("the guest's address {guest_ip} is not IPv4"))?;
-    let host = relay_broker::net::address_toward(ip).ok_or_else(|| {
+    let host = address_toward(ip).ok_or_else(|| {
         format!("this host has no address on the subnet of the guest's {guest_ip}")
     })?;
     Ok(format!(
         "wss://{host}:{}{}",
-        settings.session_port,
+        settings.guest_port.unwrap_or(settings.session_port),
         remote_session::RELAY_PATH
     ))
 }
@@ -1381,6 +1409,7 @@ mod tests {
             session_port: 6241,
             relay_url: "wss://h:6241/relay".into(),
             guest_url: Some("wss://o:1/relay".into()),
+            guest_port: None,
             register_timeout: Duration::from_secs(1),
             agent_wait: Duration::from_secs(1),
         };
@@ -1393,6 +1422,17 @@ mod tests {
         assert!(guest_url(&settings, "198.51.100.7").is_err());
         assert!(guest_url(&settings, "not-an-address").is_err());
         assert!(default_relay_url(6241).ends_with(":6241/relay"));
+        let host = |_| Some(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(
+            guest_url_toward(&settings, "198.51.100.7", host).unwrap(),
+            "wss://198.51.100.1:6241/relay"
+        );
+        // A test rig's chain in front of the broker takes the guests' port.
+        settings.guest_port = Some(6244);
+        assert_eq!(
+            guest_url_toward(&settings, "198.51.100.7", host).unwrap(),
+            "wss://198.51.100.1:6244/relay"
+        );
     }
 
     #[test]

@@ -69,6 +69,28 @@ pub struct RigConfig {
     pub run_dir: PathBuf,
     /// A test-only idle close in seconds, in place of the profile's.
     pub idle_close_s: Option<u64>,
+    /// Where the chain's one port listens: a free loopback port unless set.
+    /// A relay agent's chain on a VM host listens where its guests reach it.
+    pub listen: SocketAddr,
+    /// The authority the edge signs its certificates with, instead of one
+    /// made for the run: the authority a client already trusts, such as the
+    /// broker's own for a relay agent that trusts only that one.
+    pub edge_authority: Option<EdgeAuthority>,
+    /// Addresses a client may dial in place of the broker's name, which the
+    /// edge's certificate names beside it: a relay agent dials its host's
+    /// address on the guest network (BK-5).
+    pub edge_addresses: Vec<String>,
+}
+
+/// A certificate authority given to the edge, PEM.
+#[derive(Debug, Clone)]
+pub struct EdgeAuthority {
+    /// The common name of the authority's certificate.
+    pub common_name: String,
+    /// The authority's private key.
+    pub key_pem: String,
+    /// The authority's certificate.
+    pub cert_pem: String,
 }
 
 impl RigConfig {
@@ -89,6 +111,9 @@ impl RigConfig {
             horizon_ms: DEFAULT_HORIZON_MS,
             run_dir: run_dir.into(),
             idle_close_s: None,
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            edge_authority: None,
+            edge_addresses: Vec::new(),
         }
     }
 }
@@ -285,7 +310,8 @@ struct Player {
 pub struct Rig {
     // Fields drop in order: the player stops before the processes do.
     player: Option<Player>,
-    mitmdump: Child,
+    mitmdump: Option<Child>,
+    edge: Edge,
     toxiproxy: Child,
     control: Control,
     client: ClientSide,
@@ -313,10 +339,18 @@ impl Rig {
             fs::write(path, text).map_err(RigError::io(format!("write {}", path.display())))
         };
 
-        let edge_ca = Authority::new("network-rig edge authority")?;
-        write(&mitm_dir.join("mitmproxy-ca.pem"), &edge_ca.mitmproxy_pem())?;
+        let authority = match &config.edge_authority {
+            Some(given) => {
+                Authority::from_parts(&given.common_name, &given.key_pem, &given.cert_pem)?
+            }
+            None => Authority::new("network-rig edge authority")?,
+        };
+        write(
+            &mitm_dir.join("mitmproxy-ca.pem"),
+            &authority.mitmproxy_pem(),
+        )?;
         let client_bundle = run_dir.join("client-ca.pem");
-        write(&client_bundle, edge_ca.cert_pem())?;
+        write(&client_bundle, authority.cert_pem())?;
         let broker_ca = run_dir.join("broker-ca.pem");
         write(&broker_ca, &config.upstream_ca_pem)?;
         let edge_script = run_dir.join("edge.py");
@@ -329,7 +363,12 @@ impl Rig {
         let mitm_addr = loopback(process::free_port()?);
         let toxiproxy_addr = loopback(process::free_port()?);
         let pairs = run_dir.join("edge-pairs.jsonl");
-        let stage = Arc::new(Stage::start(toxiproxy_addr, config.upstream, &pairs)?);
+        let stage = Arc::new(Stage::start_on(
+            config.listen,
+            toxiproxy_addr,
+            config.upstream,
+            &pairs,
+        )?);
         let broker_side = stage.broker_side();
 
         let mut command = Command::new(&toxiproxy_bin);
@@ -340,44 +379,26 @@ impl Rig {
         let api = Api::new(api_addr);
         toxiproxy.wait_until(READY, || api.version().is_ok())?;
 
-        let edge = config.profile.edge;
-        let idle = config.idle_close_s.unwrap_or(edge.idle_close_s);
+        let edge_rules = config.profile.edge;
+        let idle = config.idle_close_s.unwrap_or(edge_rules.idle_close_s);
         let name = config.broker_name.to_ascii_lowercase();
-        let mut command = Command::new(&mitmdump_bin);
-        command
-            .arg("--mode")
-            .arg(format!(
-                "reverse:https://{name}:{}@{}",
-                broker_side.port(),
-                mitm_addr.port()
-            ))
-            .args(["--listen-host", "127.0.0.1"])
-            .arg("--scripts")
-            .arg(&edge_script)
-            .arg("--set")
-            .arg(format!("confdir={}", mitm_dir.display()))
-            .arg("--set")
-            .arg(format!(
-                "ssl_verify_upstream_trusted_ca={}",
-                broker_ca.display()
-            ))
-            .args(["--set", "connection_strategy=lazy"])
-            .args(["--set", "keep_host_header=true"])
-            .args(["--set", "upstream_cert=false"])
-            .args(["--set", "flow_detail=1"])
-            .arg("--set")
-            .arg(format!("edge_routes={name}={broker_side}"))
-            .arg("--set")
-            .arg(format!("edge_pairs_file={}", pairs.display()))
-            .arg("--set")
-            .arg(format!("edge_idle_close_s={idle}"))
-            .arg("--set")
-            .arg(format!("edge_max_message_bytes={}", edge.max_message_bytes))
-            .env_remove("SSL_CERT_FILE")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("HTTP_PROXY");
-        let mut mitmdump = Child::spawn("mitmdump", command, &run_dir)?;
-        mitmdump.wait_until(READY, || process::accepts(mitm_addr))?;
+        let mut edge = Edge {
+            bin: mitmdump_bin,
+            name: name.clone(),
+            broker_side,
+            listen: mitm_addr,
+            script: edge_script,
+            mitm_dir,
+            broker_ca,
+            pairs,
+            idle_close_s: idle,
+            max_message_bytes: edge_rules.max_message_bytes,
+            authority,
+            run_dir: run_dir.clone(),
+            launches: 0,
+            addresses: Vec::new(),
+        };
+        let mitmdump = edge.launch(&config.edge_addresses)?;
 
         api.create_proxy(PROXY, toxiproxy_addr, mitm_addr)?;
         for toxic in &config.profile.toxics {
@@ -399,6 +420,8 @@ impl Rig {
         let record = json!({
             "profile": config.profile,
             "seed": config.seed,
+            "listen": config.listen.to_string(),
+            "edge_addresses": config.edge_addresses,
             "idle_close_s": idle,
             "broker_name": name,
             "toxiproxy": tools::TOXIPROXY_VERSION,
@@ -410,7 +433,8 @@ impl Rig {
 
         Ok(Rig {
             player: None,
-            mitmdump,
+            mitmdump: Some(mitmdump),
+            edge,
             toxiproxy,
             control: Control { api, stage },
             client,
@@ -446,8 +470,25 @@ impl Rig {
     }
 
     /// The log files of the chain's processes.
-    pub fn logs(&self) -> [&Path; 2] {
-        [self.toxiproxy.log(), self.mitmdump.log()]
+    pub fn logs(&self) -> Vec<&Path> {
+        std::iter::once(self.toxiproxy.log())
+            .chain(self.mitmdump.as_ref().map(Child::log))
+            .collect()
+    }
+
+    /// The addresses the edge serves in place of the name.
+    pub fn edge_addresses(&self) -> &[String] {
+        &self.edge.addresses
+    }
+
+    /// Serve `addresses` in place of the name from now on: the edge starts
+    /// again with a certificate that names them, which closes the
+    /// connections through it, as an edge that is redeployed does.
+    pub fn set_edge_addresses(&mut self, addresses: &[String]) -> Result<(), RigError> {
+        // The old edge holds the port; it stops before the new one starts.
+        self.mitmdump = None;
+        self.mitmdump = Some(self.edge.launch(addresses)?);
+        Ok(())
     }
 
     /// Play the schedule from now, on its own thread. Each fault is applied at
@@ -470,6 +511,90 @@ impl Rig {
             let _ = player.stop.send(());
             let _ = player.thread.join();
         }
+    }
+}
+
+/// How the edge is started, so that it can start again.
+#[derive(Debug)]
+struct Edge {
+    bin: PathBuf,
+    name: String,
+    broker_side: SocketAddr,
+    listen: SocketAddr,
+    script: PathBuf,
+    mitm_dir: PathBuf,
+    broker_ca: PathBuf,
+    pairs: PathBuf,
+    idle_close_s: u64,
+    max_message_bytes: u64,
+    authority: Authority,
+    run_dir: PathBuf,
+    launches: u32,
+    addresses: Vec<String>,
+}
+
+impl Edge {
+    /// Start mitmdump with the edge script. With `addresses`, the edge
+    /// presents one certificate of its authority for the name and them.
+    fn launch(&mut self, addresses: &[String]) -> Result<Child, RigError> {
+        let name = &self.name;
+        let mut command = Command::new(&self.bin);
+        command
+            .arg("--mode")
+            .arg(format!(
+                "reverse:https://{name}:{}@{}",
+                self.broker_side.port(),
+                self.listen.port()
+            ))
+            .args(["--listen-host", "127.0.0.1"])
+            .arg("--scripts")
+            .arg(&self.script)
+            .arg("--set")
+            .arg(format!("confdir={}", self.mitm_dir.display()))
+            .arg("--set")
+            .arg(format!(
+                "ssl_verify_upstream_trusted_ca={}",
+                self.broker_ca.display()
+            ))
+            .args(["--set", "connection_strategy=lazy"])
+            .args(["--set", "keep_host_header=true"])
+            .args(["--set", "upstream_cert=false"])
+            .args(["--set", "flow_detail=1"])
+            .arg("--set")
+            .arg(format!("edge_routes={name}={}", self.broker_side))
+            .arg("--set")
+            .arg(format!("edge_pairs_file={}", self.pairs.display()))
+            .arg("--set")
+            .arg(format!("edge_idle_close_s={}", self.idle_close_s))
+            .arg("--set")
+            .arg(format!("edge_max_message_bytes={}", self.max_message_bytes))
+            .env_remove("SSL_CERT_FILE")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("HTTP_PROXY");
+        if !addresses.is_empty() {
+            let mut names = vec![name.as_str()];
+            names.extend(addresses.iter().map(String::as_str));
+            let leaf = self.authority.issue(&names)?;
+            let path = self.mitm_dir.join("edge-cert.pem");
+            fs::write(&path, format!("{}{}", leaf.key_pem, leaf.cert_pem))
+                .map_err(RigError::io(format!("write {}", path.display())))?;
+            command
+                .arg("--set")
+                .arg(format!("certs=*={}", path.display()))
+                .arg("--set")
+                .arg(format!("edge_addresses={}", addresses.join(",")));
+        }
+        self.launches += 1;
+        let log = if self.launches == 1 {
+            "mitmdump".to_string()
+        } else {
+            format!("mitmdump-{}", self.launches)
+        };
+        let mut child = Child::spawn(&log, command, &self.run_dir)?;
+        let listen = self.listen;
+        child.wait_until(READY, || process::accepts(listen))?;
+        self.addresses = addresses.to_vec();
+        Ok(child)
     }
 }
 

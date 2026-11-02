@@ -410,13 +410,13 @@ impl SessionServer {
                 return None;
             }
         };
-        let welcome = |session: &str, resumed: bool, received: u64| {
+        let welcome = |session: &str, resumed: bool, received: u64, grace: Duration| {
             Control::Welcome(Welcome {
                 session: session.to_string(),
                 resumed,
                 received,
                 heartbeat_ms: millis(config.timing.heartbeat),
-                grace_ms: millis(config.grace),
+                grace_ms: millis(grace),
             })
         };
         match hello.session {
@@ -430,16 +430,21 @@ impl SessionServer {
                     return None;
                 }
                 let id = uuid::Uuid::new_v4().to_string();
+                let grace = asked_grace(&hello.attributes)
+                    .map_or(config.grace, |asked| asked.min(config.grace));
                 let (shared, events) = Shared::new(id.clone(), config.max_buffered);
                 let generation = {
                     let mut inner = shared.lock();
                     let _ = inner.seq.resume(0);
                     inner.attach(false, peer)
                 };
-                self.inner
-                    .lock_table()
-                    .insert(id.clone(), principal.clone(), shared.clone());
-                if link::send_control(ws, &welcome(&id, false, 0)).is_err() {
+                self.inner.lock_table().insert_with_grace(
+                    id.clone(),
+                    principal.clone(),
+                    shared.clone(),
+                    grace,
+                );
+                if link::send_control(ws, &welcome(&id, false, 0, grace)).is_err() {
                     // The client never learned the ID, so nothing can resume it.
                     self.inner.lock_table().remove(&id);
                     shared.finish(SessionEnd::Closed { by_peer: true });
@@ -473,7 +478,8 @@ impl SessionServer {
                                     let generation = inner.attach(true, peer);
                                     drop(inner);
                                     shared.changed.notify_all();
-                                    Ok((shared.clone(), generation, received))
+                                    let grace = table.grace_of(&id).unwrap_or(config.grace);
+                                    Ok((shared.clone(), generation, received, grace))
                                 }
                                 Err(e) => Err(Control::Error {
                                     code: RejectCode::Protocol,
@@ -497,8 +503,8 @@ impl SessionServer {
                     resolved
                 };
                 match resolved {
-                    Ok((shared, generation, received)) => {
-                        if link::send_control(ws, &welcome(&id, true, received)).is_err() {
+                    Ok((shared, generation, received, grace)) => {
+                        if link::send_control(ws, &welcome(&id, true, received, grace)).is_err() {
                             self.after(&shared, generation, Exit::Lost("welcome not sent".into()));
                             return None;
                         }
@@ -557,6 +563,17 @@ impl ServerInner {
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The shorter grace period a hello asks for in `attributes.grace_ms`: a
+/// client that would rather learn of expiry soon than wait may ask for less
+/// than the server's grace, never for more (RS-5).
+pub fn asked_grace(attributes: &serde_json::Value) -> Option<Duration> {
+    attributes
+        .get("grace_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
 }
 
 /// Expire detached sessions and settle sessions closed while detached, until

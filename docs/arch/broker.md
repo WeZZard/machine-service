@@ -43,7 +43,7 @@
 
 ## BK-5: Reaching the broker from a virtual machine
 
-- A guest on Tart's shared NAT network reaches its host's broker through the host's address on that network, which machine-service finds at acquisition as its own interface address on the guest's subnet and writes into the guest's relay agent configuration. `MACHINE_SERVICE_RELAY_GUEST_URL` replaces it, for tests and unusual networks.
+- A guest on Tart's shared NAT network reaches its host's broker through the host's address on that network, which machine-service finds at acquisition as its own interface address on the guest's subnet and writes into the guest's relay agent configuration. `MACHINE_SERVICE_RELAY_GUEST_URL` replaces it, for tests and unusual networks, and `MACHINE_SERVICE_RELAY_GUEST_PORT` replaces only its port, for a test rig's chain in front of the broker (TL-7).
 - A guest on the `internet` network is kept off the host by the guest firewall ([DC-14](../decisions.md)), which drops every connection that such a guest opens to the host's own addresses.
 - The guest firewall makes one exception: an `internet` guest may open a TCP connection to the broker's port on its host, and to no other port (DC-107). `vm-service-guest-firewall install` writes it for port 6241, `--broker-port` for another and `--no-broker` for none; an `internet` lease on an instance whose session port the installed anchor does not pass is served over SSH (RA-8) and says why in its record.
 - The exception keeps DC-13's purpose, because the broker accepts only an authenticated relay agent session under TLS and serves no other service, and the guest still reaches no other port of the host and no private network.

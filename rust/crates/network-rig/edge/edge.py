@@ -6,7 +6,10 @@ The rig starts mitmdump in reverse mode with this script. The script
   (mitmproxy does both; the broker's certificate is verified against the CA
   the rig passes in `ssl_verify_upstream_trusted_ca`),
 - routes by name only: a request whose TLS server name or `Host` is not one of
-  `edge_routes` is answered `421` and never reaches a broker (TC-6),
+  `edge_routes` is answered `421` and never reaches a broker (TC-6); a chain
+  for relay agents, which dial their host's address on the guest network as
+  machine-service writes it (BK-5), also takes a request without a server
+  name whose `Host` is one of `edge_addresses`, on its one route,
 - closes a connection that carries no data for `edge_idle_close_s` seconds,
   counting every byte in either direction, WebSocket pings included (TC-3),
 - closes a WebSocket that sends a message larger than `edge_max_message_bytes`,
@@ -67,6 +70,7 @@ def host_name(authority):
 class Edge:
     def __init__(self):
         self.routes = {}
+        self.addresses = set()
         self.max_message_bytes = 0
         self.pairs_file = ""
         # The ClientHello random of each client connection, by its ID.
@@ -75,6 +79,13 @@ class Edge:
     def load(self, loader):
         loader.add_option(
             "edge_routes", str, "", "Names the edge serves: name=host:port,..."
+        )
+        loader.add_option(
+            "edge_addresses",
+            str,
+            "",
+            "Addresses a client without a server name may dial, comma-separated; "
+            "they reach the one route.",
         )
         loader.add_option(
             "edge_idle_close_s",
@@ -99,6 +110,10 @@ class Edge:
     def configure(self, updated):
         if "edge_routes" in updated:
             self.routes = parse_routes(ctx.options.edge_routes)
+        if "edge_addresses" in updated:
+            self.addresses = {
+                a.strip().lower() for a in ctx.options.edge_addresses.split(",") if a.strip()
+            }
         if "edge_idle_close_s" in updated:
             idle = ctx.options.edge_idle_close_s
             # mitmproxy's own inactivity watchdog sees every byte of a
@@ -129,6 +144,11 @@ class Edge:
     def requestheaders(self, flow: http.HTTPFlow):
         sni = (flow.client_conn.sni or "").lower()
         name = host_name(flow.request.host_header or "")
+        if not sni and name in self.addresses and len(self.routes) == 1:
+            route = next(iter(self.routes))
+            flow.request.host = route
+            flow.request.port = self.routes[route][1]
+            return
         if sni not in self.routes or name != sni:
             flow.response = http.Response.make(
                 421, b"edge: unknown host name\n", {"Content-Type": "text/plain"}

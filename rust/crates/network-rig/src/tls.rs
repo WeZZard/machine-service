@@ -70,6 +70,29 @@ impl Authority {
         })
     }
 
+    /// An authority made elsewhere, from its private key and certificate,
+    /// PEM, and the common name its certificate carries, which a leaf's
+    /// issuer must repeat (the broker's authority keeps it in `ca.name`).
+    pub fn from_parts(
+        common_name: &str,
+        key_pem: &str,
+        cert_pem: &str,
+    ) -> Result<Authority, RigError> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(tls)?;
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, common_name);
+        params.distinguished_name = name;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = KeyPair::from_pem(key_pem).map_err(tls)?;
+        let cert_der = parse_pem_certs(cert_pem)?.remove(0);
+        Ok(Authority {
+            cert_pem: cert_pem.to_string(),
+            cert_der,
+            key_pem: key_pem.to_string(),
+            issuer: Issuer::new(params, key),
+        })
+    }
+
     /// The authority's certificate, PEM.
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
@@ -89,7 +112,15 @@ impl Authority {
     /// A server certificate for `names`, signed by this authority.
     pub fn issue(&self, names: &[&str]) -> Result<Leaf, RigError> {
         let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
-        let mut params = CertificateParams::new(names.clone()).map_err(tls)?;
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(tls)?;
+        params.subject_alt_names = names
+            .iter()
+            .map(|name| match name.parse::<std::net::IpAddr>() {
+                Ok(address) => Ok(rcgen::SanType::IpAddress(address)),
+                Err(_) => name.clone().try_into().map(rcgen::SanType::DnsName),
+            })
+            .collect::<Result<_, _>>()
+            .map_err(tls)?;
         let mut name = DistinguishedName::new();
         name.push(
             DnType::CommonName,
