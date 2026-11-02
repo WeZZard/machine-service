@@ -335,11 +335,12 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                 },
             );
             // `/tmp` is a link on macOS, and cua-driver refuses an output
-            // path whose existing ancestor is not a folder.
+            // path whose existing ancestor is not a folder; only the output
+            // file is named, which every cua-driver release takes.
             let png = format!("/private/tmp/acc-{prefix}screen.png").replace(' ', "-");
             let capture = client.exec(
                 &format!(
-                    "rm -f {png}; cua-driver call get_desktop_state '{{\"screenshot_out_file\":\"{png}\",\"max_image_dimension\":640}}' && \
+                    "rm -f {png}; cua-driver call get_desktop_state '{{\"screenshot_out_file\":\"{png}\"}}' && \
                      head -c 8 {png} | od -An -tx1 | tr -d ' \\n'"
                 ),
                 120.0,
