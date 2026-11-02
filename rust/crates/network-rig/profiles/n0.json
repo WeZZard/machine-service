@@ -1,0 +1,5 @@
+{
+  "id": "N0",
+  "name": "Clean",
+  "edge": { "idle_close_s": 0, "max_message_bytes": 0 }
+}

@@ -19,6 +19,7 @@ workspace until the live acceptance phase completes.
 - `crates/console-worker` — the attempt-local console broker.
 - `crates/guest-console-agent` — the guest-side sharing adapter.
 - `crates/machine-service-install` — launchd installation and removal.
+- `crates/network-rig` — the TL-7 network rig: Toxiproxy and mitmproxy with the edge script, the network profiles, the seeded fault schedule and the cell runner. Its self-tests are opt-in: `cargo test -p network-rig --test rig_live -- --ignored`.
 
 Cross-crate interfaces and porting rules are in [`CONVENTIONS.md`](CONVENTIONS.md).
 The translation plan is in [`../docs/rust-translation.md`](../docs/rust-translation.md).

@@ -1,0 +1,5 @@
+{
+  "id": "N1",
+  "name": "Edge",
+  "edge": { "idle_close_s": 100, "max_message_bytes": 1048576 }
+}

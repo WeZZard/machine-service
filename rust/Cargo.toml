@@ -23,6 +23,7 @@ members = [
   "crates/machine-service-install",
   "crates/runtime-launcher",
   "crates/remote-session",
+  "crates/network-rig",
 ]
 
 [workspace.package]

@@ -1,0 +1,60 @@
+[
+  {
+    "index": 0,
+    "at_ms": 10000,
+    "fault": {
+      "fault": "limit_data",
+      "stream": "downstream",
+      "bytes": 1018490,
+      "window_ms": 4096
+    }
+  },
+  {
+    "index": 1,
+    "at_ms": 70828,
+    "fault": {
+      "fault": "address_change"
+    }
+  },
+  {
+    "index": 2,
+    "at_ms": 113809,
+    "fault": {
+      "fault": "blackhole",
+      "stream": "downstream",
+      "duration_ms": 12518
+    }
+  },
+  {
+    "index": 3,
+    "at_ms": 173102,
+    "fault": {
+      "fault": "address_change"
+    }
+  },
+  {
+    "index": 4,
+    "at_ms": 214979,
+    "fault": {
+      "fault": "address_change"
+    }
+  },
+  {
+    "index": 5,
+    "at_ms": 253070,
+    "fault": {
+      "fault": "reset",
+      "stream": "downstream",
+      "window_ms": 4099
+    }
+  },
+  {
+    "index": 6,
+    "at_ms": 292152,
+    "fault": {
+      "fault": "reset",
+      "stream": "upstream",
+      "window_ms": 2957
+    }
+  }
+]
