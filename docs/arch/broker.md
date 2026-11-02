@@ -12,8 +12,8 @@
 
 - The broker accepts WebSocket connections on the remote session listener, `MACHINE_SERVICE_SESSION_PORT` (6241 by default), at path `/relay`, under TLS ([RS-1](remote-session.md#rs-1-transport)). The listener binds every interface, because the guests reach it on their network's host address (BK-5); it accepts nothing but authenticated sessions.
 - Relay agents and clients connect to the same endpoint, and the first message of a session says which role it takes: `attributes.role` in the hello is `agent` or `client` ([RP-3](relay-protocol.md#rp-3-roles-and-credentials)).
-- machine-service runs the broker when `MACHINE_SERVICE_GUEST_LINK=relay`. Until the relay acceptance passes (M7), SSH stays the default link and the relay link is chosen by the operator (DC-1xx-BK-1). An instance told to run it that cannot open the listener does not start.
-- The broker's TLS comes from a per-instance authority kept in the state folder, `relay/tls/`. It signs a certificate for the TLS server name each client sends, and for the host's own addresses when a client sends none, so the broker is reached by any of its names (TC-6). Clients pin the authority by `relay_ca_sha256` ([RP-1](relay-protocol.md#rp-1-endpoint-and-trust), DC-1xx-BK-3).
+- machine-service runs the broker when `MACHINE_SERVICE_GUEST_LINK=relay`. Until the relay acceptance passes (M7), SSH stays the default link and the relay link is chosen by the operator (DC-141). An instance told to run it that cannot open the listener does not start.
+- The broker's TLS comes from a per-instance authority kept in the state folder, `relay/tls/`. It signs a certificate for the TLS server name each client sends, and for the host's own addresses when a client sends none, so the broker is reached by any of its names (TC-6). Clients pin the authority by `relay_ca_sha256` ([RP-1](relay-protocol.md#rp-1-endpoint-and-trust), DC-143).
 
 ## BK-2: Pairing and routing
 
@@ -32,12 +32,12 @@
 - The broker takes a call's whole upload and checks it against its end before it hands the call on, so a resend to a new agent session carries the same bytes. An upload holds at most 256 MiB.
 - The relay agent records execution IDs as well ([RA-5](relay-agent.md#ra-5-operations)), so a resend after either session resumes, or after a broker restart, never runs a command twice.
 - A client asks `query {execution}` after any loss and receives `completed`, `running` or `unknown`; the broker answers from its record, else from the relay agent's.
-- machine-service's own HTTP `exec`, `push` and `pull` on a `relay` lease, and so `machctl`'s, are calls on the same records, made in-process. The HTTP body may carry `execution_id` to make a request idempotent, and the answer names its `execution_id` and `link: relay`. Folders still go by `scp` (DC-1xx-BK-11).
+- machine-service's own HTTP `exec`, `push` and `pull` on a `relay` lease, and so `machctl`'s, are calls on the same records, made in-process. The HTTP body may carry `execution_id` to make a request idempotent, and the answer names its `execution_id` and `link: relay`. Folders still go by `scp` (DC-151).
 
 ## BK-4: Discovery of the broker
 
 - machine-service reports its broker URL as `relay_url`, and its authority's fingerprint as `relay_ca_sha256`, in `/health`, in its Bonjour TXT record and in its Consul metadata, which `machine-service-install catalog-description` writes ([FD-1](federation.md#fd-1-advertisement-and-registration)). `GET /relay/ca.pem` serves the authority.
-- By default, `relay_url` names the Mac's Bonjour host name, `<LocalHostName>.local`, which every Mac on the network resolves, and the listener's port (DC-1xx-BK-13).
+- By default, `relay_url` names the Mac's Bonjour host name, `<LocalHostName>.local`, which every Mac on the network resolves, and the listener's port (DC-153).
 - The operator can set `MACHINE_SERVICE_RELAY_URL` to a URL that other sites can reach, such as a Cloudflare Tunnel hostname or a Tailscale name, and discovery advertises that URL instead ([TC-6](transport-contract.md#tc-6-the-broker-is-reached-by-name)).
 - A client never needs an IP address that a person wrote down.
 
