@@ -289,6 +289,9 @@ pub fn as_root(script: &str, password: &str) -> (String, Option<Vec<u8>>) {
 pub struct GuestFirewall {
     /// The table file the anchor reads and this service writes.
     pub table: PathBuf,
+    /// The host port the anchor lets the guests reach, the broker's
+    /// (DC-107); `None` for an anchor installed before it, or without it.
+    pub broker_port: Option<u16>,
 }
 
 /// The anchor file the service reads: `MACHINE_SERVICE_GUEST_FIREWALL_ANCHOR`, or
@@ -349,6 +352,7 @@ account with: {install} (no NAT fallback)",
     }
     Ok(GuestFirewall {
         table: table.to_path_buf(),
+        broker_port: guest_firewall::parse_anchor_broker_port(&text),
     })
 }
 
@@ -875,7 +879,7 @@ mod tests {
 
         std::fs::write(
             &anchor,
-            guest_firewall::anchor_rules(Path::new("/elsewhere/guests")),
+            guest_firewall::anchor_rules(Path::new("/elsewhere/guests"), Some(6241)),
         )
         .unwrap();
         let error = check_guest_firewall(&anchor, &table).unwrap_err();
@@ -884,12 +888,18 @@ mod tests {
             "{error}"
         );
 
-        std::fs::write(&anchor, guest_firewall::anchor_rules(&table)).unwrap();
+        std::fs::write(&anchor, guest_firewall::anchor_rules(&table, None)).unwrap();
         assert_eq!(
             check_guest_firewall(&anchor, &table).unwrap(),
             GuestFirewall {
-                table: table.clone()
+                table: table.clone(),
+                broker_port: None,
             }
+        );
+        std::fs::write(&anchor, guest_firewall::anchor_rules(&table, Some(6241))).unwrap();
+        assert_eq!(
+            check_guest_firewall(&anchor, &table).unwrap().broker_port,
+            Some(6241)
         );
 
         std::fs::remove_file(&table).unwrap();

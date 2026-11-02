@@ -598,6 +598,7 @@ impl Host for FakeHost {
             Some(reason) => Err(reason),
             None => Ok(machine_service_core::isolation::GuestFirewall {
                 table: self.firewall_table(),
+                broker_port: Some(machine_service_core::guest_firewall::DEFAULT_BROKER_PORT),
             }),
         }
     }

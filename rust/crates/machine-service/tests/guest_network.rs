@@ -52,7 +52,7 @@ impl Live {
         if !matches!(firewall, Firewall::Missing) {
             std::fs::write(
                 &anchor,
-                machine_service_core::guest_firewall::anchor_rules(&table),
+                machine_service_core::guest_firewall::anchor_rules(&table, Some(6241)),
             )
             .expect("anchor file");
         }
