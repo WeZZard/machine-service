@@ -40,8 +40,8 @@ jobs:
       # archives here keeps it working between releases.
       - name: relay agent release archives
         run: |
-          rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl && rustup component add llvm-tools
-          scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent"
+          rustup target add aarch64-unknown-linux-musl && rustup component add llvm-tools
+          scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent" darwin-arm64 linux-arm64
 
   # The TL-7 network rig's opt-in self-tests run the pinned Toxiproxy and
   # mitmproxy on every platform the rig pins, so the Linux pins and launch

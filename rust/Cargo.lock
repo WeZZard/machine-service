@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acquisition-options"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "application-catalog"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "serde",
@@ -176,7 +176,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "byte-transfer"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "sha2",
@@ -271,7 +271,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "console"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "base64 0.22.1",
  "lease-keys",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "console-worker"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "serde",
@@ -303,7 +303,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "control-only"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "serde_json",
  "sha2",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "discovery"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
 ]
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "environment"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "serde",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "guest-actions"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "byte-transfer",
  "libc",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "guest-console-agent"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "serde_json",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "guest-dot-forwarder"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "rustls",
  "webpki-roots",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "guest-firewall"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "clap",
  "libc",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "guest-session"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "guest-actions",
  "libc",
@@ -656,7 +656,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lease-keys"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "tempfile",
@@ -683,7 +683,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "machctl"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "byte-transfer",
  "clap",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "machine-service"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "byte-transfer",
  "discovery",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "machine-service-core"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "acquisition-options",
  "application-catalog",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "machine-service-install"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "clap",
  "console",
@@ -776,7 +776,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "network-rig"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "rcgen",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "relay-agent"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "byte-transfer",
  "guest-actions",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "relay-broker"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "base64 0.22.1",
  "byte-transfer",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "remote-session"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
  "rand",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-launcher"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "libc",
 ]
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "service-layout"
-version = "0.2.0-rc.2"
+version = "0.2.0-rc.3"
 dependencies = [
  "sha2",
  "tempfile",

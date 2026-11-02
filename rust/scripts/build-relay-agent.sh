@@ -5,9 +5,12 @@
 # image pins a release by version and SHA-256 (docs/arch/relay-agent.md RA-6).
 #
 # Platforms: darwin-arm64, linux-arm64, linux-x86_64. The Linux builds are
-# static musl executables linked by rust-lld, which rustup ships, so any host
-# with the musl targets installed builds them without a C cross toolchain.
-# darwin-arm64 builds only on a macOS arm64 host.
+# static musl executables linked by rust-lld. A release builds each platform
+# natively on its own runner (darwin-arm64 on macOS, each Linux platform on a
+# Linux runner of that architecture with musl-gcc from musl-tools), so ring's
+# C code compiles against real musl headers (DC-178). On a Mac, linux-arm64
+# can also be cross-built for development through the clang fallback below;
+# linux-x86_64 cannot, because clang has no C library headers for it there.
 #
 # The macOS executable is signed with the identifier com.wezzard.relay-agent,
 # the LaunchAgent's label, instead of the linker's per-build identifier. A
@@ -33,11 +36,12 @@ case "$version" in
 esac
 
 if [ $# -eq 0 ]; then
-    if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
-        set -- darwin-arm64 linux-arm64 linux-x86_64
-    else
-        set -- linux-arm64 linux-x86_64
-    fi
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) set -- darwin-arm64 linux-arm64 ;;
+        Linux-aarch64) set -- linux-arm64 ;;
+        Linux-x86_64) set -- linux-x86_64 ;;
+        *) echo "error: no default platform for $(uname -s)-$(uname -m); name one" >&2; exit 1 ;;
+    esac
 fi
 
 rm -rf "$out"
@@ -65,7 +69,10 @@ for platform in "$@"; do
             # toolchain's llvm-ar archives the ELF objects (DC-154).
             arch_prefix=${target%%-*}
             target_variable=$(echo "$target" | tr 'a-z-' 'a-z_')
-            if ! command -v "$arch_prefix-linux-musl-gcc" >/dev/null 2>&1; then
+            if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = "$arch_prefix" ] && command -v musl-gcc >/dev/null 2>&1; then
+                # A native Linux build: musl-gcc compiles ring against musl.
+                export "CC_$target_variable=musl-gcc"
+            elif ! command -v "$arch_prefix-linux-musl-gcc" >/dev/null 2>&1; then
                 # No musl cross compiler: the clang fallback is the only way,
                 # so its tools must be present, or the build stops here with
                 # the fix instead of failing later inside ring's build.
