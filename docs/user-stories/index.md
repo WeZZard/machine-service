@@ -49,6 +49,9 @@ Consolidated, test-linked user stories for the lease-based VM service. Each stor
 | US33 | Operator | Choose which Macs are durable machines | AC-43; [machine model](../arch/machines.md#mm-1-two-kinds-of-machine) |
 | US34 | Operator | An installation holds every executable the service needs | AC-46; [installation](../arch/installation.md) |
 | US35 | Operator | Rename a Mac without breaking anything | AC-50 to AC-54; [identity](../arch/identity.md) |
+| US36 | Agent | My actions run as the person at the desktop | AC-55 to AC-60, AC-65; [relay agent](../arch/relay-agent.md) |
+| US37 | Agent | A bad link never loses or repeats my work | AC-61 to AC-64, AC-67, AC-70; [broker](../arch/broker.md) |
+| US38 | Operator | Machines in other sites, behind NAT, serve leases | AC-66, AC-68, AC-69; [transport contract](../arch/transport-contract.md) |
 | US-N1 | Agent | Bounded resource consumption and predictable defaults | `TestAcquireValidation.test_ttl_bounds` (unit), `TestImagesSnapshot` (unit) |
 | US-N2 | Orchestrator | Failure at any provisioning step rolls back cleanly | `TestAcquireLifecycle.test_failure_rolls_back_clone_and_state`, `test_ssh_never_ready_rolls_back` (unit) |
 | US-N3 | Orchestrator | Concurrency correctness: races never oversubscribe or double-lease | `TestConcurrency` (unit) |

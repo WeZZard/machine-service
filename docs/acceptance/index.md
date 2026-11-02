@@ -5,6 +5,7 @@
 - Agent
 - Orchestrator
 - Operator
+- Relay
 
 Each scenario names the [test layer](../arch/test-layers.md) that runs it. Stories are in [user stories](../user-stories/index.md).
 
@@ -71,3 +72,24 @@ Each scenario names the [test layer](../arch/test-layers.md) that runs it. Stori
 17. AC-47: A Mac whose Consul node name is not its own name is listed once, by its own name (US23, TL-2, TL-6).
 18. AC-48: A Mac with nothing but machctl lists every instance on the network (US23, TL-2, TL-6).
 19. AC-49: The consul mode stops the advertisement and asks only Consul (US23, TL-2).
+
+## Relay
+
+[relay.acceptance](relay.acceptance)
+
+1. AC-55: An action runs in the desktop session (US36, TL-7).
+2. AC-56: A command behaves as it would in a terminal of the desktop session (US36, TL-7).
+3. AC-57: Large output arrives whole (US36, TL-7).
+4. AC-58: Files move whole or not at all (US36, TL-7).
+5. AC-59: A long action completes (US36, TL-7).
+6. AC-60: A lease's relay agent registers and its credential ends at release (US36, TL-7).
+7. AC-61: A connection cut during an action does not run it twice (US37, TL-7).
+8. AC-62: A silent connection is detected and resumed (US37, TL-7).
+9. AC-63: A client that changes its address keeps its session (US37, TL-7).
+10. AC-64: A restart of the broker or the relay agent never replays an action (US37, TL-7).
+11. AC-65: The relay agent returns after a reboot (US36, TL-7).
+12. AC-66: Credentials and ports are guarded (US38, TL-7).
+13. AC-67: An expired session still reports its operations (US37, TL-7).
+14. AC-68: The client finds the broker by name (US38, TL-7).
+15. AC-69: A silent action survives the edge's idle close (US38, TL-7).
+16. AC-70: The link is the smallest part of an action's time (US37, TL-7).

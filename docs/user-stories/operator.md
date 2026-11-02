@@ -130,3 +130,10 @@ The human operator (WeZZard) who installs the service, keeps it healthy, trouble
 - See [MI](../arch/identity.md).
 
 **Tests:** AC-50 to AC-54 in [operator.acceptance](../acceptance/operator.acceptance).
+
+## US38 — Machines in other sites, behind NAT, serve leases
+
+- As the operator, I want machines in other sites behind NAT to serve leases over a network that I choose, such as an intranet, Tailscale or Cloudflare Tunnel, without opening any inbound port on them (DC-100, DC-101).
+- Any network that meets the [transport contract](../arch/transport-contract.md) works, and I check a new network once by reaching the broker through its advertised URL.
+
+**Tests:** AC-66, AC-68 and AC-69 in [relay.acceptance](../acceptance/relay.acceptance).

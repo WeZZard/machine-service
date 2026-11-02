@@ -1,5 +1,7 @@
 # Guest session (GS)
 
+> The [relay agent](relay-agent.md) replaces this design's two channels for actions, because both start the agent outside the desktop session. Its frames, checksums and process-group rules carry over ([RA-9](relay-agent.md#ra-9-relation-to-the-guest-session)).
+
 ## Why
 
 - Each exec starts one `ssh` process and each push or pull one `scp -r` process (`ssh.rs`). Each pays a new SSH handshake and key exchange.

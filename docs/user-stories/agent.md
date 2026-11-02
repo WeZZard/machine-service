@@ -131,3 +131,17 @@ The agent's contract with the service is **lease-based**: it asks for a VM, work
 - Push and pull carry the bytes and their digest, because my file paths do not exist on the other Mac. See [FD-4](../arch/federation.md#fd-4-working-on-a-remote-instance).
 
 **Tests:** AC-28 in [agent.acceptance](../acceptance/agent.acceptance).
+
+## US36 — My actions run as the person at the desktop
+
+- As an agent, I want every action to run in the desktop session of the machine's logged-in user, so that the keychain, the window server and the privacy permissions behave as they do for a person at that machine (DC-97).
+- This holds on macOS virtual machines, durable Macs and Ubuntu virtual machines (DC-98). See [relay agent](../arch/relay-agent.md).
+
+**Tests:** AC-55 to AC-60 and AC-65 in [relay.acceptance](../acceptance/relay.acceptance).
+
+## US37 — A bad link never loses or repeats my work
+
+- As an agent, I want my actions to survive broken, silent and slow links and a change of my own address, so that a long link between sites never loses a result and never runs an action twice.
+- See [broker](../arch/broker.md) and [remote session](../arch/remote-session.md).
+
+**Tests:** AC-61 to AC-64, AC-67 and AC-70 in [relay.acceptance](../acceptance/relay.acceptance).
