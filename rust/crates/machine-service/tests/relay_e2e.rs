@@ -60,8 +60,14 @@ struct AgentProcess {
 
 impl AgentProcess {
     fn start(home: &Path, env: &[(String, String)]) -> AgentProcess {
+        AgentProcess::start_from(relay_agent_bin(), home, env)
+    }
+
+    /// Start the agent from `executable`, as launchd or systemd starts the
+    /// one installed in the guest.
+    fn start_from(executable: &Path, home: &Path, env: &[(String, String)]) -> AgentProcess {
         let log = home.join("agent.log");
-        let child = Command::new(relay_agent_bin())
+        let child = Command::new(executable)
             .arg("run")
             .env("HOME", home)
             .env("SHELL", "/bin/sh")
@@ -600,4 +606,128 @@ fn through_the_rig_under_n1() {
     let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
     assert_eq!(released.status, 200);
     drop(agent);
+}
+
+/// RA-6 for a lease that lives on: the instance restarts with another
+/// relay agent build than the lease's agent runs. When the agent registers
+/// again, the instance writes its build over the agent's executable through
+/// the relay and restarts the agent once no call runs; the command that ran
+/// across the instance's restart completes, and the records persist.
+#[test]
+fn a_long_lived_lease_gets_the_instances_new_relay_agent_build() {
+    let session_port = free_session_port();
+    let mut lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    // The build this instance holds, and the guest's installed agent: the
+    // same bytes at first, so bootstrap uploads nothing.
+    let held = lab.fixture.root.join("held-relay-agent");
+    std::fs::copy(relay_agent_bin(), &held).unwrap();
+    for (key, value) in lab.env.iter_mut() {
+        if key == "MACHINE_SERVICE_RELAY_AGENT" {
+            *value = held.display().to_string();
+        }
+    }
+    let installed = lab
+        .guest_home
+        .join(".local/libexec/relay-agent/relay-agent");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(relay_agent_bin(), &installed).unwrap();
+    let agent = AgentProcess::start_from(&installed, &lab.guest_home, &[]);
+    let mut daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(
+        answer["link"],
+        "relay",
+        "{answer}\nagent log:\n{}",
+        agent.log()
+    );
+    let vm = answer["vm"].as_str().unwrap().to_string();
+    let old = sha256_hex(&std::fs::read(relay_agent_bin()).unwrap());
+    assert_eq!(answer["relay_agent"]["build"], json!(old));
+    assert!(!lab.relay_calls().contains("machine-service-relay-upload"));
+
+    let url = answer["relay"]["url"].as_str().unwrap().to_string();
+    let credential = answer["relay"]["credential"].as_str().unwrap().to_string();
+    let tls = trust(&answer);
+    let client = connect(&url, &credential, tls.clone());
+    client.call(1, "before", exec("echo before"), b"");
+    assert_eq!(client.wait(1, WAIT).bytes, b"before\n");
+    client.call(2, "across", exec("sleep 4; echo across"), b"");
+    assert!(wait_until_e2e(|| String::from_utf8_lossy(
+        &std::fs::read(
+            lab.guest_home
+                .join(".local/state/relay-agent/executions")
+                .join(sha256_hex(b"across"))
+                .join("record.json")
+        )
+        .unwrap_or_default()
+    )
+    .contains("across")));
+    drop(client);
+
+    // The instance comes back with a new build.
+    let mut build = std::fs::read(relay_agent_bin()).unwrap();
+    build.extend_from_slice(b"a newer build");
+    let new = sha256_hex(&build);
+    std::fs::write(&held, &build).unwrap();
+    daemon.stop();
+    let _daemon = lab.start();
+
+    // The command that ran across the instance's restart completes; the
+    // agent was not restarted under it.
+    let client = connect(&url, &credential, tls.clone());
+    client.call(1, "across", exec("never runs"), b"");
+    let across = client.wait(1, WAIT);
+    assert_eq!(across.bytes, b"across\n", "agent log:\n{}", agent.log());
+    assert!(matches!(
+        across.result.unwrap().outcome,
+        Outcome::Exit { rc: Some(0), .. }
+    ));
+
+    // Then the agent runs the new build, in the same process.
+    let machine = || {
+        http(
+            lab.fixture.port(),
+            "GET",
+            &format!("/machines/{vm}"),
+            None,
+            None,
+        )
+        .body
+    };
+    assert!(
+        wait_until_e2e(|| machine()["relay_agent"]["build"] == json!(new)),
+        "{}\nagent log:\n{}",
+        machine(),
+        agent.log()
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), build);
+    assert!(agent.log().contains("restarting onto"), "{}", agent.log());
+    let ran = lab.post(
+        &format!("/machines/{vm}/exec"),
+        &json!({"argv": ["echo", "after"]}),
+    );
+    assert_eq!(ran.body["output"], "after\n", "{}", ran.body);
+    // The records persist across the agent's restart.
+    let client = connect(&url, &credential, tls);
+    client.call(2, "before", exec("never runs"), b"");
+    let replay = client.wait(2, WAIT);
+    assert!(replay.result.unwrap().replayed);
+    assert_eq!(replay.bytes, b"before\n");
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200);
+    drop(agent);
+}
+
+fn wait_until_e2e(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    condition()
 }

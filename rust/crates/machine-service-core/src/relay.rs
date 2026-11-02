@@ -13,8 +13,12 @@
 //! - A `relay` lease's exec, push and pull go through its relay agent; a
 //!   folder travels as a tar stream (RP-13).
 //! - Release and expiry revoke the lease's credentials at once (RP-10).
+//! - A `relay` lease whose relay agent registers with another build than
+//!   this instance holds gets this instance's build written over its
+//!   executable through the relay, and the agent restarts onto it once no
+//!   call is out (RA-6, [`Service::watch_relay_agents`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -22,9 +26,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use acquisition_options::GuestNetwork;
+use relay_agent::protocol::AgentInfo;
 use relay_agent::protocol::{Op, Outcome};
 use relay_broker::tls::Authority;
-use relay_broker::{Answer, Broker, BrokerConfig, Role, RunError, Target};
+use relay_broker::{Answer, Broker, BrokerConfig, RestartError, Role, RunError, Target};
 use remote_session::{Listening, ServerConfig, SessionServer};
 use serde_json::{json, Value};
 
@@ -174,6 +179,11 @@ pub struct Relay {
     /// Client credentials issued at acquisition, until the acquisition's
     /// answer carries them.
     credentials: Mutex<HashMap<String, String>>,
+    /// Leases whose relay agent is being replaced now.
+    replacing: Mutex<HashSet<String>>,
+    /// The build each lease's replacement last failed to bring, so a guest
+    /// that cannot take it is not tried again for that build.
+    failed_builds: Mutex<HashMap<String, String>>,
 }
 
 impl Relay {
@@ -222,6 +232,8 @@ impl Relay {
             authority,
             listening: Mutex::new(Some(listening)),
             credentials: Mutex::new(HashMap::new()),
+            replacing: Mutex::new(HashSet::new()),
+            failed_builds: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -631,6 +643,173 @@ impl Service {
         self.relay
             .set(relay)
             .map_err(|_| OpError::new("the relay link was installed twice"))
+    }
+
+    /// RA-6 for leases that live on: whenever a `relay` lease's relay agent
+    /// registers, such as after this instance restarted with a new build,
+    /// compare its build with the one this instance holds and replace it
+    /// when they differ ([`Service::replace_relay_agent`]).
+    pub fn watch_relay_agents(self: &Arc<Self>) {
+        let Some(relay) = self.relay() else {
+            return;
+        };
+        let service = Arc::downgrade(self);
+        relay.broker.on_agent(move |target, info| {
+            let Target::Lease(vm) = target else {
+                // A durable machine's agent is the installer's (RA-6).
+                return;
+            };
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            let (vm, info) = (vm.clone(), info.clone());
+            std::thread::spawn(move || service.replace_relay_agent(&vm, &info));
+        });
+    }
+
+    /// Replace the relay agent of `vm` when `agent` runs another build than
+    /// this instance holds: write the build over the agent's executable
+    /// through the relay, then restart the agent onto it once no call of
+    /// the lease is out, holding new calls for its next session. No
+    /// execution is lost: none runs at the restart, and the agent's records
+    /// outlive it.
+    pub(crate) fn replace_relay_agent(&self, vm: &str, agent: &AgentInfo) {
+        let Some(relay) = self.relay() else {
+            return;
+        };
+        let record = match self.state.read() {
+            Ok(data) => data.get("vms").and_then(|vms| vms.get(vm)).cloned(),
+            Err(_) => None,
+        };
+        // A lease still bootstrapping registers its agent before its record
+        // says `relay`; bootstrap has already put this build in place.
+        let Some(record) =
+            record.filter(|r| r.get("link").and_then(Value::as_str) == Some(LINK_RELAY))
+        else {
+            return;
+        };
+        let kind = crate::ops::record_kind(&record).to_string();
+        let build = match self.host.relay_agent(&kind) {
+            Ok(build) => build,
+            Err(error) => {
+                self.log(&format!(
+                    "WARN: relay: {vm}: cannot compare the relay agent's build: {error}"
+                ));
+                return;
+            }
+        };
+        let want = sha256_hex(&build);
+        if agent.build == want {
+            return;
+        }
+        let failed = relay
+            .failed_builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(vm)
+            == Some(&want);
+        let first = relay
+            .replacing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(vm.to_string());
+        if failed || !first {
+            return;
+        }
+        let outcome = self.replace_relay_agent_steps(relay, vm, &want, build, &agent.build);
+        relay
+            .replacing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(vm);
+        match outcome {
+            Ok(()) => {}
+            Err(reason) => {
+                self.log(&format!(
+                    "WARN: relay: {vm}: the relay agent was not replaced: {reason}; it keeps build {}",
+                    agent.build.get(..12).unwrap_or(&agent.build)
+                ));
+                relay
+                    .failed_builds
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(vm.to_string(), want);
+            }
+        }
+    }
+
+    fn replace_relay_agent_steps(
+        &self,
+        relay: &Relay,
+        vm: &str,
+        want: &str,
+        build: Vec<u8>,
+        have: &str,
+    ) -> Result<(), String> {
+        let target = Target::Lease(vm.to_string());
+        self.log(&format!(
+            "relay: {vm}: the relay agent runs build {}, not this instance's {}; replacing it (RA-6)",
+            have.get(..12).unwrap_or(have),
+            &want[..12]
+        ));
+        let written = relay
+            .broker
+            .run(
+                &target,
+                &uuid::Uuid::new_v4().to_string(),
+                Op::Write {
+                    path: GUEST_EXECUTABLE.into(),
+                    name: String::new(),
+                    mode: Some(0o755),
+                },
+                build,
+                relay.settings.agent_wait + Duration::from_secs(300),
+            )
+            .map_err(|e| format!("writing the build got no answer: {e:?}"))?;
+        match &written.outcome {
+            Outcome::Written(digest) if digest.sha256 == want => {}
+            other => return Err(format!("writing the build failed: {other:?}")),
+        }
+        // The agent refuses a restart while anything runs, including calls
+        // a restarted broker does not know of; wait for it to be idle.
+        let agent = loop {
+            if !relay.broker.has_credential(&target, Role::Agent) {
+                return Err("the lease ended".into());
+            }
+            match relay.broker.restart_agent(
+                &target,
+                Duration::from_secs(3600),
+                relay.settings.register_timeout,
+            ) {
+                Ok(agent) => break agent,
+                Err(RestartError::Busy) => std::thread::sleep(Duration::from_secs(2)),
+                Err(other) => return Err(format!("the restart failed: {other:?}")),
+            }
+        };
+        if agent.build != want {
+            return Err(format!(
+                "after the restart it runs build {}",
+                agent.build.get(..12).unwrap_or(&agent.build)
+            ));
+        }
+        let _ = self.state.update(
+            |data| {
+                if let Some(record) = data.get_mut("vms").and_then(|vms| vms.get_mut(vm)) {
+                    if let Some(object) =
+                        record.get_mut("relay_agent").and_then(Value::as_object_mut)
+                    {
+                        object.insert("build".into(), json!(want));
+                    }
+                }
+                Ok(())
+            },
+            None::<fn(&serde_json::Map<String, Value>)>,
+        );
+        self.log(&format!(
+            "relay: {vm}: relay agent replaced; it runs build {} (RA-6)",
+            &want[..12]
+        ));
+        Ok(())
     }
 
     /// Revoke a lease's relay credentials and end its sessions.

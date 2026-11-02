@@ -37,8 +37,21 @@ fn main() {
 
 fn open_agent() -> Agent {
     let options = AgentOptions::from_environment();
+    eprintln!(
+        "relay-agent: commands are owned by {}",
+        options.ownership.describe()
+    );
     match Agent::open(options.clone()) {
-        Ok(agent) => agent,
+        Ok(agent) => {
+            // A restart executes the agent's path again, so a build renamed
+            // into place there runs in this same process (RA-6).
+            let executable = options.executable.clone();
+            agent.set_restart(move || {
+                eprintln!("relay-agent: restarting onto {}", executable.display());
+                relay_agent::agent::reexec(&executable)
+            });
+            agent
+        }
         Err(error) => {
             eprintln!(
                 "relay-agent: cannot open its records in {}: {error}",

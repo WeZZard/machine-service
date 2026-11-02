@@ -1792,7 +1792,7 @@ fn arg_text(value: &Value) -> String {
     }
 }
 
-fn record_kind(record: &Value) -> &str {
+pub(crate) fn record_kind(record: &Value) -> &str {
     record
         .get("image_kind")
         .and_then(Value::as_str)

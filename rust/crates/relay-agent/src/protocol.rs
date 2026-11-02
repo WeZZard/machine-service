@@ -227,6 +227,9 @@ pub enum Op {
     },
     /// Report the agent's state.
     Status,
+    /// Restart the agent onto the executable at its path, which may hold a
+    /// new build (RA-6). Refused with `busy` while any operation runs.
+    Restart,
 }
 
 impl Op {
@@ -241,6 +244,7 @@ impl Op {
             Op::ReadTree { .. } => OpKind::ReadTree,
             Op::Cancel { .. } => OpKind::Cancel,
             Op::Status => OpKind::Status,
+            Op::Restart => OpKind::Restart,
         }
     }
 }
@@ -265,6 +269,8 @@ pub enum OpKind {
     Cancel,
     /// [`Op::Status`].
     Status,
+    /// [`Op::Restart`].
+    Restart,
 }
 
 impl OpKind {

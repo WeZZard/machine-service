@@ -106,11 +106,13 @@ The same rule, one key naming the variant or a bare string for a variant without
 | read_tree | `{"read_tree":{"path":"<path>"}}` | no | the folder's tar stream as chunks, `end`, `result` with `read` |
 | cancel | `{"cancel":{"target":"<execution ID>"}}` | no | `result` with `cancel` |
 | status | `"status"` | no | `result` with `status` |
+| restart | `"restart"` | no | `result` with `status`, the state before the restart |
 
 - exec runs the command line through the user's shell with `-c`, as `sshd` does, from the home folder, in its own process group, in the desktop session; standard output and standard error are combined into one stream. script runs the uploaded script on standard input of `zsh -s` on macOS or `bash -s` on Linux. A command is killed with its process group, and on Linux with its systemd scope, which also holds the processes that left the group, after `timeout_s` seconds, which must be positive.
 - write resolves `path` against the home folder; when `path` names a folder, the file is `name` inside it. The bytes go to a temporary sibling, are checked against the `end`, and are renamed into place. `mode` is an integer file mode, such as `420` for `0644`.
 - read resolves `path` against the home folder. A folder is refused with code `is_directory`; read it with read_tree.
 - write_tree and read_tree move a folder as one tar stream ([RP-13](#rp-13-folders)).
+- restart replaces the relay agent's process with the executable at its path, which may hold a new build (RA-6). It is taken only while no other operation runs or waits for its end, else refused with `busy`; an agent that cannot replace itself refuses it with `unsupported`. Its record keeps the answer, so a repeated ID never restarts twice. The agent's session ends and its next session says hello with the build now running. machine-service sends it; a client has no need to.
 - cancel kills the target's process group (and scope) when it runs, discards it when its upload has not ended, and has its own execution ID like any operation.
 
 ### Outcomes (`outcome`)
@@ -129,7 +131,7 @@ The same rule, one key naming the variant or a bare string for a variant without
 
 | State | JSON |
 | --- | --- |
-| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status","outcome":<outcome>}}` |
+| completed | `{"completed":{"op":"exec" \| "script" \| "write" \| "read" \| "write_tree" \| "read_tree" \| "cancel" \| "status" \| "restart","outcome":<outcome>}}` |
 | running | `{"running":{"op":"<op kind>"}}` |
 | unknown | `"unknown"` |
 
@@ -179,6 +181,7 @@ broker ← {"result":{"call":1,"execution":"7d3c…","replayed":false,"outcome":
 - When the lease's relay agent has no session, the broker answers a `call` or `query` with `pending`, code `agent_not_connected`, and keeps it waiting for up to `wait_ms` for the relay agent to register: the agent session's grace period, 10 minutes by default (`MACHINE_SERVICE_RELAY_AGENT_WAIT`). A later caller attached to the same execution receives no second `pending`.
 - When the relay agent registers in time, the call proceeds as usual. Otherwise the call ends with `failed`, code `agent_not_connected`, `"committed": false`, and a query with state `unknown`.
 - A relay agent whose connection breaks keeps its session for its grace period, and the broker's messages wait in that session's replay buffer, so a short break needs nothing from the client.
+- While machine-service restarts a lease's relay agent onto a new build (RA-6), the broker holds new calls back until the agent's next session, as if the agent had no session; such a call may receive `pending`.
 - When the relay agent's session ends while a call is out, the broker sends the call again, with the same execution ID and upload, to the agent's next session, and the relay agent answers it from its record. When no next session comes within `wait_ms`, the call ends with `failed`, code `agent_lost`, `"committed": true`: its outcome is uncertain, and `query` later tells it.
 
 ## RP-9: Error codes
@@ -195,7 +198,8 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | `revoked` | broker | false, or true once handed on | the lease was released while the call waited or ran |
 | `invalid_request` | agent | false | a bad execution ID or `timeout_s` |
 | `call_in_use`, `superseded`, `end_mismatch`, `cancelled` | agent | false | the agent refused the call before its commit point |
-| `stopping`, `record_failed` | agent | false | the agent cannot run it now |
+| `stopping`, `record_failed` | agent | false | the agent cannot run it now; the broker sends a call refused with `stopping` again to the agent's next session instead of answering it |
+| `busy`, `unsupported` | agent | false | a restart was refused: an operation runs, or the agent cannot replace itself |
 | `not_found`, `is_directory`, `write_failed`, `read_failed` | agent | false before the end, true after | a file operation failed |
 | `not_a_directory`, `bad_archive`, `unsupported_entry` | agent | false | a folder operation was refused: the path is a file, the uploaded tar stream is not a folder of files and folders, or the folder to read holds a link or a device ([RP-13](#rp-13-folders)) |
 

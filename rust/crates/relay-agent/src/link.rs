@@ -41,6 +41,11 @@ pub trait Link: Send + Sync {
     /// Close the link. A blocked `receive` on this side returns, and the
     /// other side sees [`LinkError::Closed`] after the messages already sent.
     fn close(&self);
+    /// Wait up to `timeout` for the messages sent so far to leave this
+    /// process, before the process ends or replaces itself.
+    fn flush(&self, timeout: std::time::Duration) {
+        let _ = timeout;
+    }
 }
 
 // --------------------------------------------------------------- in memory

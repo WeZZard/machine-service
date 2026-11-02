@@ -480,6 +480,8 @@ fn run_waits_for_a_private_configuration() {
     assert!(!relay_agent::agent::state_directory(home.path()).exists());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     expect("configuration loaded; broker wss://broker.example/relay");
+    // It says how the operating system owns its commands (DC-139).
+    expect("commands are owned by");
     // It dials now; `.example` never resolves (RFC 2606), so the dial fails
     // and is retried with backoff.
     expect("connect:");
@@ -496,4 +498,71 @@ fn run_waits_for_a_private_configuration() {
     );
     let rest: Vec<String> = logged.try_iter().collect();
     assert!(rest.iter().all(|line| !line.contains("secret-token")));
+}
+
+/// RA-6 (TL-2): a new build written over the agent's executable takes
+/// effect at a restart, in the same process: the hello names the new build,
+/// and the records written before the restart answer after it.
+#[test]
+fn a_restart_runs_the_build_written_over_the_executable() {
+    let home = tempfile::tempdir().unwrap();
+    let installed = home.path().join(".local/libexec/relay-agent/relay-agent");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(AGENT, &installed).unwrap();
+    let mut child = Command::new(&installed)
+        .arg("stdio")
+        .env("HOME", home.path())
+        .env("SHELL", "/bin/sh")
+        .current_dir(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let link: Arc<dyn Link> = Arc::new(StreamLink::new(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+    ));
+    let mut driver = Driver::open(link).unwrap();
+    let old = driver.hello().build.clone();
+    let before = driver.run("before", exec("echo before"), b"").unwrap();
+
+    let mut build = std::fs::read(AGENT).unwrap();
+    build.extend_from_slice(b"another build");
+    let new = guest_actions::sha256_hex(&build);
+    assert_ne!(new, old);
+    let written = driver
+        .run(
+            "write-build",
+            Op::Write {
+                path: ".local/libexec/relay-agent/relay-agent".into(),
+                name: String::new(),
+                mode: Some(0o755),
+            },
+            &build,
+        )
+        .unwrap();
+    assert!(matches!(outcome(&written), Outcome::Written(_)));
+    let restarted = driver.run("restart", Op::Restart, b"").unwrap();
+    assert!(matches!(outcome(&restarted), Outcome::Status(status) if status.build == old));
+    while driver.restarts == 0 {
+        driver.pump().unwrap();
+    }
+    assert_eq!(driver.hello().build, new, "the new build runs");
+    assert_eq!(child.try_wait().unwrap(), None, "in the same process");
+    assert_eq!(child.id(), pid);
+    let replay = driver.run("before", exec("echo again"), b"").unwrap();
+    assert!(replay.result.as_ref().unwrap().replayed);
+    assert_eq!(
+        replay.bytes, before.bytes,
+        "the records survive the restart"
+    );
+    let again = driver.run("restart", Op::Restart, b"").unwrap();
+    assert!(
+        again.result.as_ref().unwrap().replayed,
+        "never restarts twice"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

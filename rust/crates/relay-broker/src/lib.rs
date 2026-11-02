@@ -18,7 +18,7 @@ mod job;
 pub mod net;
 pub mod tls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -77,6 +77,26 @@ struct Links {
     agents: HashMap<Target, Arc<AgentConn>>,
     revoked: HashMap<Target, String>,
     clients: HashMap<Target, Vec<(u64, Session)>>,
+    /// Targets whose relay agent is restarting: no call is handed to them
+    /// until the agent's next session registers.
+    held: HashSet<Target>,
+}
+
+/// Called with every relay agent that registers.
+type AgentWatcher = dyn Fn(&Target, &AgentInfo) + Send + Sync;
+
+/// Why a relay agent was not restarted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartError {
+    /// Calls kept running for the whole drain bound, or the agent refused
+    /// because one runs; nothing was restarted.
+    Busy,
+    /// The agent has no session, or its lease was revoked.
+    Unavailable,
+    /// The agent took the restart but no new session registered in time.
+    NotBack,
+    /// The agent refused the restart.
+    Refused(String),
 }
 
 pub(crate) struct Inner {
@@ -88,6 +108,7 @@ pub(crate) struct Inner {
     jobs: Mutex<HashMap<(Target, String), Arc<Job>>>,
     next_id: AtomicU64,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
+    watchers: Mutex<Vec<Arc<AgentWatcher>>>,
 }
 
 /// What an in-process call answered.
@@ -144,6 +165,7 @@ impl Broker {
                 jobs: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 log: Arc::new(log),
+                watchers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -320,6 +342,30 @@ impl Broker {
         }
     }
 
+    /// Call `watch` with every relay agent that registers, after it is the
+    /// target's session. It runs on the session's thread and must not block.
+    pub fn on_agent(&self, watch: impl Fn(&Target, &AgentInfo) + Send + Sync + 'static) {
+        self.inner
+            .watchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(watch));
+    }
+
+    /// Restart the relay agent of `target` onto the executable at its path
+    /// (RA-6) without losing an execution: wait up to `drain` until no call
+    /// of the target is out, then hold new calls back, send `restart`, and
+    /// wait up to `back` for the agent's next session, to which the held
+    /// calls then go. Returns the agent that registered.
+    pub fn restart_agent(
+        &self,
+        target: &Target,
+        drain: Duration,
+        back: Duration,
+    ) -> Result<AgentInfo, RestartError> {
+        self.inner.restart_agent(target, drain, back)
+    }
+
     /// What the broker, else the relay agent, knows of `execution` (RP-7).
     pub fn query(&self, target: &Target, execution: &str) -> ExecutionState {
         self.inner.query(target, execution, &|_| {})
@@ -407,6 +453,8 @@ impl Inner {
                 session.close();
                 return;
             }
+            // A new session ends a restart's hold: held calls go to it.
+            links.held.remove(&target);
             links.agents.insert(target.clone(), Arc::clone(&conn))
         };
         self.links_changed.notify_all();
@@ -421,6 +469,15 @@ impl Inner {
             hello.build.get(..12).unwrap_or(&hello.build),
             hello.in_flight.len()
         ));
+        let watchers: Vec<Arc<AgentWatcher>> = self
+            .watchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let info = conn.info();
+        for watch in watchers {
+            watch(&target, &info);
+        }
         let log = Arc::clone(&self.log);
         conn.read_until_end(&*log);
         let current = {
@@ -460,7 +517,11 @@ impl Inner {
             if let Some(reason) = links.revoked.get(target) {
                 return Err(Unavailable::Revoked(reason.clone()));
             }
-            if let Some(conn) = links.agents.get(target).filter(|c| c.alive()) {
+            if let Some(conn) = links
+                .agents
+                .get(target)
+                .filter(|c| c.alive() && !links.held.contains(target))
+            {
                 return Ok(Arc::clone(conn));
             }
             let now = Instant::now();
@@ -573,6 +634,98 @@ impl Inner {
                 }
                 _ => return ExecutionState::Unknown,
             }
+        }
+    }
+
+    fn restart_agent(
+        &self,
+        target: &Target,
+        drain: Duration,
+        back: Duration,
+    ) -> Result<AgentInfo, RestartError> {
+        // Hold new calls once no call of the target is out; the check and
+        // the hold happen under the records' lock, which every new call
+        // takes first.
+        let deadline = Instant::now() + drain;
+        let conn = loop {
+            {
+                let jobs = self.jobs();
+                let busy = jobs
+                    .iter()
+                    .any(|((t, _), job)| t == target && !job.is_done());
+                if !busy {
+                    let mut links = self.links();
+                    if links.revoked.contains_key(target) {
+                        return Err(RestartError::Unavailable);
+                    }
+                    let Some(conn) = links.agents.get(target).filter(|c| c.alive()).cloned() else {
+                        return Err(RestartError::Unavailable);
+                    };
+                    links.held.insert(target.clone());
+                    break conn;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(RestartError::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let release = || {
+            self.links().held.remove(target);
+            self.links_changed.notify_all();
+        };
+        let execution = format!(
+            "restart:{}",
+            guest_actions::hex(&rand::random::<[u8; 16]>())
+        );
+        let events = conn.start(&execution, &Op::Restart, &[]);
+        let answered = loop {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(AgentEvent::Result(result)) => break Some(result.outcome),
+                Ok(AgentEvent::Lost) | Err(RecvTimeoutError::Disconnected) => break None,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    release();
+                    return Err(RestartError::NotBack);
+                }
+            }
+        };
+        match answered {
+            Some(Outcome::Failed { code, .. }) if code == "busy" => {
+                release();
+                return Err(RestartError::Busy);
+            }
+            Some(Outcome::Failed { code, message, .. }) => {
+                release();
+                return Err(RestartError::Refused(format!("{code}: {message}")));
+            }
+            _ => {}
+        }
+        (self.log)(&format!(
+            "relay: {target}: relay agent restarting; calls wait for its next session"
+        ));
+        // The next session clears the hold; wait for it.
+        let deadline = Instant::now() + back;
+        let mut links = self.links();
+        loop {
+            if let Some(next) = links
+                .agents
+                .get(target)
+                .filter(|c| c.id != conn.id && c.alive())
+            {
+                return Ok(next.info());
+            }
+            let now = Instant::now();
+            if now >= deadline || links.revoked.contains_key(target) {
+                drop(links);
+                release();
+                return Err(RestartError::NotBack);
+            }
+            links = self
+                .links_changed
+                .wait_timeout(links, (deadline - now).min(Duration::from_secs(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 

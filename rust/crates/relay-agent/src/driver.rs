@@ -39,6 +39,9 @@ pub struct Driver {
     queries: HashMap<u64, ExecutionState>,
     /// Heartbeats received so far.
     pub heartbeats: u64,
+    /// Hellos received after the first: an agent that replaced itself on
+    /// the same link (`relay-agent stdio` after a restart).
+    pub restarts: u64,
 }
 
 impl Driver {
@@ -63,6 +66,7 @@ impl Driver {
             answers: HashMap::new(),
             queries: HashMap::new(),
             heartbeats: 0,
+            restarts: 0,
         })
     }
 
@@ -178,8 +182,11 @@ impl Driver {
                 self.queries.insert(call, state);
             }
             Message::Heartbeat => self.heartbeats += 1,
-            Message::Hello(_)
-            | Message::Call(_)
+            Message::Hello(hello) => {
+                self.hello = hello;
+                self.restarts += 1;
+            }
+            Message::Call(_)
             | Message::Query { .. }
             | Message::Ready(_)
             | Message::Pending(_)

@@ -98,6 +98,10 @@ impl Link for SessionLink {
     fn close(&self) {
         self.session.close();
     }
+
+    fn flush(&self, timeout: std::time::Duration) {
+        let _ = self.session.flush(timeout);
+    }
 }
 
 /// Open a new session to the broker of `config`, as an agent. The first

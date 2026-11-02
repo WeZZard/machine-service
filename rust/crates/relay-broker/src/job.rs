@@ -254,6 +254,11 @@ impl Job {
     fn handed_on(&self) -> bool {
         self.lock().handed_on
     }
+
+    /// Whether the record has its outcome.
+    pub fn is_done(&self) -> bool {
+        self.lock().done.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +324,17 @@ the outcome is uncertain: query it later",
             }
         };
         match result {
+            // An agent that is stopping or restarting refuses before the
+            // commit point; its next session takes the call.
+            Some(result)
+                if matches!(&result.outcome, Outcome::Failed { code, committed: false, .. } if code == "stopping") =>
+            {
+                (inner.log)(&format!(
+                    "relay: {}: the agent is stopping; sending {} to its next session",
+                    job.target, job.execution
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
             Some(result) => {
                 if job.on_result(result, handed_before) && !job.transient {
                     inner.forget(&job);

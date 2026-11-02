@@ -1910,3 +1910,63 @@ fn a_bad_folder_upload_never_lands_and_is_not_recorded() {
     );
     assert!(matches!(outcome(&read), Outcome::Failed { code, .. } if code == "not_a_directory"));
 }
+
+// ---------------------------------------------------------------- restart
+
+/// RA-6 (TL-1): a restart runs only while nothing else runs, is recorded
+/// with the status before it, and never runs twice under one ID.
+#[test]
+fn a_restart_runs_only_when_idle_and_only_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut rig = Rig::new();
+    let refused = rig.run("r0", Op::Restart, b"");
+    assert!(matches!(
+        outcome(&refused),
+        Outcome::Failed { code, committed: false, .. } if code == "unsupported"
+    ));
+    let restarts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&restarts);
+    rig.agent.set_restart(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        std::io::Error::other("a test cannot replace its process")
+    });
+    let call = rig
+        .driver
+        .start("busy", exec("echo started; sleep 30"), b"")
+        .unwrap();
+    first_line(&mut rig.driver, call);
+    let busy = rig.run("r1", Op::Restart, b"");
+    assert!(matches!(
+        outcome(&busy),
+        Outcome::Failed { code, committed: false, .. } if code == "busy"
+    ));
+    assert_eq!(
+        rig.agent.query("r1"),
+        ExecutionState::Unknown,
+        "not recorded"
+    );
+    assert_eq!(restarts.load(Ordering::SeqCst), 0);
+    rig.run(
+        "busy-cancel",
+        Op::Cancel {
+            target: "busy".into(),
+        },
+        b"",
+    );
+    rig.driver.finish(call).unwrap();
+
+    let restarted = rig.run("r2", Op::Restart, b"");
+    assert!(matches!(outcome(&restarted), Outcome::Status(status) if status.running.is_empty()));
+    // The result goes out before the process is replaced.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while restarts.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the restart never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The failed replacement leaves the agent serving.
+    let after = rig.exec("after", "echo still-here");
+    assert_eq!(text(&after), "still-here\n");
+    let again = rig.run("r2", Op::Restart, b"");
+    assert!(again.result.as_ref().unwrap().replayed);
+    assert_eq!(restarts.load(Ordering::SeqCst), 1, "never restarts twice");
+}

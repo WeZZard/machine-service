@@ -568,3 +568,87 @@ fn folders_round_trip_as_tar_streams() {
         }
     }
 }
+
+/// RA-6: a restart of the relay agent waits until no call is out, so the
+/// call that runs completes; a call made during the restart goes to the
+/// agent's next session; the agent's records persist.
+#[test]
+fn a_restart_waits_for_running_calls_and_hands_later_ones_to_the_next_session() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    assert!(wait_until(WAIT, || h.broker.agent(&a.target).is_some()));
+    let restarts = Arc::new(AtomicUsize::new(0));
+    {
+        let restarts = Arc::clone(&restarts);
+        let same = agent.agent.clone();
+        // The in-process agent cannot replace its process; it ends its
+        // session instead, after a moment, and the dialer registers anew.
+        agent.agent.set_restart(move || {
+            restarts.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(500));
+            same.drop_links();
+            std::io::Error::other("restarted in place")
+        });
+    }
+    client.call(1, "slow", exec("sleep 2; echo done"), b"");
+    assert!(wait_until(WAIT, || matches!(
+        h.broker.query(&a.target, "slow"),
+        ExecutionState::Running { .. }
+    )));
+    let broker = h.broker.clone();
+    let target = a.target.clone();
+    let restarting = std::thread::spawn(move || {
+        broker.restart_agent(&target, Duration::from_secs(30), Duration::from_secs(30))
+    });
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(restarts.load(Ordering::SeqCst), 0, "not while a call runs");
+    let slow = client.wait(1, WAIT);
+    assert_eq!(slow.bytes, b"done\n");
+    assert!(matches!(
+        slow.result.unwrap().outcome,
+        Outcome::Exit { rc: Some(0), .. }
+    ));
+    assert!(wait_until(WAIT, || restarts.load(Ordering::SeqCst) == 1));
+    client.call(2, "during", exec("echo during"), b"");
+    let back = restarting.join().unwrap();
+    assert!(back.is_ok(), "{back:?}");
+    let during = client.wait(2, WAIT);
+    assert_eq!(during.bytes, b"during\n");
+    assert!(h.logged("relay agent restarting"));
+    client.call(3, "slow", exec("never"), b"");
+    let replay = client.wait(3, WAIT);
+    assert!(replay.result.unwrap().replayed);
+    assert_eq!(replay.bytes, b"done\n");
+    assert_eq!(restarts.load(Ordering::SeqCst), 1);
+}
+
+/// RA-6: an agent that cannot restart, or one with no session, says so and
+/// keeps serving.
+#[test]
+fn a_restart_that_cannot_happen_releases_the_hold() {
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    assert_eq!(
+        h.broker.restart_agent(
+            &a.target,
+            Duration::from_millis(100),
+            Duration::from_secs(1)
+        ),
+        Err(relay_broker::RestartError::Unavailable)
+    );
+    let _agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    assert!(wait_until(WAIT, || h.broker.agent(&a.target).is_some()));
+    let refused = h
+        .broker
+        .restart_agent(&a.target, Duration::from_secs(5), Duration::from_secs(5));
+    assert!(
+        matches!(&refused, Err(relay_broker::RestartError::Refused(why)) if why.starts_with("unsupported")),
+        "{refused:?}"
+    );
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    client.call(1, "after", exec("echo after"), b"");
+    assert_eq!(client.wait(1, WAIT).bytes, b"after\n");
+}

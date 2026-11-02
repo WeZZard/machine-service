@@ -105,7 +105,13 @@ struct Inner {
     links: Mutex<HashMap<u64, Arc<dyn Link>>>,
     next: AtomicU64,
     stopping: AtomicBool,
+    /// What a committed restart runs; without one, a restart is refused.
+    restart: Mutex<Option<Arc<RestartFn>>>,
 }
+
+/// Replaces the process with the agent's executable; it returns only when
+/// that fails, with the reason.
+pub type RestartFn = dyn Fn() -> std::io::Error + Send + Sync;
 
 struct State {
     store: Store,
@@ -212,6 +218,7 @@ impl Agent {
                 links: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stopping: AtomicBool::new(false),
+                restart: Mutex::new(None),
             }),
         })
     }
@@ -300,6 +307,20 @@ impl Agent {
                 break;
             }
             state = self.inner.settled.wait_timeout(state, left).unwrap().0;
+        }
+    }
+
+    /// Let a committed [`Op::Restart`] run `restart`, which replaces the
+    /// process; the binary passes [`reexec`].
+    pub fn set_restart(&self, restart: impl Fn() -> std::io::Error + Send + Sync + 'static) {
+        *self.inner.restart.lock().unwrap() = Some(Arc::new(restart));
+    }
+
+    /// Close every link and keep running, as a lost connection would: the
+    /// dialer opens a new session, which says hello again.
+    pub fn drop_links(&self) {
+        for link in self.inner.links.lock().unwrap().values() {
+            link.close();
         }
     }
 
@@ -523,7 +544,11 @@ impl Session {
                     Err(error) => return self.refuse(call, &execution, error.code, error.message),
                 }
             }
-            Op::Read { .. } | Op::ReadTree { .. } | Op::Cancel { .. } | Op::Status => {
+            Op::Read { .. }
+            | Op::ReadTree { .. }
+            | Op::Cancel { .. }
+            | Op::Status
+            | Op::Restart => {
                 return self.commit(call, execution, op, Committed::Nothing);
             }
         };
@@ -621,6 +646,9 @@ impl Session {
             drop(state);
             return self.refuse(call, &execution, "stopping", "the relay agent is stopping");
         }
+        if let Op::Restart = op {
+            return self.restart(state, call, execution);
+        }
         if let Err(error) = state.store.begin(&execution, op.kind()) {
             drop(state);
             return self.refuse(
@@ -707,6 +735,61 @@ impl Session {
         };
         drop(state);
         self.answer(call, execution, known, false);
+    }
+
+    /// A restart commits only while nothing else runs or waits for its end
+    /// on this link, so no execution is in flight when the process is
+    /// replaced; otherwise it is refused with `busy` and not recorded. Its
+    /// record holds the status before the restart, so the agent that
+    /// starts answers a repeated ID from it and never restarts twice.
+    fn restart(&mut self, mut state: MutexGuard<'_, State>, call: u64, execution: String) {
+        let inner = Arc::clone(&self.inner);
+        let Some(restart) = inner.restart.lock().unwrap().clone() else {
+            drop(state);
+            return self.refuse(
+                call,
+                &execution,
+                "unsupported",
+                "this agent cannot restart itself",
+            );
+        };
+        let others = self.active.lock().unwrap().len() + self.pending.len();
+        if !state.live.is_empty() || others > 0 {
+            let running = state.live.len() + others;
+            drop(state);
+            return self.refuse(
+                call,
+                &execution,
+                "busy",
+                format!("{running} operations run or wait; restart when none does"),
+            );
+        }
+        let outcome = Outcome::Status(inner.status(&state));
+        let recorded = state
+            .store
+            .begin(&execution, OpKind::Restart)
+            .and_then(|()| state.store.complete(&execution, outcome.clone()));
+        if let Err(error) = recorded {
+            drop(state);
+            return self.refuse(
+                call,
+                &execution,
+                "record_failed",
+                format!("the restart could not be recorded: {error}"),
+            );
+        }
+        // Nothing commits from here on; a call that arrives now is refused
+        // with `stopping`, which the broker sends again to the next agent.
+        inner.stopping.store(true, Ordering::SeqCst);
+        drop(state);
+        send_result(&inner, &*self.link, call, &execution, false, outcome);
+        for link in inner.links.lock().unwrap().values() {
+            link.flush(Duration::from_secs(2));
+        }
+        let error = restart();
+        // The process was not replaced: carry on as before.
+        eprintln!("relay-agent: the restart failed: {error}");
+        inner.stopping.store(false, Ordering::SeqCst);
     }
 
     fn cancel(&mut self, state: &State, target: &str) -> CancelFound {
@@ -1044,4 +1127,15 @@ fn stream_output(
         }
         .encode(),
     )
+}
+
+/// Replace this process with `executable`, given the arguments the process
+/// started with. The descriptors the agent opened close on `exec`, except
+/// standard input and output, which `relay-agent stdio` keeps serving.
+/// Returns only when the replacement fails.
+pub fn reexec(executable: &std::path::Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .exec()
 }

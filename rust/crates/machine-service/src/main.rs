@@ -203,7 +203,9 @@ fn start_relay(service: &Arc<Service>) -> Result<(), String> {
     durable_routes::install_relay(&relay, &service.config.state_dir);
     service
         .install_relay(relay)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    service.watch_relay_agents();
+    Ok(())
 }
 
 /// `virtual` needs Tart as well as a catalog: a Mac without Tart offers only
