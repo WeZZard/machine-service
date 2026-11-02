@@ -501,3 +501,156 @@ fn plain_websocket_serves_loopback() {
     session.send(b"hi".to_vec()).unwrap();
     assert_eq!(recv(&remote), b"hi");
 }
+
+/// A shaped link behind a deep queue that both directions share, as a proxy
+/// that handles a connection's messages one after the other does (the rig's
+/// edge under N2): the receiver's acknowledgements wait behind the bytes the
+/// proxy still owes it. Scaled down: 8 MB/s and a 1.5 s dead bound.
+fn slow_shared_link() -> (Server, FaultProxy, Session, Session, Timing) {
+    let cert = Cert::localhost();
+    let timing = Timing {
+        dead_after: Duration::from_millis(1500),
+        ..fast_timing()
+    };
+    let server = Server::start(&cert, timing.clone(), Duration::from_secs(60));
+    let proxy = FaultProxy::start(server.addr(), Mode::Tcp);
+    proxy.set_one_queue(true);
+    proxy.set_bandwidth(8_000_000);
+    proxy.set_latency(Duration::from_millis(40), Duration::from_millis(20));
+    let session = connect(client(proxy.url("wss"), &cert, timing.clone())).unwrap();
+    let remote = server.accept();
+    (server, proxy, session, remote, timing)
+}
+
+/// Send `n` bodies of `size` bytes, each starting with its number.
+fn bulk(session: Session, n: u32, size: usize) -> std::thread::JoinHandle<Session> {
+    std::thread::spawn(move || {
+        for i in 0..n {
+            let mut body = vec![0u8; size];
+            body[..4].copy_from_slice(&i.to_be_bytes());
+            session.send(body).unwrap();
+        }
+        session
+    })
+}
+
+fn receive_bulk(session: &Session, n: u32) {
+    for i in 0..n {
+        let body = session
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .expect("a body within 30 s");
+        assert_eq!(body[..4], i.to_be_bytes(), "each body once, in order");
+    }
+}
+
+fn disconnects(rx: &Receiver<LinkEvent>) -> Vec<String> {
+    rx.try_iter()
+        .filter_map(|e| match e {
+            LinkEvent::Disconnected { reason } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_bulk_transfer_on_a_healthy_slow_link_never_reconnects() {
+    let (_server, _proxy, session, remote, timing) = slow_shared_link();
+    let (client_events, server_events) = (
+        session.take_events().unwrap(),
+        remote.take_events().unwrap(),
+    );
+    // 48 MiB is 6 s of the link, four times the dead bound. Before the flow
+    // window, the whole 64 MiB replay buffer went into the queue, the oldest
+    // body waited 6 s for its acknowledgement and the sender declared the
+    // healthy link stalled every 1.5 s.
+    let n = 48;
+    let started = Instant::now();
+    let sender = bulk(remote, n, MAX_BODY);
+    receive_bulk(&session, n);
+    let remote = sender.join().unwrap();
+    remote.flush(Duration::from_secs(10)).unwrap();
+    assert!(
+        started.elapsed() > timing.dead_after * 3,
+        "the link was shaped"
+    );
+    let lost = [disconnects(&client_events), disconnects(&server_events)].concat();
+    assert!(lost.is_empty(), "a healthy slow link reconnected: {lost:?}");
+    let counters = remote.counters();
+    assert_eq!(counters.connections, 1);
+    assert!(counters.rtt.samples > 0);
+    session.close();
+}
+
+#[test]
+fn a_stall_on_a_slow_link_is_still_detected_within_the_bound() {
+    let (_server, proxy, session, remote, timing) = slow_shared_link();
+    let (client_events, server_events) = (
+        session.take_events().unwrap(),
+        remote.take_events().unwrap(),
+    );
+    let n = 32;
+    let sender = bulk(remote, n, MAX_BODY);
+    // Mid-transfer the path stops carrying anything, keeping its connections.
+    for _ in 0..4 {
+        session
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+    }
+    proxy.set_hang(true);
+    let hung_at = Instant::now();
+    let deadline = hung_at + timing.dead_after * 3;
+    let detected = loop {
+        let lost = [disconnects(&client_events), disconnects(&server_events)].concat();
+        if !lost.is_empty() {
+            break hung_at.elapsed();
+        }
+        assert!(Instant::now() < deadline, "the stall went unnoticed");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        detected <= timing.dead_after + Duration::from_millis(500),
+        "detected after {detected:?}"
+    );
+    proxy.reset();
+    proxy.set_hang(false);
+    // The session resumes and every body still arrives once, in order.
+    for i in 4..n {
+        let body = session
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .expect("a body after the resume");
+        assert_eq!(body[..4], i.to_be_bytes());
+    }
+    let remote = sender.join().unwrap();
+    remote.flush(Duration::from_secs(10)).unwrap();
+    session.close();
+}
+
+#[test]
+fn the_counters_count_a_lookup_before_a_request_as_a_second_round_trip() {
+    let cert = Cert::localhost();
+    let server = Server::start(&cert, fast_timing(), Duration::from_secs(60));
+    let session = connect(client(server.url(), &cert, fast_timing())).unwrap();
+    let _echo = echo(server.accept());
+    // A request in several bodies, then its answers: one round trip.
+    let before = session.counters();
+    session.send(b"call".to_vec()).unwrap();
+    session.send(b"chunk".to_vec()).unwrap();
+    recv(&session);
+    recv(&session);
+    assert_eq!(session.counters().round_trips_since(&before), 1);
+    // A lookup answered before the request: two.
+    let before = session.counters();
+    session.send(b"lookup".to_vec()).unwrap();
+    recv(&session);
+    session.send(b"call".to_vec()).unwrap();
+    recv(&session);
+    let after = session.counters();
+    assert_eq!(after.round_trips_since(&before), 2);
+    assert_eq!((after.sent, after.received, after.connections), (4, 4, 1));
+    session.flush(Duration::from_secs(5)).unwrap();
+    assert!(session.counters().rtt.samples > 0);
+    session.close();
+}

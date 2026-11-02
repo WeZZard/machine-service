@@ -10,6 +10,7 @@ use rustls::{ClientConnection, ServerConnection, StreamOwned};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
+use crate::flow::{FlowWindow, RttMeter};
 use crate::session::Shared;
 use crate::state::{Accepted, ProtocolError};
 use crate::timing::Timing;
@@ -111,8 +112,9 @@ pub(crate) enum Exit {
     Lost(String),
     /// Nothing arrived for `dead_after`.
     Dead,
-    /// Bodies written on this connection went unacknowledged for
-    /// `dead_after` although the peer was heard from.
+    /// Bodies were in flight on this connection and the peer's
+    /// acknowledgement did not advance for `dead_after`, although the peer
+    /// was heard from. The flow window keeps a healthy link far from this.
     Stalled,
     /// A newer connection took over the session.
     Superseded,
@@ -151,9 +153,14 @@ pub(crate) fn run(ws: &mut Ws, shared: &Shared, generation: u64, timing: &Timing
     let mut last_tx = Instant::now();
     let mut blocked = false;
     // The peer acknowledges on receipt, independently of its payload layer, so
-    // acknowledgements that stop while bodies are outstanding mean the
-    // connection lost them; resuming on a new one replays them.
+    // acknowledgements that stop while bodies are in flight mean the
+    // connection lost them; resuming on a new one replays them. Liveness is
+    // the acknowledgement's progress, never the age of the oldest body: the
+    // flow window keeps that age within a third of the bound on a healthy
+    // link of any speed.
     let mut acked = (0, Instant::now());
+    let mut flow = FlowWindow::new(timing.dead_after, shared.max_buffered);
+    let mut rtt = RttMeter::default();
     loop {
         // Outbound: envelopes, then an acknowledgement or a heartbeat.
         let (frames, ack, closing) = {
@@ -164,10 +171,11 @@ pub(crate) fn run(ws: &mut Ws, shared: &Shared, generation: u64, timing: &Timing
             if inner.end.is_some() {
                 return Exit::Ended;
             }
+            let window = flow.window();
             let frames: Vec<Envelope> = if blocked || inner.close_requested {
                 Vec::new()
             } else {
-                std::iter::from_fn(|| inner.seq.next_to_send())
+                std::iter::from_fn(|| inner.seq.next_within(window))
                     .take(BATCH)
                     .collect()
             };
@@ -185,14 +193,21 @@ pub(crate) fn run(ws: &mut Ws, shared: &Shared, generation: u64, timing: &Timing
         for frame in frames {
             let seq = frame.seq;
             match ws.write(Message::Binary(frame.encode().into())) {
-                Ok(()) => last_tx = Instant::now(),
+                Ok(()) => {
+                    last_tx = Instant::now();
+                    rtt.wrote(seq, last_tx);
+                }
                 // The frame was refused; it goes out again once the buffer drains.
                 Err(tungstenite::Error::WriteBufferFull(_)) => {
                     shared.lock().seq.rewind(seq);
+                    rtt.rewind(seq);
                     break;
                 }
                 // The frame is queued in the write buffer; the flush below decides.
-                Err(e) if would_block(&e) => last_tx = Instant::now(),
+                Err(e) if would_block(&e) => {
+                    last_tx = Instant::now();
+                    rtt.wrote(seq, last_tx);
+                }
                 Err(e) => return Exit::Lost(e.to_string()),
             }
         }
@@ -249,9 +264,16 @@ pub(crate) fn run(ws: &mut Ws, shared: &Shared, generation: u64, timing: &Timing
         if last_rx.elapsed() >= timing.dead_after {
             return Exit::Dead;
         }
+        let now = Instant::now();
         let (now_acked, awaiting) = {
-            let inner = shared.lock();
-            (inner.seq.acked(), inner.seq.awaiting_ack())
+            let mut inner = shared.lock();
+            let (now_acked, awaiting) = (inner.seq.acked(), inner.seq.awaiting_ack());
+            if let Some(sample) = rtt.acked(now_acked, now) {
+                inner.counters.rtt.sample(sample);
+            }
+            let busy = inner.seq.unacked() > 0;
+            flow.observe(now, inner.seq.acked_bytes(), busy, inner.counters.rtt.min);
+            (now_acked, awaiting)
         };
         if now_acked != acked.0 || !awaiting {
             acked = (now_acked, Instant::now());
@@ -264,7 +286,7 @@ pub(crate) fn run(ws: &mut Ws, shared: &Shared, generation: u64, timing: &Timing
 fn deliver(shared: &Shared, envelope: Envelope) -> Result<(), ProtocolError> {
     let mut inner = shared.lock();
     if let Accepted::Deliver(body) = inner.seq.accept(envelope)? {
-        inner.inbox.push_back(body);
+        inner.deliver(body);
     }
     drop(inner);
     shared.changed.notify_all();

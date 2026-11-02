@@ -1603,14 +1603,20 @@ fn ac69(ctx: &mut Ctx<'_>) -> Verdict {
     Ok(())
 }
 
-// AC-70: the link's share of an action's time.
+// AC-70: speed is measured and reported, never judged (DC-193); what is
+// judged is that each action costs one round trip of the open session
+// (DC-194), counted from the session's own counters.
 fn ac70(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_client(ctx)?;
     let command = "perl -MTime::HiRes=time -e '$s=time; system(\"ls -la ~ >/dev/null\"); printf \"%.6f\\n\", time-$s'";
     let mut total = Vec::new();
     let mut guest = Vec::new();
+    let mut trips = Vec::new();
+    let mut path_rtt = Vec::new();
     for _ in 0..100 {
+        let before = client.session().counters();
         let answer = client.exec(command, 120.0, Duration::from_secs(600))?;
+        let after = client.session().counters();
         let g: f64 = answer
             .text()
             .trim()
@@ -1618,11 +1624,26 @@ fn ac70(ctx: &mut Ctx<'_>) -> Verdict {
             .map_err(|_| format!("the action printed {:?}", answer.text()))?;
         total.push(answer.elapsed.as_secs_f64());
         guest.push(g);
+        trips.push(after.round_trips_since(&before));
+        // The call's envelope to the acknowledgement that covers it: the
+        // broker acknowledges on receipt, so this is the path's own round
+        // trip, without the guest's work.
+        if after.rtt.samples > before.rtt.samples {
+            if let Some(rtt) = after.rtt.last {
+                path_rtt.push(rtt.as_secs_f64());
+            }
+        }
     }
     let link: Vec<f64> = total
         .iter()
         .zip(&guest)
         .map(|(t, g)| (t - g).max(0.0))
+        .collect();
+    let extra: Vec<(usize, u64)> = trips
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, n)| n != 1)
         .collect();
     let report = json!({
         "cell": ctx.cell.id(),
@@ -1631,9 +1652,23 @@ fn ac70(ctx: &mut Ctx<'_>) -> Verdict {
         "total_s": Summary::of(&total),
         "guest_s": Summary::of(&guest),
         "link_s": Summary::of(&link),
-        "method": "guest time is the action's own clock around its work; link time is the client's round trip less that",
+        "path_rtt_s": Summary::of(&path_rtt),
+        "round_trips": {
+            "per_action": Summary::of(&trips.iter().map(|&n| n as f64).collect::<Vec<_>>()),
+            "not_one": extra.iter().map(|&(i, n)| json!({"action": i, "round_trips": n})).collect::<Vec<_>>(),
+        },
+        "method": "guest time is the action's own clock around its work; link time is the client's round trip less that; the path's round trip is the call's envelope to the broker's acknowledgement; round trips are the client session's flights and new connections during the action",
     });
     let _ = std::fs::write(ctx.run_dir.join("speed.json"), format!("{report:#}\n"));
     ctx.record("speed", report);
-    Ok(())
+    if extra.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} actions cost other than one round trip of the open session: {extra:?}",
+            extra.len(),
+            trips.len()
+        )
+        .into())
+    }
 }

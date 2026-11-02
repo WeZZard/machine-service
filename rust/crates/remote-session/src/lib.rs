@@ -22,6 +22,7 @@
 //! `bye` closes the session on purpose.
 
 mod client;
+mod flow;
 mod link;
 mod server;
 mod session;
@@ -32,11 +33,12 @@ pub mod tls;
 mod wire;
 
 pub use client::{connect, fixed_resolver, ClientConfig, Resolver};
+pub use flow::{Rtt, INITIAL_WINDOW, MIN_WINDOW};
 pub use server::{
     AuthRequest, Authenticator, Listening, Rejection, ServerConfig, SessionServer, StaticToken,
     DEFAULT_GRACE, DEFAULT_SESSION_PORT, RELAY_PATH, SESSION_PORT_ENV,
 };
-pub use session::{LinkEvent, Session, SessionEnd, Status, DEFAULT_MAX_BUFFERED};
+pub use session::{Counters, LinkEvent, Session, SessionEnd, Status, DEFAULT_MAX_BUFFERED};
 pub use state::ProtocolError;
 pub use timing::{Backoff, Timing, MAX_HEARTBEAT};
 pub use wire::{split_body, ExpiryReason, RejectCode, ENVELOPE_HEADER, MAX_BODY, MAX_MESSAGE};

@@ -42,6 +42,11 @@ pub(crate) struct SeqState {
     cursor: u64,
     /// The `received` value last told to the peer on the current connection.
     ack_sent: u64,
+    /// Bytes of the bodies written on the current connection and not yet
+    /// acknowledged: those from `acked + 1` to `cursor`.
+    in_flight: usize,
+    /// Bytes of every body the peer acknowledged, over the session.
+    acked_bytes: u64,
 }
 
 impl SeqState {
@@ -79,6 +84,10 @@ impl SeqState {
                 .pop_front()
                 .expect("outbox covers acked..last_seq");
             self.outbox_bytes -= body.len();
+            if self.acked < self.cursor {
+                self.in_flight -= body.len();
+            }
+            self.acked_bytes += body.len() as u64;
             self.acked += 1;
         }
         Ok(())
@@ -95,15 +104,31 @@ impl SeqState {
         }
         self.ack(peer_received)?;
         self.cursor = peer_received;
+        self.in_flight = 0;
         self.ack_sent = 0;
         Ok(())
     }
 
     /// The next envelope to write on the current connection, if any.
+    #[cfg(test)]
     pub fn next_to_send(&mut self) -> Option<Envelope> {
-        self.cursor = self.cursor.max(self.acked);
+        self.next_within(usize::MAX)
+    }
+
+    /// The next envelope to write on the current connection, if the bytes in
+    /// flight stay within `window`. With nothing in flight one body always
+    /// goes, so a body larger than the window still moves.
+    pub fn next_within(&mut self, window: usize) -> Option<Envelope> {
+        if self.cursor < self.acked {
+            self.cursor = self.acked;
+            self.in_flight = 0;
+        }
         let index = usize::try_from(self.cursor - self.acked).ok()?;
         let body = self.outbox.get(index)?.clone();
+        if self.in_flight > 0 && self.in_flight + body.len() > window {
+            return None;
+        }
+        self.in_flight += body.len();
         self.cursor += 1;
         self.ack_sent = self.received;
         Some(Envelope {
@@ -116,7 +141,11 @@ impl SeqState {
     /// Forget that `seq` and everything after it were written, because the
     /// connection refused it; they go out again.
     pub fn rewind(&mut self, seq: u64) {
-        self.cursor = self.cursor.min(seq.saturating_sub(1));
+        while self.cursor >= seq && self.cursor > self.acked {
+            let index = usize::try_from(self.cursor - self.acked - 1).expect("in the outbox");
+            self.in_flight -= self.outbox[index].len();
+            self.cursor -= 1;
+        }
     }
 
     pub fn needs_ack(&self) -> bool {
@@ -137,6 +166,17 @@ impl SeqState {
     /// acknowledgement.
     pub fn awaiting_ack(&self) -> bool {
         self.cursor > self.acked
+    }
+
+    /// Bytes written on the current connection and not yet acknowledged.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Bytes the peer acknowledged over the session.
+    pub fn acked_bytes(&self) -> u64 {
+        self.acked_bytes
     }
 
     pub fn received(&self) -> u64 {
@@ -202,6 +242,31 @@ mod tests {
         assert_eq!((s.unacked(), s.outbox_bytes()), (0, 0));
         assert!(s.ack(4).is_err());
         assert!(s.resume(2).is_err());
+    }
+
+    #[test]
+    fn the_window_bounds_the_bytes_in_flight() {
+        let mut s = SeqState::default();
+        for _ in 0..5 {
+            s.push(vec![0; 10]);
+        }
+        let sent: Vec<u64> = std::iter::from_fn(|| s.next_within(25))
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!((sent, s.in_flight()), (vec![1, 2], 20));
+        s.ack(1).unwrap();
+        assert_eq!(s.in_flight(), 10);
+        assert_eq!(s.next_within(25).unwrap().seq, 3);
+        assert!(s.next_within(25).is_none());
+        s.rewind(3);
+        assert_eq!(s.in_flight(), 10);
+        // A body above the window goes alone.
+        s.ack(2).unwrap();
+        assert_eq!((s.in_flight(), s.acked_bytes()), (0, 20));
+        assert_eq!(s.next_within(5).unwrap().seq, 3);
+        assert!(s.next_within(5).is_none());
+        s.resume(2).unwrap();
+        assert_eq!(s.in_flight(), 0);
     }
 
     #[test]

@@ -73,6 +73,13 @@ struct State {
     refuse: AtomicBool,
     latency_ms: AtomicU64,
     jitter_ms: AtomicU64,
+    /// Bytes per second each forwarding loop writes; 0 is no cap.
+    bandwidth: AtomicU64,
+    /// Carry both directions of a connection through one queue in arrival
+    /// order, as a proxy that handles a connection's messages one after the
+    /// other does: what the client sends waits behind what it still owes
+    /// the client.
+    one_queue: AtomicBool,
     accepted: AtomicU64,
     conns: Mutex<Vec<Conn>>,
     stop: AtomicBool,
@@ -98,6 +105,8 @@ impl FaultProxy {
             refuse: AtomicBool::new(false),
             latency_ms: AtomicU64::new(0),
             jitter_ms: AtomicU64::new(0),
+            bandwidth: AtomicU64::new(0),
+            one_queue: AtomicBool::new(false),
             accepted: AtomicU64::new(0),
             conns: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
@@ -156,6 +165,19 @@ impl FaultProxy {
             .store(jitter.as_millis() as u64, Ordering::SeqCst);
     }
 
+    /// Cap each forwarding loop at `bytes_per_second`, holding the excess
+    /// in an unbounded buffer, as a shaped link behind a deep queue does.
+    pub fn set_bandwidth(&self, bytes_per_second: u64) {
+        self.state
+            .bandwidth
+            .store(bytes_per_second, Ordering::SeqCst);
+    }
+
+    /// Carry both directions of new connections through one queue.
+    pub fn set_one_queue(&self, on: bool) {
+        self.state.one_queue.store(on, Ordering::SeqCst);
+    }
+
     pub fn accepted(&self) -> u64 {
         self.state.accepted.load(Ordering::SeqCst)
     }
@@ -199,6 +221,9 @@ fn serve(state: Arc<State>, client: TcpStream) {
         killed: killed.clone(),
     });
     match state.mode.clone() {
+        Mode::Tcp if state.one_queue.load(Ordering::SeqCst) => {
+            one_queue(state, killed, client, upstream)
+        }
         Mode::Tcp => {
             let a = (client.try_clone().unwrap(), upstream.try_clone().unwrap());
             let (s1, k1) = (state.clone(), killed.clone());
@@ -209,29 +234,60 @@ fn serve(state: Arc<State>, client: TcpStream) {
     }
 }
 
-/// Forward `from` to `to`, delaying each chunk by the latency and holding it
-/// while hung. Order is kept: a chunk never overtakes the one before it.
-fn pump(state: Arc<State>, killed: Arc<AtomicBool>, mut from: TcpStream, mut to: TcpStream) {
-    let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
-    let (ws, wk) = (state.clone(), killed.clone());
-    let mut writer_to = to.try_clone().unwrap();
-    let writer = std::thread::spawn(move || {
-        while let Ok((due, bytes)) = rx.recv() {
-            loop {
-                if wk.load(Ordering::SeqCst) {
-                    return;
-                }
-                if !ws.hang.load(Ordering::SeqCst) && Instant::now() >= due {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            if writer_to.write_all(&bytes).is_err() {
-                return;
-            }
+/// When a chunk read now is due: after the latency and jitter, and never
+/// before the chunk read before it.
+fn due_after(state: &State, last_due: &mut Instant) -> Instant {
+    let base = state.latency_ms.load(Ordering::SeqCst);
+    let jitter = state.jitter_ms.load(Ordering::SeqCst);
+    let extra = if jitter == 0 {
+        0
+    } else {
+        rand::random::<u64>() % (jitter + 1)
+    };
+    let due = (Instant::now() + Duration::from_millis(base + extra)).max(*last_due);
+    *last_due = due;
+    due
+}
+
+/// Wait until `due` and not hung; false once the connection is killed.
+fn wait_due(state: &State, killed: &AtomicBool, due: Instant) -> bool {
+    loop {
+        if killed.load(Ordering::SeqCst) {
+            return false;
         }
-        let _ = writer_to.shutdown(Shutdown::Write);
-    });
+        if !state.hang.load(Ordering::SeqCst) && Instant::now() >= due {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Write `bytes` at the bandwidth cap.
+fn write_shaped(state: &State, to: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    let rate = state.bandwidth.load(Ordering::SeqCst);
+    if rate == 0 {
+        return to.write_all(bytes);
+    }
+    let step = (rate / 100).max(1) as usize;
+    for piece in bytes.chunks(step) {
+        let started = Instant::now();
+        to.write_all(piece)?;
+        let take = Duration::from_secs_f64(piece.len() as f64 / rate as f64);
+        if let Some(rest) = take.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+    Ok(())
+}
+
+/// Read `from` into `tx` as `(direction, due, bytes)` until it ends.
+fn read_into<D: Copy + Send + 'static>(
+    state: Arc<State>,
+    killed: Arc<AtomicBool>,
+    mut from: TcpStream,
+    tx: mpsc::Sender<(D, Instant, Vec<u8>)>,
+    direction: D,
+) {
     from.set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
     let mut buf = vec![0u8; 64 * 1024];
@@ -240,16 +296,8 @@ fn pump(state: Arc<State>, killed: Arc<AtomicBool>, mut from: TcpStream, mut to:
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let base = state.latency_ms.load(Ordering::SeqCst);
-                let jitter = state.jitter_ms.load(Ordering::SeqCst);
-                let extra = if jitter == 0 {
-                    0
-                } else {
-                    rand::random::<u64>() % (jitter + 1)
-                };
-                let due = (Instant::now() + Duration::from_millis(base + extra)).max(last_due);
-                last_due = due;
-                if tx.send((due, buf[..n].to_vec())).is_err() {
+                let due = due_after(&state, &mut last_due);
+                if tx.send((direction, due, buf[..n].to_vec())).is_err() {
                     break;
                 }
             }
@@ -261,7 +309,53 @@ fn pump(state: Arc<State>, killed: Arc<AtomicBool>, mut from: TcpStream, mut to:
             Err(_) => break,
         }
     }
+}
+
+/// Both directions through one queue in arrival order (see `one_queue`).
+fn one_queue(state: Arc<State>, killed: Arc<AtomicBool>, client: TcpStream, upstream: TcpStream) {
+    let (tx, rx) = mpsc::channel::<(bool, Instant, Vec<u8>)>();
+    for (from, toward_client) in [
+        (client.try_clone().unwrap(), false),
+        (upstream.try_clone().unwrap(), true),
+    ] {
+        let (s, k, tx) = (state.clone(), killed.clone(), tx.clone());
+        std::thread::spawn(move || read_into(s, k, from, tx, toward_client));
+    }
     drop(tx);
+    let (mut to_client, mut to_upstream) = (client, upstream);
+    while let Ok((toward_client, due, bytes)) = rx.recv() {
+        if !wait_due(&state, &killed, due) {
+            return;
+        }
+        let to = if toward_client {
+            &mut to_client
+        } else {
+            &mut to_upstream
+        };
+        if write_shaped(&state, to, &bytes).is_err() {
+            return;
+        }
+    }
+}
+
+/// Forward `from` to `to`, delaying each chunk by the latency and holding it
+/// while hung. Order is kept: a chunk never overtakes the one before it.
+fn pump(state: Arc<State>, killed: Arc<AtomicBool>, from: TcpStream, mut to: TcpStream) {
+    let (tx, rx) = mpsc::channel::<((), Instant, Vec<u8>)>();
+    let (ws, wk) = (state.clone(), killed.clone());
+    let mut writer_to = to.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        while let Ok((_, due, bytes)) = rx.recv() {
+            if !wait_due(&ws, &wk, due) {
+                return;
+            }
+            if write_shaped(&ws, &mut writer_to, &bytes).is_err() {
+                return;
+            }
+        }
+        let _ = writer_to.shutdown(Shutdown::Write);
+    });
+    read_into(state, killed, from, tx, ());
     let _ = writer.join();
     let _ = to.flush();
 }

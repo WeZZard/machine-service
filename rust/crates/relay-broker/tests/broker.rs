@@ -132,6 +132,29 @@ fn a_repeated_execution_id_never_runs_twice() {
 }
 
 #[test]
+fn a_short_action_costs_one_round_trip_of_the_open_session() {
+    // DC-194: no new connection, hello, lookup or wait for an acknowledgement
+    // stands between a call and its result, on either session.
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let _agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    for call in 1..=20 {
+        let before = client.session.counters();
+        client.call(call, &format!("short-{call}"), exec("echo ok"), b"");
+        assert_eq!(client.wait(call, WAIT).bytes, b"ok\n");
+        let after = client.session.counters();
+        assert_eq!(after.round_trips_since(&before), 1, "call {call}");
+        assert_eq!(after.connections, 1);
+    }
+    // The broker acknowledges each call on receipt, so the client measures
+    // the path's round trip from it.
+    let rtt = client.session.counters().rtt;
+    assert!(rtt.samples >= 20, "{rtt:?}");
+    assert!(rtt.min.unwrap() < Duration::from_secs(1), "{rtt:?}");
+}
+
+#[test]
 fn a_late_caller_attaches_to_a_running_command() {
     let h = Harness::start(Options::default());
     let a = lease(&h.broker, "vm-a");

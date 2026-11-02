@@ -6,12 +6,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::flow::Rtt;
 use crate::state::SeqState;
 use crate::wire::{ExpiryReason, RejectCode, MAX_BODY};
 use crate::Error;
 
 /// The default bound on bytes a side holds unacknowledged before
-/// [`Session::send`] waits.
+/// [`Session::send`] waits: the replay buffer. How much of it one connection
+/// has in flight is the flow window's business (RS-4).
 pub const DEFAULT_MAX_BUFFERED: usize = 64 << 20;
 
 /// How a session ended. After the end, no message is sent or received.
@@ -52,6 +54,39 @@ pub struct Status {
     pub received: u64,
 }
 
+/// What a session has done so far, over all its connections, for
+/// measurement: AC-70 counts an action's round trips from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Connections that carried the session, the first one included. Each
+    /// costs a handshake.
+    pub connections: u64,
+    /// Bodies the payload layer sent.
+    pub sent: u64,
+    /// Bodies delivered to the payload layer.
+    pub received: u64,
+    /// Flights: runs of sends with no body received between them. A request
+    /// answered by the peer and then followed by the next request is two
+    /// flights, so an action's flights are its round trips on an open
+    /// session; acknowledgements never start one, because nothing waits for
+    /// them.
+    pub flights: u64,
+    /// Round trips measured from envelopes to the acknowledgements that
+    /// cover them.
+    pub rtt: Rtt,
+}
+
+impl Counters {
+    /// The round trips spent since `before` (DC-194): one for each flight
+    /// this side sent, and one for each new connection, whose hello and
+    /// welcome are a round trip of their own. A lookup before a request, or
+    /// a wait for an acknowledgement before sending on, is a second flight,
+    /// so a request answered on an open session is exactly 1.
+    pub fn round_trips_since(&self, before: &Counters) -> u64 {
+        (self.flights - before.flights) + (self.connections - before.connections)
+    }
+}
+
 pub(crate) struct Inner {
     pub seq: SeqState,
     pub inbox: VecDeque<Vec<u8>>,
@@ -61,6 +96,9 @@ pub(crate) struct Inner {
     /// no longer current stops.
     pub generation: u64,
     pub connected: bool,
+    pub counters: Counters,
+    /// Whether a body arrived since this side last sent one.
+    heard: bool,
     events: Sender<LinkEvent>,
 }
 
@@ -80,8 +118,24 @@ impl Inner {
     pub fn attach(&mut self, resumed: bool, peer: SocketAddr) -> u64 {
         self.generation += 1;
         self.connected = true;
+        self.counters.connections += 1;
         self.emit(LinkEvent::Connected { resumed, peer });
         self.generation
+    }
+
+    /// A body arrived for the payload layer.
+    pub fn deliver(&mut self, body: Vec<u8>) {
+        self.counters.received += 1;
+        self.heard = true;
+        self.inbox.push_back(body);
+    }
+
+    fn push(&mut self, body: Vec<u8>) -> u64 {
+        self.counters.sent += 1;
+        if std::mem::take(&mut self.heard) || self.counters.flights == 0 {
+            self.counters.flights += 1;
+        }
+        self.seq.push(body)
     }
 
     pub fn detach(&mut self, generation: u64, reason: String) -> bool {
@@ -114,6 +168,8 @@ impl Shared {
                 close_requested: false,
                 generation: 0,
                 connected: false,
+                counters: Counters::default(),
+                heard: false,
                 events,
             }),
             changed: Condvar::new(),
@@ -236,7 +292,7 @@ impl Session {
             }
             let fits = inner.seq.outbox_bytes() + body.len() <= shared.max_buffered;
             if fits || inner.seq.unacked() == 0 {
-                let seq = inner.seq.push(body);
+                let seq = inner.push(body);
                 drop(inner);
                 shared.changed.notify_all();
                 return Ok(seq);
@@ -334,6 +390,11 @@ impl Session {
             unacked: inner.seq.unacked(),
             received: inner.seq.received(),
         }
+    }
+
+    /// What the session has done so far.
+    pub fn counters(&self) -> Counters {
+        self.handle.shared.lock().counters
     }
 
     /// The session's connection events. The first call takes the receiver;
