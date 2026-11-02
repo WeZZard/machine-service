@@ -507,8 +507,25 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Try a hello and report how the broker answered it: `Ok` with the
-/// session's `ready`, or the refusal.
+/// session's `ready`, or the refusal. A connection that the network loses
+/// before the broker answers says nothing about the credential, so the
+/// hello is tried again, for up to two minutes, as a client would (TC-2).
 pub fn try_hello(options: &ClientOptions) -> Result<Ready, remote_session::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let result = hello_once(options);
+        let lost = matches!(
+            result,
+            Err(remote_session::Error::Connect(_)) | Err(remote_session::Error::Timeout)
+        );
+        if !lost || std::time::Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn hello_once(options: &ClientOptions) -> Result<Ready, remote_session::Error> {
     let config = options.config().map_err(remote_session::Error::Config)?;
     let session = remote_session::connect(config)?;
     let ready =
