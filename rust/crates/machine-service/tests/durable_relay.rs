@@ -279,6 +279,48 @@ impl Lab {
         }
     }
 
+    /// Stop the instance and start it again on the same state (DM-8).
+    fn restart_daemon(&mut self) {
+        if let Some(mut daemon) = self.daemon.take() {
+            // SAFETY: the PID is this test's own child.
+            unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+            let _ = daemon.wait();
+        }
+        let config = self.root.join("config");
+        self.start_daemon(&config);
+    }
+
+    /// The service's log.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.state.join("service.log")).unwrap_or_default()
+    }
+
+    /// The leases whose purge is pending, as the machine record and
+    /// `/health` both show them (DC-177).
+    fn pending_purges(&self, name: &str) -> Vec<String> {
+        let ids = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .unwrap_or_else(|| panic!("no pending list: {list}"))
+                .iter()
+                .map(|purge| purge["lease_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let record = self.request("GET", &format!("/machines/{name}"), None);
+        let health = self.request("GET", "/health", None);
+        let from_record = ids(&record.body["relay_purges_pending"]);
+        assert_eq!(from_record, ids(&health.body["relay_purges_pending"]));
+        from_record
+    }
+
+    /// Wait until the broker logged `count` registrations of an agent.
+    fn wait_for_registrations(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.log().matches("agent registered").count() < count {
+            assert!(Instant::now() < deadline, "the agent did not register");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn release_lease(&self, name: &str, lease: &str) -> common::Response {
         self.request(
             "POST",
@@ -581,7 +623,8 @@ fn m4_release_purges_the_relay_agents_records_of_the_lease() {
 
 /// DC-173: a release whose relay agent cannot confirm the purge still frees
 /// the Mac (HY-1), and its hygiene record fails the `relay-records` step
-/// with the reason; the agent's safety bound removes the records later.
+/// with the reason; the purge stays pending until the agent confirms it
+/// (DC-177).
 #[test]
 fn m4_release_records_a_purge_the_agent_cannot_confirm() {
     let mut lab = Lab::new(relay_agent_bin());
@@ -600,9 +643,111 @@ fn m4_release_records_a_purge_the_agent_cannot_confirm() {
     assert!(reason.contains("relay agent"), "{reason}");
     assert!(
         !agent_records(&lab).is_empty(),
-        "the records stay until the safety bound"
+        "the records stay until the agent registers again"
     );
     // The Mac is free again.
     let (_, again, _) = lab.acquire("none");
     assert_eq!(lab.release_lease(&name, &again).status, 200);
+}
+
+/// How often the broker logged a confirmed purge of `lease`.
+fn confirmations(lab: &Lab, lease: &str) -> usize {
+    lab.log()
+        .lines()
+        .filter(|line| line.contains("relay: ") && line.ends_with(&format!(" of lease {lease}")))
+        .filter(|line| line.contains(" purged "))
+        .count()
+}
+
+/// DC-177: a purge the release could not confirm stays pending in the
+/// instance's state, across a restart of the instance, and is sent again
+/// when the relay agent registers; once confirmed it leaves the list, the
+/// lease's hygiene record says so, and it is never sent again.
+#[test]
+fn m4_an_unconfirmed_purge_stays_pending_until_the_agent_confirms_it() {
+    let mut lab = Lab::new(relay_agent_bin());
+    lab.start_agent();
+    let (name, lease, _) = lab.acquire("default");
+    lab.wait_for_relay(&name, &lease);
+    let answer = lab.exec(
+        &name,
+        json!({"lease_id": lease, "script": "echo \"key=$ANTHROPIC_API_KEY\"\n"}),
+    );
+    assert_eq!(answer.body["link"], "relay", "{}", answer.body);
+    assert!(agent_records(&lab).contains(CLAUDE_KEY));
+
+    // The agent is down at release: the Mac is freed and the purge waits.
+    lab.stop_agent();
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+    let hygiene = &released.body["hygiene"];
+    assert_eq!(hygiene["relay_records"]["purged"], false, "{hygiene}");
+    assert_eq!(hygiene["relay_records"]["pending"], true, "{hygiene}");
+    assert!(relay_records_failure(hygiene).is_some(), "{hygiene}");
+    assert_eq!(lab.pending_purges(&name), std::slice::from_ref(&lease));
+
+    // A restart of the instance keeps it pending.
+    lab.restart_daemon();
+    assert_eq!(lab.pending_purges(&name), std::slice::from_ref(&lease));
+    assert!(agent_records(&lab).contains(CLAUDE_KEY));
+    assert_eq!(confirmations(&lab, &lease), 0);
+
+    // The agent registers again: the purge is sent and confirmed.
+    let registered = lab.log().matches("agent registered").count();
+    lab.start_agent();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !lab.pending_purges(&name).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the pending purge was not confirmed:\n{}",
+            lab.log()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!agent_records(&lab).contains(CLAUDE_KEY));
+    assert_eq!(confirmations(&lab, &lease), 1);
+    let record = lab.request(
+        "GET",
+        &format!("/machines/{name}/leases/{lease}/hygiene"),
+        None,
+    );
+    assert_eq!(record.status, 200, "{}", record.body);
+    let records = &record.body["relay_records"];
+    assert_eq!(records["purged"], true, "{records}");
+    assert!(records["purged_at"].as_f64().is_some(), "{records}");
+    assert!(records["pending_since"].as_f64().is_some(), "{records}");
+
+    // A confirmed purge is never sent again: not when the agent registers
+    // again, nor after a restart of the instance.
+    lab.stop_agent();
+    lab.start_agent();
+    lab.wait_for_registrations(registered + 2);
+    lab.restart_daemon();
+    let registered = lab.log().matches("agent registered").count();
+    lab.start_agent();
+    lab.wait_for_registrations(registered + 1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(confirmations(&lab, &lease), 1, "{}", lab.log());
+    assert!(lab.pending_purges(&name).is_empty());
+}
+
+/// DC-177: a purge confirmed at release is never pending and is not sent
+/// again when the agent registers later.
+#[test]
+fn m4_a_purge_confirmed_at_release_is_never_sent_again() {
+    let mut lab = Lab::new(relay_agent_bin());
+    lab.start_agent();
+    let (name, lease, _) = lab.acquire("none");
+    lab.wait_for_relay(&name, &lease);
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.body["hygiene"]["relay_records"]["purged"], true);
+    assert!(lab.pending_purges(&name).is_empty());
+    assert_eq!(confirmations(&lab, &lease), 1);
+
+    let registered = lab.log().matches("agent registered").count();
+    lab.stop_agent();
+    lab.start_agent();
+    lab.wait_for_registrations(registered + 1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(confirmations(&lab, &lease), 1, "{}", lab.log());
 }

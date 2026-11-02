@@ -13,15 +13,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use relay_agent::protocol::{Op, Outcome};
-use relay_broker::{Broker, JobEvent, Target};
+use relay_broker::{Broker, JobEvent, Purged, Target};
 use serde_json::{json, Value};
 
 use super::super::exec::Request;
 use super::super::launch;
+use super::purges::{self, PendingPurge};
 use super::{agents, tail_chars, DurableMachine, Reply, Runtime, MAX_OUTPUT_CHARS};
+use crate::config::unix_now;
 
 /// The answer's `link` when the relay agent carried the call.
 pub const LINK_RELAY: &str = crate::relay::LINK_RELAY;
@@ -56,6 +59,13 @@ pub struct DurableRelay {
 /// after a lost connection (its backoff stops at 5 s) and for the lease's
 /// stopped commands to record their end (DC-176).
 pub const PURGE_WAIT: Duration = Duration::from_secs(60);
+
+/// The state of the pass over pending purges (DC-177).
+#[derive(Default)]
+pub(super) struct Retry {
+    running: bool,
+    again: bool,
+}
 
 /// One relay call's events, gathered as they come.
 struct Call {
@@ -108,14 +118,34 @@ impl DurableMachine {
     /// Attach this instance's broker, once (M4). A lease that is current
     /// across a restart is bound again; its calls may have reached the
     /// agent before the restart, so its release purges (DM-8, DC-173).
-    pub fn attach_relay(&self, relay: DurableRelay) {
-        let _ = self.relay.set(relay);
+    /// Every registration of this Mac's relay agent sends the purges that
+    /// are still pending again, and so does attaching while it has a
+    /// session (DC-177).
+    pub fn attach_relay(self: &Arc<Self>, relay: DurableRelay) {
+        let target = relay.target.clone();
+        let broker = relay.broker.clone();
+        if self.relay.set(relay).is_err() {
+            return;
+        }
         if let Some(record) = self.current_record() {
+            let state = record["state"].as_str().unwrap_or_default();
             if let Some(lease_id) = record["lease_id"].as_str() {
-                if record["state"] != "released" {
+                if state == "leased" || state == "releasing" {
                     self.bind_relay_lease(lease_id, true);
                 }
             }
+        }
+        let machine = Arc::downgrade(self);
+        let own = target.clone();
+        broker.on_agent(move |target, _| {
+            if *target == own {
+                if let Some(machine) = machine.upgrade() {
+                    machine.retry_pending_purges();
+                }
+            }
+        });
+        if broker.agent(&target).is_some() {
+            self.retry_pending_purges();
         }
     }
 
@@ -129,8 +159,8 @@ impl DurableMachine {
     /// Ask the relay agent to remove the lease's execution records, with
     /// the output they keep (DC-173). Returns the hygiene record's
     /// `relay_records` and, when the agent did not confirm, why: that fails
-    /// the release's `relay-records` step, and the agent's safety bound
-    /// removes the records later (RA-5).
+    /// the release's `relay-records` step, and the release keeps the purge
+    /// pending until the agent confirms it (DC-177).
     pub(super) fn purge_relay_records(&self, lease_id: &str) -> (Value, Option<String>) {
         let Some(relay) = self.relay.get() else {
             return (
@@ -157,12 +187,148 @@ impl DurableMachine {
                     self.log(&format!(
                         "WARN: durable lease {lease_id}: the relay agent's records were not purged: {reason}"
                     ));
-                    (json!({"purged": false, "reason": reason}), Some(reason))
+                    (
+                        json!({"purged": false, "pending": true, "reason": reason}),
+                        Some(reason),
+                    )
                 }
             }
         };
         relay.broker.unbind_lease(&relay.target, lease_id);
         answer
+    }
+
+    /// The purges the relay agent has not confirmed (DC-177).
+    pub fn pending_purges(&self) -> Vec<PendingPurge> {
+        purges::load(&purges::file(&self.config.state_dir)).unwrap_or_else(|error| {
+            self.log(&format!("WARN: relay purges: {error}"));
+            Vec::new()
+        })
+    }
+
+    /// Store `change` applied to the pending purges; the caller holds
+    /// `self.purges`.
+    fn change_pending(
+        &self,
+        change: impl FnOnce(Vec<PendingPurge>) -> Vec<PendingPurge>,
+    ) -> Result<(), String> {
+        let path = purges::file(&self.config.state_dir);
+        let pending = purges::load(&path)?;
+        Self::write_json(&path, &purges::to_file(change(pending)))
+    }
+
+    /// Keep the unconfirmed purge of `lease_id` until the agent confirms
+    /// it (DC-177). The caller holds the guard of `self.purges` and writes
+    /// the lease's hygiene record under it.
+    pub(super) fn keep_purge_pending(
+        &self,
+        lease_id: &str,
+        at: f64,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.change_pending(|pending| purges::kept(pending, lease_id, at, reason))
+    }
+
+    /// Send the pending purges again on a background thread: one pass at a
+    /// time, and one more when asked while a pass runs (DC-177). Never
+    /// blocks, so the broker may call it from an agent's session thread.
+    pub fn retry_pending_purges(self: &Arc<Self>) {
+        {
+            let Ok(mut retry) = self.retry.lock() else {
+                return;
+            };
+            if retry.running {
+                retry.again = true;
+                return;
+            }
+            retry.running = true;
+            retry.again = false;
+        }
+        let machine = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            machine.send_pending_purges();
+            let Ok(mut retry) = machine.retry.lock() else {
+                return;
+            };
+            if !retry.again {
+                retry.running = false;
+                return;
+            }
+            retry.again = false;
+        });
+    }
+
+    /// One pass: send each pending purge once while the agent has a
+    /// session, including purges a release adds during the pass; drop each
+    /// the agent confirms and mark its hygiene record purged.
+    fn send_pending_purges(&self) {
+        let Some(relay) = self.relay.get() else {
+            return;
+        };
+        let mut sent: Vec<String> = Vec::new();
+        loop {
+            if relay.broker.agent(&relay.target).is_none() {
+                return;
+            }
+            let pending = self.pending_purges();
+            let Some(purge) = purges::next(&pending, &sent).cloned() else {
+                return;
+            };
+            sent.push(purge.lease_id.clone());
+            let result = relay
+                .broker
+                .purge(&relay.target, &purge.lease_id, relay.purge_wait);
+            let Ok(_guard) = self.purges.lock() else {
+                return;
+            };
+            let at = unix_now();
+            let stored = match &result {
+                Ok(purged) => {
+                    self.log(&format!(
+                        "durable lease {}: the relay agent confirmed the pending purge ({} records, {} bytes)",
+                        purge.lease_id, purged.records, purged.bytes
+                    ));
+                    self.mark_purged_later(&purge, purged, at);
+                    self.change_pending(|pending| purges::confirmed(pending, &purge.lease_id))
+                }
+                Err(reason) => {
+                    self.log(&format!(
+                        "WARN: durable lease {}: the pending purge is still unconfirmed: {reason}",
+                        purge.lease_id
+                    ));
+                    self.change_pending(|pending| {
+                        purges::attempted(pending, &purge.lease_id, at, reason)
+                    })
+                }
+            };
+            if let Err(error) = stored {
+                self.log(&format!("WARN: relay purges: {error}"));
+            }
+        }
+    }
+
+    /// Record in the lease's hygiene record that its purge was confirmed
+    /// after the release. The release's `relay-records` failure stays: it
+    /// says what happened at release.
+    fn mark_purged_later(&self, purge: &PendingPurge, purged: &Purged, at: f64) {
+        let path = self.config.lease_dir(&purge.lease_id).join("hygiene.json");
+        let Some(mut hygiene) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            return;
+        };
+        hygiene["relay_records"] = json!({
+            "purged": true,
+            "records": purged.records,
+            "bytes": purged.bytes,
+            "purged_at": at,
+            "pending_since": purge.since,
+            "attempts": purge.attempts + 1,
+        });
+        if let Err(error) = Self::write_json(&path, &hygiene) {
+            self.log(&format!("WARN: durable lease {}: {error}", purge.lease_id));
+        }
     }
 
     /// The relay link for the next call, or why the call runs in the

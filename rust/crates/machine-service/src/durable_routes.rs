@@ -102,8 +102,8 @@ fn with_relay_credential(machine: &Arc<DurableMachine>, mut body: Value) -> Valu
     body
 }
 
-/// Build the durable machine, reconcile it after a restart, and start its
-/// GC loop (DM-6, DM-8). Call once at startup, before serving.
+/// Build the durable machine. Call once at startup, before the relay link
+/// is installed and before [`start`].
 pub fn install(service: &Service) -> Result<(), String> {
     let probe = std::env::current_exe().ok().map(|exe| {
         vec![
@@ -116,26 +116,33 @@ pub fn install(service: &Service) -> Result<(), String> {
         &service.config.log_file,
         probe,
     )?;
-    let exposed = config.exposed;
     let machine = Arc::new(DurableMachine::new(config)?);
+    MACHINE
+        .set(machine)
+        .map_err(|_| "durable machine installed twice".to_string())
+}
+
+/// Reconcile the durable machine after a restart and start its GC loop
+/// (DM-6, DM-8). Call once, after the relay link is installed, so that a
+/// release the restart interrupted can purge the relay agent's records
+/// (DC-173, DC-177).
+pub fn start(service: &Service) {
+    let Some(machine) = machine() else { return };
     machine.startup();
-    if exposed {
+    if machine.exposed() {
         service.log(&format!(
             "durable machine {} exposed (lock folder {})",
             machine.name(),
             machine.config.lock_dir.display()
         ));
     }
-    let gc = Arc::clone(&machine);
+    let gc = Arc::clone(machine);
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(
             machine_service_core::GC_INTERVAL_S,
         ));
         gc.gc_once();
     });
-    MACHINE
-        .set(machine)
-        .map_err(|_| "durable machine installed twice".to_string())
 }
 
 fn machine() -> Option<&'static Arc<DurableMachine>> {
@@ -165,6 +172,14 @@ pub fn health(body: &mut Value, virtual_kind: bool) {
         body["instance"] = json!(name);
         body["machine_id"] = json!(machine.machine_id);
         body["former_names"] = former_names;
+        // DC-177: purges of the relay agent's records it has not confirmed.
+        if machine.exposed() {
+            body["relay_purges_pending"] = json!(machine
+                .pending_purges()
+                .iter()
+                .map(machine_service_core::durable::lease::PendingPurge::to_json)
+                .collect::<Vec<_>>());
+        }
     }
 }
 

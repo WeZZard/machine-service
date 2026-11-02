@@ -11,6 +11,7 @@
 - Hygiene has three parts: a scratch workspace ([HY-2](#hy-2-scratch-workspace)), a leftover-process sweep ([HY-3](#hy-3-leftover-process-sweep)), and an inventory before and after the lease ([HY-4](#hy-4-inventory-before-and-after)) (DC-28).
 - Hygiene reports. It never refuses an acquisition, never blocks a release, and never undoes a change outside the workspace.
 - A failure in any hygiene step is recorded with its reason in the lease's hygiene record.
+- A step that needs a party absent at release, the relay agent's purge of the lease's records, is kept pending and finished when that party returns, not by holding the Mac. The hygiene record then says it was finished later ([DM-7](durable-machine.md#dm-7-release), DC-177).
 
 ## HY-2: Scratch workspace
 
@@ -49,7 +50,7 @@
 - The global npm packages are recorded as `{name: version}` from the session's `npm ls --global --depth=0 --json`. A crontab entry is recorded as its schedule and its program, keyed by the SHA-256 of its whole line: a change shows, and an argument, such as a token written into a crontab line, never reaches the hygiene record that any LAN client can read (DC-74).
 - The service compares the two inventories and records what was added, removed and changed. The CI runner's processes and files are marked with their origin, so a client does not attribute a CI job's work to the lease.
 - The lease record keeps `inventory-before.json`, `inventory-after.json` and `changes.json` under the lease's state folder. The release response carries `changes.json` and the paths of the full inventories.
-- `GET /machines/<name>/leases/<lease_id>/hygiene` returns the hygiene record of a current or recent lease for 30 days.
+- `GET /machines/<name>/leases/<lease_id>/hygiene` returns the hygiene record of a current or recent lease for 30 days. Its `relay_records` changes once after release, when a pending purge is confirmed (DC-177).
 
 ## HY-5: Coexistence with the CI runner
 

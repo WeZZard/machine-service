@@ -85,6 +85,7 @@ sequenceDiagram
 - Release then sends `SIGTERM` to every process group the lease started, waits 10 seconds, and sends `SIGKILL` to the groups that remain.
 - Release then runs the sweep of leftover processes ([HY-3](hygiene.md#hy-3-leftover-process-sweep)) and takes the inventory after the lease ([HY-4](hygiene.md#hy-4-inventory-before-and-after)).
 - After the sweep, release has the Mac's relay agent purge the lease's execution records, whose kept output may hold agent keys unredacted ([AK-5](agent-keys.md#ak-5-never-printed-logged-or-returned)), and waits up to 60 seconds for its confirmation. The hygiene record's `relay_records` says `purged` with the counts, or why the purge was skipped or failed; an unconfirmed purge is the failure of the step `relay-records` ([RP-14](relay-protocol.md#rp-14-records-belong-to-their-lease), DC-173).
+- An unconfirmed purge stays pending: release stores it in `<state>/relay-purges.json` together with the hygiene record, before the lease is marked released, and its `relay_records` says `pending`. The service sends every pending purge again each time the Mac's relay agent registers, and at startup when the agent already has a session, until the agent confirms it. A confirmed purge leaves the list and is never sent again; the lease's hygiene record then says `purged` with `purged_at`, `pending_since` and `attempts`, and keeps the `relay-records` failure of the release. The machine record and `/health` list the pending purges as `relay_purges_pending`, with each lease, since when, the attempts and the last reason (DC-177).
 - Release removes the workspace, unless the request sets `keep_workspace: true`. A kept workspace is listed in the lease record and removed by GC after 7 days.
 - Release returns the hygiene record and keeps the lease record for 30 days, so a client can read what happened after the lease ended.
 - Release never reboots the Mac, logs a user out, uninstalls software or reverts a change outside the workspace. Those changes are recorded, not undone ([HY-1](hygiene.md#hy-1-best-effort-not-isolation)).
@@ -93,6 +94,7 @@ sequenceDiagram
 ## DM-8: Service restart
 
 - A restart of machine-service does not end a durable lease, because the Mac and the session's processes are still there.
+- The service attaches its relay link before it reconciles the durable lease, so a release that the restart interrupted purges the relay agent's records through the broker. Pending purges are on disk and survive the restart ([DM-7](#dm-7-release), DC-177).
 - Session processes run in their own process sessions, so launchd does not kill them when the service's job stops. At startup the service reads the recorded process groups of the current lease and signals them at release as usual.
 - An exec, push or pull in flight at the restart has no outcome the service can report. Its client receives a connection failure, and a query of its execution ID over a remote session answers `unknown`, as [AC-14](../acceptance/orchestrator.acceptance) requires.
 

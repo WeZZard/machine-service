@@ -154,6 +154,7 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
     if service.config.guest_link == GuestLink::Relay {
         start_relay(&service)?;
     }
+    durable_routes::start(&service);
 
     let address = if service.config.host.contains(':') {
         format!("[{}]:{}", service.config.host, service.config.port)

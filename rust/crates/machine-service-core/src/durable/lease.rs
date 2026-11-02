@@ -34,7 +34,9 @@ use super::process::{self, LeaseSession};
 use super::session_env::{self, SessionEnv, WorkspacePaths};
 use crate::config::{log_to_file, unix_now};
 
+mod purges;
 mod relay;
+pub use purges::PendingPurge;
 pub use relay::{DurableRelay, LINK_IN_SESSION, LINK_RELAY, PURGE_WAIT};
 
 /// Fields a durable acquisition refuses, because none can be applied to a
@@ -105,6 +107,12 @@ pub struct DurableMachine {
     runtime: Mutex<Option<Runtime>>,
     /// The broker, when this instance runs one (M4).
     relay: std::sync::OnceLock<DurableRelay>,
+    /// Serializes changes to the pending purges and the hygiene records
+    /// they update (DC-177).
+    purges: Mutex<()>,
+    /// Whether a pass over the pending purges runs, and whether another
+    /// was asked for while it ran (DC-177).
+    retry: Mutex<relay::Retry>,
 }
 
 impl DurableMachine {
@@ -132,6 +140,8 @@ impl DurableMachine {
             gate: RwLock::new(()),
             runtime: Mutex::new(None),
             relay: std::sync::OnceLock::new(),
+            purges: Mutex::new(()),
+            retry: Mutex::new(relay::Retry::default()),
         })
     }
 
@@ -374,6 +384,11 @@ impl DurableMachine {
             "workspace": field("workspace"),
             "agents": field("agents"),
             "warnings": super::capabilities::warnings(&capabilities, self.config.disk_warn_bytes),
+            "relay_purges_pending": self
+                .pending_purges()
+                .iter()
+                .map(PendingPurge::to_json)
+                .collect::<Vec<_>>(),
             "capabilities": capabilities,
         });
         if let Some(reason) = unavailable {
@@ -1185,7 +1200,7 @@ impl DurableMachine {
         // output they keep, which may hold agent keys (DC-173, AK-5). Its
         // commands were stopped above, so none of them still runs.
         let (relay_records, unconfirmed) = self.purge_relay_records(&lease_id);
-        if let Some(reason) = unconfirmed {
+        if let Some(reason) = &unconfirmed {
             failures.push(json!({"step": "relay-records", "reason": reason}));
         }
 
@@ -1251,6 +1266,19 @@ impl DurableMachine {
         // The last sample, then any interval still open ends at release
         // (HY-5, DC-75).
         let ci = ci_close(&self.sample_ci(&lease_id, released_at), released_at);
+        // An unconfirmed purge is kept before the lease is released, under
+        // the lock the retry takes to mark the hygiene record, so neither a
+        // crash nor a retry that confirms at once loses it (DC-177).
+        let purges = self.purges.lock();
+        if let Some(reason) = &unconfirmed {
+            if let Err(error) = self.keep_purge_pending(&lease_id, released_at, reason) {
+                self.log(&format!("WARN: durable lease {lease_id}: {error}"));
+                failures.push(json!({
+                    "step": "relay-records",
+                    "reason": format!("the purge cannot be kept pending: {error}"),
+                }));
+            }
+        }
         let hygiene = json!({
             "lease_id": lease_id,
             "name": name,
@@ -1276,6 +1304,7 @@ impl DurableMachine {
         if let Err(error) = Self::write_json(&hygiene_path, &hygiene) {
             self.log(&format!("WARN: durable lease {lease_id}: {error}"));
         }
+        drop(purges);
 
         // 5. Free the machine.
         record["state"] = json!("released");
