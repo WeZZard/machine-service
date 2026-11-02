@@ -64,8 +64,8 @@ flowchart LR
 - pilot-images ships a pinned build of the relay agent in every image, with its LaunchAgent or systemd user unit ([pilot-images: relay agent](https://github.com/WeZZard/pilot-images/blob/main/docs/relay-agent.md)).
 - The relay agent reports the SHA-256 of its executable in its first message.
 - When that hash differs from the build that machine-service holds, machine-service replaces the build and restarts the relay agent through launchd or systemd. Today it does so at bootstrap over SSH ([RA-7](#ra-7-bootstrap)); a lease that lives on with an older agent keeps it.
-- machine-service holds a build per guest kind beside itself, `relay-agent` for macOS and `relay-agent-linux`, which `scripts/build-guest-agents.sh` makes; `MACHINE_SERVICE_RELAY_AGENT` names another.
-- The machine-service installer installs the relay agent and its LaunchAgent on a durable Mac.
+- machine-service holds the relay agent's release beside itself, `relay-agent-release/` ([IN-1](installation.md#in-1-one-layout)), and sends a guest exactly the executable of the archive for the guest's platform, after checking the archive against `SHA256SUMS`; it never builds one (DC-140). A release that does not check out serves the lease over SSH with the reason (RA-8). `MACHINE_SERVICE_RELAY_AGENT_RELEASE` names another release folder.
+- The machine-service installer installs the release's relay agent and its LaunchAgent on a durable Mac ([IN-3](installation.md#in-3-the-durable-macs-relay-agent)).
 - A release tag `v<version>` publishes the relay agent's archives with the GitHub release: `relay-agent-<version>-<platform>.tar.gz` for `darwin-arm64`, `linux-arm64` and `linux-x86_64`, each holding the one executable `relay-agent`, and `SHA256SUMS` over them. `rust/scripts/build-relay-agent.sh` builds them; the Linux executables are static (musl), so one build serves every distribution.
 - The macOS executable is signed with the identifier `com.wezzard.relay-agent`, the LaunchAgent's label, not with the per-build identifier that the linker gives it. An image grants privacy permissions to the code requirement `identifier "com.wezzard.relay-agent"`, so every build signed this way keeps the grants, including the build that machine-service sends at lease time. The signature is ad hoc; a Developer ID signature with the same identifier would satisfy the same requirement.
 
@@ -83,7 +83,7 @@ flowchart LR
 
 - When a virtual machine's relay agent does not register within its bound, machine-service serves the lease over the SSH link and records `link: ssh-fallback` in the lease record, with the reason in `link_reason`; it revokes the lease's relay credentials, and the acquisition's answer carries no `relay`. A lease whose relay agent registered records `link: relay` and `relay_agent` (`os`, `arch`, `build`, `broker_url`).
 - A client sees the fallback in the lease record, because an action over SSH runs outside the desktop session.
-- A durable Mac whose relay agent does not register falls back to machine-service's own in-session exec, which runs in the desktop session.
+- A durable Mac whose relay agent does not register falls back to machine-service's own in-session exec, which runs in the desktop session. Each durable call chooses: the relay agent when the instance runs the broker, the agent has a session and its build is the installed release's; otherwise the service's session. The answer carries `link` (`relay` or `in-session`) and, for the fallback, `link_reason`; the acquisition's answer says which link the lease's calls take at that moment ([DM-4](durable-machine.md#dm-4-exec)).
 
 ## RA-9: Relation to the guest session
 
