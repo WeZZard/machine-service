@@ -519,6 +519,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-actions"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "guest-console-agent"
 version = "0.1.1"
 dependencies = [
@@ -551,6 +560,7 @@ dependencies = [
 name = "guest-session"
 version = "0.1.1"
 dependencies = [
+ "guest-actions",
  "libc",
  "serde_json",
  "sha2",
@@ -896,6 +906,18 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "relay-agent"
+version = "0.1.1"
+dependencies = [
+ "guest-actions",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
