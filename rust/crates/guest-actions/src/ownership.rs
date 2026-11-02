@@ -246,37 +246,38 @@ fn platform_start(_pid: i32) -> Option<String> {
 
 /// The program and arguments that put a shell into `scope`: `systemd-run
 /// --user --scope`, which registers itself as the scope and then executes
-/// the shell in place, so the shell keeps its process ID, its process
-/// group, its standard streams and its environment.
+/// in place, so the shell keeps its process ID, its process group, its
+/// standard streams and its environment. `systemd-run` executes its
+/// program by its full path, so `bash` executes the shell under its bare
+/// file name, as `sshd` names it (`$0` reads `bash`, not `/usr/bin/bash`);
+/// without `bash`, the shell runs under its path.
 pub(crate) fn scope_command(scope: &str, shell: &Path) -> Command {
     let mut command = Command::new("systemd-run");
     let unit = scope.strip_suffix(".scope").unwrap_or(scope);
     command
         .args(["--user", "--scope", "--quiet", "--collect", "--unit"])
         .arg(unit)
-        .arg("--")
-        .arg(shell_argument(shell));
+        .arg("--");
+    match (find_in_path("bash"), shell.file_name()) {
+        (Some(bash), Some(name)) => {
+            command
+                .arg(bash)
+                .arg("-c")
+                .arg(r#"exec -a "$0" "$@""#)
+                .arg(name)
+                .arg(shell);
+        }
+        _ => {
+            command.arg(shell);
+        }
+    }
     command
 }
 
-/// The shell as `systemd-run` should name it: its bare file name when the
-/// search path finds that same file, so the shell's `$0` reads `bash` as
-/// it does under `sshd`; its path otherwise.
-fn shell_argument(shell: &Path) -> PathBuf {
-    let Some(name) = shell.file_name() else {
-        return shell.to_path_buf();
-    };
-    let wanted = std::fs::canonicalize(shell).ok();
-    let found = std::env::var_os("PATH").and_then(|paths| {
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|directory| directory.join(name))
             .find(|candidate| candidate.is_file())
-    });
-    match (
-        wanted,
-        found.and_then(|path| std::fs::canonicalize(path).ok()),
-    ) {
-        (Some(wanted), Some(found)) if wanted == found => PathBuf::from(name),
-        _ => shell.to_path_buf(),
-    }
+    })
 }
