@@ -1,5 +1,7 @@
 # Broker (BK)
 
+> The client-facing wire contract, precise enough to build a client from, is the [relay protocol](relay-protocol.md) (RP).
+
 ## Why
 
 - A relay agent behind NAT cannot accept a connection, and a client in another site cannot accept one either, so both open outgoing connections to a place that both can reach.
