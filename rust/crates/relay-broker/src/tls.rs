@@ -255,8 +255,7 @@ pub fn host_names() -> Vec<String> {
         .map(|ip| ip.to_string())
         .collect();
     names.push("localhost".into());
-    if let Some(host) = crate::net::host_name() {
-        names.push(host);
-    }
+    names.extend(crate::net::host_name());
+    names.extend(crate::net::network_host_name());
     names
 }

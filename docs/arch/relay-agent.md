@@ -42,6 +42,7 @@ flowchart LR
 - The relay agent and the broker run the resumable session of [RS](remote-session.md): sequence numbers, acknowledgements, a replay buffer, heartbeats and a grace period.
 - After a lost connection, the relay agent reconnects with exponential backoff from 250 ms to 5 s with random jitter, and it resumes its session.
 - A relay agent that finds its session expired starts a new session and reports the execution IDs that it had in flight, with their outcomes when it has them.
+- `relay-agent run` dials the `broker_url` of `~/.config/relay-agent/config.json` as role `agent` with its `agent_credential`, trusting the public roots and the configuration's `broker_ca_pem`. It resolves the broker's host name on every attempt and reads the file again before every dial, so a rotated credential or a moved broker takes effect without a restart. `RELAY_AGENT_CA_BUNDLE` adds a PEM file of authorities and `RELAY_AGENT_RESOLVE` one `host:port:address` resolution, for a test rig's name and edge (DC-1xx-BK-10).
 
 ## RA-4: Identity and authorization
 
@@ -62,7 +63,8 @@ flowchart LR
 
 - pilot-images ships a pinned build of the relay agent in every image, with its LaunchAgent or systemd user unit ([pilot-images: relay agent](https://github.com/WeZZard/pilot-images/blob/main/docs/relay-agent.md)).
 - The relay agent reports the SHA-256 of its executable in its first message.
-- When that hash differs from the build that machine-service holds, machine-service sends the new build with `write` and asks the relay agent to restart itself through launchd or systemd, as the guest session agent does today.
+- When that hash differs from the build that machine-service holds, machine-service replaces the build and restarts the relay agent through launchd or systemd. Today it does so at bootstrap over SSH ([RA-7](#ra-7-bootstrap)); a lease that lives on with an older agent keeps it.
+- machine-service holds a build per guest kind beside itself, `relay-agent` for macOS and `relay-agent-linux`, which `scripts/build-guest-agents.sh` makes; `MACHINE_SERVICE_RELAY_AGENT` names another.
 - The machine-service installer installs the relay agent and its LaunchAgent on a durable Mac.
 - A release tag `v<version>` publishes the relay agent's archives with the GitHub release: `relay-agent-<version>-<platform>.tar.gz` for `darwin-arm64`, `linux-arm64` and `linux-x86_64`, each holding the one executable `relay-agent`, and `SHA256SUMS` over them. `rust/scripts/build-relay-agent.sh` builds them; the Linux executables are static (musl), so one build serves every distribution.
 - The macOS executable is signed with the identifier `com.wezzard.relay-agent`, the LaunchAgent's label, not with the per-build identifier that the linker gives it. An image grants privacy permissions to the code requirement `identifier "com.wezzard.relay-agent"`, so every build signed this way keeps the grants, including the build that machine-service sends at lease time. The signature is ad hoc; a Developer ID signature with the same identifier would satisfy the same requirement.
@@ -70,13 +72,16 @@ flowchart LR
 ## RA-7: Bootstrap
 
 - machine-service still bootstraps a new clone over SSH with the per-lease SSH key, as [per-lease SSH keys](../lease-ssh-keys.md) describe.
-- During bootstrap, machine-service writes the broker URL and the lease's agent credential into a file that only the guest user can read, and it restarts the relay agent.
-- An acquisition reaches `running` only after the relay agent has registered with the broker and has answered a probe command and a checksummed transfer.
+- During bootstrap, machine-service writes the broker URL and the lease's agent credential into a file that only the guest user can read, and it restarts the relay agent. In order, over the lease's SSH key, with `MACHINE_SERVICE_GUEST_LINK=relay`:
+  1. It reads the SHA-256 of `~/.local/libexec/relay-agent/relay-agent`, and uploads its own build there, atomically, when the guest has none or another one.
+  2. It writes `~/.config/relay-agent/config.json`, mode 600 in a mode-700 folder: `broker_url`, `agent_credential` and `broker_ca_pem`.
+  3. It starts the relay agent in the desktop session. On macOS it installs the LaunchAgent `com.wezzard.relay-agent` (`RunAtLoad`, `KeepAlive`, `LimitLoadToSessionType` `Aqua`) when the image has none, waits for the user's `gui/<uid>` launchd domain, and bootstraps the job there, or restarts it with `launchctl kickstart -k` when it is loaded. This runs as the guest user and needs no root. On Ubuntu it installs the systemd user unit `relay-agent.service`, wanted by and part of `graphical-session.target`, when the image has none, enables it, waits for that target, and starts it, or restarts an agent that was already running.
+- An acquisition reaches `running` only after the relay agent has registered with the broker, within `MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT` (120 s by default), and has answered a probe command (`echo`) and a checksummed transfer (64 KiB written and read back).
 - After bootstrap, no action uses SSH. The relay acceptance suite turns sshd off after acquisition, before the first action, to prove that ([TL-7](test-layers.md#tl-7-relay-acceptance)).
 
 ## RA-8: Fallback
 
-- When a virtual machine's relay agent does not register within its bound, machine-service serves the lease over the SSH link and records `link: ssh-fallback` in the lease record.
+- When a virtual machine's relay agent does not register within its bound, machine-service serves the lease over the SSH link and records `link: ssh-fallback` in the lease record, with the reason in `link_reason`; it revokes the lease's relay credentials, and the acquisition's answer carries no `relay`. A lease whose relay agent registered records `link: relay` and `relay_agent` (`os`, `arch`, `build`, `broker_url`).
 - A client sees the fallback in the lease record, because an action over SSH runs outside the desktop session.
 - A durable Mac whose relay agent does not register falls back to machine-service's own in-session exec, which runs in the desktop session.
 

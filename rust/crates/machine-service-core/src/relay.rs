@@ -98,8 +98,13 @@ fn websocket_url(variable: &str, value: &str) -> Result<String, String> {
 }
 
 /// The default broker URL: this host's name and the session port (BK-4).
+/// On macOS the name is the Bonjour name, `<LocalHostName>.local`, which
+/// every Mac on the network resolves; `gethostname` may give a bare DHCP
+/// name that nothing resolves.
 pub fn default_relay_url(port: u16) -> String {
-    let host = relay_broker::net::host_name().unwrap_or_else(|| "localhost".into());
+    let host = relay_broker::net::network_host_name()
+        .or_else(relay_broker::net::host_name)
+        .unwrap_or_else(|| "localhost".into());
     format!("wss://{host}:{port}{}", remote_session::RELAY_PATH)
 }
 
@@ -392,6 +397,9 @@ unit="$units/{SYSTEMD_UNIT}"
 uid=$(id -u)
 export XDG_RUNTIME_DIR="${{XDG_RUNTIME_DIR:-/run/user/$uid}}"
 export DBUS_SESSION_BUS_ADDRESS="${{DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}}"
+# An agent that already ran (the image's) restarts onto the new build and
+# configuration; one that did not is started once.
+was=$(systemctl --user is-active {SYSTEMD_UNIT} 2>/dev/null || true)
 mkdir -p "$units"
 if [ ! -f "$unit" ]; then
   cat >"$unit.tmp.$$" <<UNIT
@@ -404,6 +412,7 @@ After=graphical-session.target
 ExecStart=$exe run
 Restart=always
 RestartSec=1
+SuccessExitStatus=143
 
 [Install]
 WantedBy=graphical-session.target
@@ -419,7 +428,11 @@ until systemctl --user is-active --quiet graphical-session.target; do
   if [ "$i" -gt 120 ]; then echo "relay-start: graphical-session.target is not active after 120 s"; exit 3; fi
   sleep 1
 done
-systemctl --user restart {SYSTEMD_UNIT}
+if [ "$was" = active ]; then
+  systemctl --user restart {SYSTEMD_UNIT}
+else
+  systemctl --user start {SYSTEMD_UNIT}
+fi
 echo "relay-start: state = $(systemctl --user is-active {SYSTEMD_UNIT})"
 "#
         )
@@ -990,6 +1003,8 @@ mod tests {
         let linux = start_script("linux");
         assert!(linux.contains("WantedBy=graphical-session.target"));
         assert!(linux.contains("systemctl --user restart relay-agent.service"));
+        assert!(linux.contains("systemctl --user start relay-agent.service"));
+        assert!(linux.contains("SuccessExitStatus=143"));
         assert!(linux.contains("${XDG_RUNTIME_DIR:-/run/user/$uid}"));
         // Both parse as POSIX shell.
         for script in [mac, linux] {

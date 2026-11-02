@@ -94,6 +94,22 @@ pub fn address_toward(guest: Ipv4Addr) -> Option<Ipv4Addr> {
         .map(|i| i.address)
 }
 
+/// The name other hosts on the network reach this one by: on macOS the
+/// Bonjour name `<LocalHostName>.local`, read from the system configuration
+/// at run time; elsewhere `None`.
+pub fn network_host_name() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "LocalHostName"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !name.is_empty()).then(|| format!("{name}.local"))
+}
+
 /// This host's name, as the system reports it.
 pub fn host_name() -> Option<String> {
     let mut buffer = [0 as libc::c_char; 256];
@@ -131,6 +147,9 @@ mod tests {
         // Loopback itself is never the answer for a guest.
         assert_eq!(address_toward(Ipv4Addr::new(127, 0, 0, 2)), None);
         assert!(host_name().is_some());
+        if cfg!(target_os = "macos") {
+            assert!(network_host_name().is_some_and(|n| n.ends_with(".local")));
+        }
     }
 
     #[test]

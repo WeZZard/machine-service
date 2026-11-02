@@ -137,6 +137,7 @@ The same rule, one key naming the variant or a bare string for a variant without
 - The answer to exec, script and read is its stream as chunks, then `end` with the size and the SHA-256 of the whole stream, then `result`. A client checks the stream against its `end`. write, cancel and status answer with `result` alone.
 - `result` is always the last message about a call; the call number may be reused after it.
 - Calls run at the same time, and their messages interleave; the broker keeps each call's messages in order.
+- A `call` whose number is 0 or still open is answered `failed`, code `bad_request`, under that number. A `call` with an empty or over-long execution ID is refused the same way; its chunks and `end` are still taken and dropped.
 
 Example: `echo hi` as exec.
 
@@ -170,7 +171,7 @@ broker ← {"result":{"call":1,"execution":"7d3c…","replayed":false,"outcome":
 
 ## RP-8: When the relay agent is not connected
 
-- When the lease's relay agent has no session, the broker answers a `call` or `query` with `pending`, code `agent_not_connected`, and keeps it waiting for up to `wait_ms` for the relay agent to register, which is the agent session's grace period (10 minutes by default).
+- When the lease's relay agent has no session, the broker answers a `call` or `query` with `pending`, code `agent_not_connected`, and keeps it waiting for up to `wait_ms` for the relay agent to register: the agent session's grace period, 10 minutes by default (`MACHINE_SERVICE_RELAY_AGENT_WAIT`). A later caller attached to the same execution receives no second `pending`.
 - When the relay agent registers in time, the call proceeds as usual. Otherwise the call ends with `failed`, code `agent_not_connected`, `"committed": false`, and a query with state `unknown`.
 - A relay agent whose connection breaks keeps its session for its grace period, and the broker's messages wait in that session's replay buffer, so a short break needs nothing from the client.
 - When the relay agent's session ends while a call is out, the broker sends the call again, with the same execution ID and upload, to the agent's next session, and the relay agent answers it from its record. When no next session comes within `wait_ms`, the call ends with `failed`, code `agent_lost`, `"committed": true`: its outcome is uncertain, and `query` later tells it.
@@ -208,10 +209,11 @@ Codes of `failed` outcomes. The broker adds the first group; the relay agent sen
 | Bonjour TXT of `_machine-service._tcp` | `relay_url`, `relay_ca_sha256` | the same |
 | Consul service metadata | `relay_url`, `relay_ca_sha256` | the same, from `machine-service-install catalog-description` |
 | `GET /relay/ca.pem` | the body | the authority's certificate, PEM |
-| `POST /acquire` answer | `relay` | `{"url":"…","credential":"…","ca_sha256":"…","ca_pem":"…"}`, only when the lease's link is `relay` |
+| `POST /acquire` answer | `relay` | `{"url":"…","credential":"…","ca_sha256":"…","ca_pem":"…"}`, only when the lease's link is `relay`; a durable machine's acquisition carries it when the instance runs the broker |
 | the lease record | `link` | `relay`, or `ssh-fallback` when the relay agent did not register (RA-8) |
 
-- `relay_url` names the instance's host name and the session listener's port, `MACHINE_SERVICE_SESSION_PORT`, 6241 by default. `MACHINE_SERVICE_RELAY_URL` replaces it with a URL that other sites reach, such as a Tunnel host name (BK-4, TC-6).
+- The broker runs when the instance is started with `MACHINE_SERVICE_GUEST_LINK=relay`; otherwise none of these fields appear.
+- `relay_url` names the instance's host name (on macOS its Bonjour name, `<LocalHostName>.local`) and the session listener's port, `MACHINE_SERVICE_SESSION_PORT`, 6241 by default. `MACHINE_SERVICE_RELAY_URL` replaces it with a URL that other sites reach, such as a Tunnel host name (BK-4, TC-6).
 - The credential appears only in the acquisition's answer; `GET /machines` never shows it. A client that loses it releases the lease and acquires another.
 - A lease whose `link` is `ssh-fallback` has no `relay` field; its actions go over machine-service's HTTP API and SSH, outside the desktop session.
 

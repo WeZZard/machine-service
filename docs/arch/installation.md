@@ -19,9 +19,10 @@
 | `guest-session-agent` | with Tart | `-linux` |
 | `vm-service-dot-forwarder` | with Tart | |
 | `vm-service-guest-firewall` | with Tart | |
+| `relay-agent` | with Tart | `-linux` |
 
 - A guest agent runs inside the guest as machine code. The host-native build serves macOS guests, and Linux guests need the `-linux` build. A kind-qualified file beside the daemon, `<name>-<kind>`, outranks the host-native one.
-- The daemon resolves every helper through this crate: the console worker, both guest agents, the forwarder and the firewall installer it names in its fixes. A helper is an entry of the layout or it cannot be resolved.
+- The daemon resolves every helper through this crate: the console worker, both guest agents, the relay agent it uploads into a clone ([RA-7](relay-agent.md#ra-7-bootstrap)), the forwarder and the firewall installer it names in its fixes. A helper is an entry of the layout or it cannot be resolved.
 - The installer requires the same list, so it can neither miss an executable the daemon looks up nor require one it never uses. A Mac without Tart needs the first three only (MG-4 step 5, DC-65).
 - The override variables `VM_GUEST_SESSION_AGENT`, `VM_GUEST_CONSOLE_AGENT`, `VM_CONSOLE_WORKER` and `MACHINE_SERVICE_DOT_FORWARDER` still win over the layout.
 
