@@ -64,6 +64,8 @@ flowchart LR
 - The relay agent reports the SHA-256 of its executable in its first message.
 - When that hash differs from the build that machine-service holds, machine-service sends the new build with `write` and asks the relay agent to restart itself through launchd or systemd, as the guest session agent does today.
 - The machine-service installer installs the relay agent and its LaunchAgent on a durable Mac.
+- A release tag `v<version>` publishes the relay agent's archives with the GitHub release: `relay-agent-<version>-<platform>.tar.gz` for `darwin-arm64`, `linux-arm64` and `linux-x86_64`, each holding the one executable `relay-agent`, and `SHA256SUMS` over them. `rust/scripts/build-relay-agent.sh` builds them; the Linux executables are static (musl), so one build serves every distribution.
+- The macOS executable is signed with the identifier `com.wezzard.relay-agent`, the LaunchAgent's label, not with the per-build identifier that the linker gives it. An image grants privacy permissions to the code requirement `identifier "com.wezzard.relay-agent"`, so every build signed this way keeps the grants, including the build that machine-service sends at lease time. The signature is ad hoc; a Developer ID signature with the same identifier would satisfy the same requirement.
 
 ## RA-7: Bootstrap
 

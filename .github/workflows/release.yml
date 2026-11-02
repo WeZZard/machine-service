@@ -9,15 +9,59 @@ permissions:
   contents: read
 
 jobs:
+  relay-agent:
+    # One macOS arm64 runner builds every platform: the macOS executable
+    # natively, and the static Linux executables through rust-lld
+    # (rust/scripts/build-relay-agent.sh).
+    name: Build relay agent archives
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
+
+      - name: The tag names the relay agent's version
+        run: |
+          version=$(cargo pkgid -p relay-agent | sed 's/.*[#@]//')
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "tag $GITHUB_REF_NAME does not match relay-agent $version" >&2
+            exit 1
+          }
+
+      - name: Build, sign and archive
+        run: scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relay-agent
+          path: ${{ runner.temp }}/relay-agent/*
+          if-no-files-found: error
+
   release:
     name: Create GitHub release
+    needs: relay-agent
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: relay-agent
+          path: dist
+
+      - name: Verify the archives against their sums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/*

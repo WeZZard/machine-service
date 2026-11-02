@@ -35,3 +35,10 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # The release workflow runs this script only on a tag; building the
+      # archives here keeps it working between releases.
+      - name: relay agent release archives
+        run: |
+          rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+          scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent"
