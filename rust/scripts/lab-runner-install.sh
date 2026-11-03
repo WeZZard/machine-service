@@ -3,10 +3,9 @@
 # GitHub Actions runner of its own folder, registered to the repository with
 # the label `lab`, run by a per-user LaunchAgent of its own label in the
 # operator's desktop session, with the job hooks of lab-runner.sh, so every
-# job holds the Mac's durable lease while it runs. The LaunchAgent starts the
-# runner over a loopback SSH session with a key that can do nothing else,
-# because macOS's local network privacy would deny a launchd agent's builds
-# any connection to the lab's other machines (lab-runner.sh explains).
+# job holds the Mac's durable lease while it runs. The runner updates only
+# when an operator installs a new version, so the program the operator lets
+# reach the local network keeps its identity (DC-1xx-LAB-14).
 #
 # Run it on the Mac, from the runner folder it creates, with lab-runner.sh
 # beside it and a registration token on standard input:
@@ -64,21 +63,11 @@ chmod 755 "$links"
 ln -sf "$dir/lab-runner.sh" "$links/job-started.sh"
 ln -sf "$dir/lab-runner.sh" "$links/job-completed.sh"
 
-# The loopback session's key: from this Mac only, and only to start the
-# runner; and this Mac's own host key, so the session checks whom it reaches.
-self_key="$HOME/.ssh/lab-runner-self_ed25519"
-known="$HOME/.ssh/lab-runner-known_hosts"
-[ -f "$self_key" ] || ssh-keygen -q -t ed25519 -N "" -C "lab runner session" -f "$self_key"
-grep -qF "$(cut -d' ' -f2 "$self_key.pub")" "$HOME/.ssh/authorized_keys" 2>/dev/null ||
-    printf 'from="127.0.0.1,::1",restrict,command="exec /bin/sh %s/lab-runner.sh session" %s\n' \
-        "$dir" "$(cat "$self_key.pub")" >>"$HOME/.ssh/authorized_keys"
-printf 'localhost %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >"$known"
-
 name="lab-$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}' | shasum -a 256 | cut -c1-6)"
 path="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 ACTIONS_RUNNER_INPUT_TOKEN="$token" PATH="$path" ./config.sh --unattended \
-    --url "https://github.com/$repo" --name "$name" --labels lab --work _work
+    --url "https://github.com/$repo" --name "$name" --labels lab --work _work --disableupdate
 token=""
 
 # The hooks, and the PATH a job and its hooks start with.
@@ -97,21 +86,7 @@ cat >"$plist" <<EOF
 	<string>$label</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/ssh</string>
-		<string>-T</string>
-		<string>-i</string>
-		<string>$self_key</string>
-		<string>-o</string>
-		<string>IdentitiesOnly=yes</string>
-		<string>-o</string>
-		<string>BatchMode=yes</string>
-		<string>-o</string>
-		<string>UserKnownHostsFile=$known</string>
-		<string>-o</string>
-		<string>StrictHostKeyChecking=yes</string>
-		<string>-o</string>
-		<string>ServerAliveInterval=30</string>
-		<string>localhost</string>
+		<string>$dir/run.sh</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>$dir</string>

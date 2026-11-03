@@ -1,11 +1,9 @@
 #!/bin/sh
-# The lab runner's own script (docs/arch/hygiene.md, HY-5): the session the
-# runner runs in, and its job hooks, by which a job on a lab runner holds its
-# durable Mac's lease for as long as it runs, as any other client of
-# machine-service does, so it never shares the desktop with a lease.
+# The lab runner's job hooks (docs/arch/hygiene.md, HY-5), by which a job on
+# a lab runner holds its durable Mac's lease for as long as it runs, as any
+# other client of machine-service does, so it never shares the desktop with a
+# lease.
 #
-#   lab-runner.sh session   the runner itself, started over a loopback SSH
-#                           session by the LaunchAgent (see below)
 #   job-started.sh          a link, ACTIONS_RUNNER_HOOK_JOB_STARTED: release a
 #                           lease an earlier job of this runner left, then
 #                           acquire this Mac's lease for purpose ci-<run id>,
@@ -14,14 +12,9 @@
 #                           the lease (sweep, inventory, purge) and keep its
 #                           hygiene record
 #
-# Why a loopback SSH session: macOS's local network privacy denies a launchd
-# agent's own programs, every executable that is not part of the system, any
-# connection to another machine on the LAN, and a build of this repository
-# changes its code signature with every build, so no grant could hold. A
-# program that sshd starts is outside it. The LaunchAgent therefore runs
-# `ssh localhost` with a key whose only command, for loopback connections
-# only, is `lab-runner.sh session`; the session runs the runner, and stops it
-# when its SSH session ends.
+# The runner is a plain per-user LaunchAgent in the desktop session. macOS's
+# local network privacy asks the operator once to let its programs reach the
+# lab's other machines (DC-1xx-LAB-14).
 #
 # The lease is renewed every 10 minutes for as long as the job's
 # Runner.Worker runs, by a detached loop, so a job of any length keeps it and
@@ -159,31 +152,6 @@ heartbeat() {
     done
 }
 
-# The runner, for as long as this SSH session lasts: when sshd lets go of
-# the session, this script is orphaned and stops the runner, so a restarted
-# LaunchAgent never finds an earlier runner still listening.
-session() {
-    cd "$runner"
-    # sshd's PATH is the system's; the runner's own, which config.sh wrote,
-    # is what its hooks and jobs need (machctl, cargo, Homebrew).
-    PATH="$(cat .path)"
-    export PATH
-    # Its own process group, which run.sh, its helper and the listener share.
-    set -m
-    ACTIONS_RUNNER_SVC=1 ./run.sh &
-    group=$!
-    set +m
-    trap 'kill -TERM -"$group" 2>/dev/null; exit 0' TERM INT HUP
-    while kill -0 "$group" 2>/dev/null; do
-        if [ "$(ps -o ppid= -p $$ | tr -d ' ')" = 1 ]; then
-            kill -TERM -"$group" 2>/dev/null || true
-            break
-        fi
-        sleep 5
-    done
-    wait "$group" || true
-}
-
 completed() {
     if [ ! -f "$lab/lease.json" ]; then
         echo "lab runner: no lab lease to release"
@@ -198,9 +166,8 @@ job-started*) started ;;
 job-completed*) completed ;;
 *)
     case "${1:-}" in
-    session) session ;;
     heartbeat) shift; heartbeat "$@" ;;
-    *) echo "usage: lab-runner.sh session, or link as job-started.sh or job-completed.sh" >&2; exit 2 ;;
+    *) echo "usage: link as job-started.sh or job-completed.sh" >&2; exit 2 ;;
     esac
     ;;
 esac

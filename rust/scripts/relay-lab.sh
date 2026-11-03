@@ -10,9 +10,10 @@
 #   - the virtual machine cells target the VM host with the fewest running
 #     macOS VMs, and the Ubuntu client VMs are leased from its installed
 #     instance.
-# On each target host the lab's own second instance runs from the folder the
-# lab key's gate keeps (scripts/relay-lab-gate.py), on the lab's ports, beside
-# the installed instance and any other agent's second instance.
+# On each target host the lab's own second instance is started by that
+# host's installed machine-service, through its second-instance launcher
+# (`machctl lab`, DC-1xx-LAB-15), on the lab's ports, beside the installed
+# instance and any other agent's second instance. Nothing here uses SSH.
 #
 # Usage: relay-lab.sh plan <dir>                write <dir>/plan.env, or fail fast
 #        relay-lab.sh toolchain                 install or update the job's own Rust
@@ -26,7 +27,7 @@
 #        relay-lab.sh scrub <names> <from> <to> copy the evidence's text, redacted
 #
 # <cells> is `all` or a comma-separated list of cell IDs; <profiles> a
-# comma-separated list of N0..N3. The SSH key is ~/.ssh/relay-lab_ed25519.
+# comma-separated list of N0..N3.
 #
 # Every command runs in the job's own environment, never the one it was
 # started in: this script starts itself again under `env -i` with a HOME,
@@ -44,7 +45,7 @@ if [ -z "${RELAY_LAB_OWN_ENV:-}" ]; then
     mkdir -p "$root/home" "$root/tmp"
     root="$(cd "$root" && pwd)"
     exec env -i RELAY_LAB_OWN_ENV=1 RELAY_LAB_ROOT="$root" \
-        RELAY_LAB_KEY="$HOME/.ssh/relay-lab_ed25519" RELAY_LAB_HOMES="$(dirname "$HOME")" \
+        RELAY_LAB_HOMES="$(dirname "$HOME")" \
         RELAY_LAB_MACHCTL="$(command -v machctl || echo machctl)" \
         HOME="$root/home" TMPDIR="$root/tmp/" USER="$(id -un)" LOGNAME="$(id -un)" LANG=en_US.UTF-8 \
         RUSTUP_HOME="$root/rustup" CARGO_HOME="$root/cargo" \
@@ -54,7 +55,6 @@ fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 rust="$(cd "$here/.." && pwd)"
-key="$RELAY_LAB_KEY"
 machctl() { "$RELAY_LAB_MACHCTL" "$@"; }
 # The lab instance's HTTP, broker and agent-chain ports on every target.
 lab_ports="RELAY_HOST_PORT=6272 RELAY_HOST_SESSION_PORT=6273 RELAY_HOST_AGENT_PORT=6274"
@@ -65,8 +65,10 @@ die() {
     exit 1
 }
 
+# The command that runs the host script on a target, through the launcher of
+# the target's installed instance: what the suite's --host-shell names.
 host_shell() {
-    echo "ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 $1.local"
+    echo "$RELAY_LAB_MACHCTL lab --instance $1 host"
 }
 
 # plan <dir>: this Mac, the other durable Mac and the VM host, from every
@@ -93,7 +95,7 @@ plan() {
 
 plan_from() {
     python3 -I - "$1" <<'EOF'
-import json, shlex, sys
+import json, shlex, sys, urllib.request
 
 instances = json.load(open(sys.argv[1]))
 def fail(message):
@@ -126,13 +128,36 @@ for i in instances:
     macos = [m for m in offers.values() if (m.get("concurrency") or {}).get("limit")]
     running = sum((m.get("concurrency") or {}).get("running") or 0 for m in macos)
     acquirable = all((offers[n].get("concurrency") or {}).get("acquirable") for n in ("macos26", "ubuntu2404"))
-    if acquirable and i.get("reachable", True):
-        port = i["address"].rsplit(":", 1)[-1].strip("/")
-        hosts.append((running, i["instance"], port))
+    if not (acquirable and i.get("reachable", True)):
+        continue
+    # A macOS guest the instance did not lease is another program's, such as
+    # an image build's `*-work` VM: the lab leaves that host to it.
+    try:
+        with urllib.request.urlopen(i["address"].rstrip("/") + "/images", timeout=10) as answer:
+            capacity = json.load(answer).get("capacity") or {}
+    except Exception:
+        continue
+    if capacity.get("foreign_macos_guests"):
+        continue
+    port = i["address"].rsplit(":", 1)[-1].strip("/")
+    hosts.append((running, i["instance"], port, i["address"]))
 if not hosts:
-    fail("no VM host has room for a macOS VM and an Ubuntu VM; the lab backs off")
+    fail("no VM host has room for a macOS VM and an Ubuntu VM without another program's VM; the lab backs off")
 hosts.sort(key=lambda h: (h[0], h[1]))
-_, vm_host, vm_port = hosts[0]
+_, vm_host, vm_port, vm_address = hosts[0]
+
+# The lab starts its instance on a target only through the target's own
+# machine-service (DC-1xx-LAB-15), never over SSH.
+addresses = {i["instance"]: i["address"] for i in instances}
+for name, address in ((durable, addresses.get(durable)), (vm_host, vm_address)):
+    try:
+        with urllib.request.urlopen(address.rstrip("/") + "/health", timeout=10) as answer:
+            launcher = json.load(answer).get("lab_launcher")
+    except Exception:
+        launcher = None
+    if not launcher:
+        fail("a target's machine-service has no second-instance launcher (DC-1xx-LAB-15), "
+             "so the lab cannot start its instance there; update that instance first")
 for key, value in (("OWN", own_name), ("DURABLE", durable), ("VM_HOST", vm_host),
                    ("CLIENT_INSTANCE", f"http://{vm_host}.local:{vm_port}")):
     print(f"{key}={shlex.quote(value)}")
@@ -192,8 +217,8 @@ build() {
     echo "built: $(du -sh "$dir/host" | cut -f1) for each target"
 }
 
-# deploy <dir>: the bundle to both targets through their gates, and the lab
-# instance started on each, the durable Mac's with exposure on.
+# deploy <dir>: the bundle to both targets through their launchers, and the
+# lab instance started on each, the durable Mac's with exposure on.
 deploy() {
     dir="$1"
     load_plan "$dir"
@@ -206,9 +231,10 @@ deploy() {
             [ "$target" = "$DURABLE" ] && echo "RELAY_HOST_DURABLE=1"
             true
         } >"$stage/host.env"
-        tar -czf - -C "$stage" . | $(host_shell "$target") deploy
-        rm -rf "$stage"
-        $(host_shell "$target") relay-acceptance-host.sh start
+        tar -czf "$stage.tar.gz" -C "$stage" .
+        machctl lab --instance "$target" deploy "$stage.tar.gz"
+        rm -rf "$stage" "$stage.tar.gz"
+        $(host_shell "$target") start
     done
 }
 
@@ -218,7 +244,7 @@ clean() {
     load_plan "$dir"
     for target in "$VM_HOST" "$DURABLE"; do
         release_all "http://$target.local:6272"
-        $(host_shell "$target") clean || echo "relay-lab: clean of a target failed" >&2
+        machctl lab --instance "$target" clean || echo "relay-lab: clean of a target failed" >&2
     done
     # The client side's network rigs, which a cancelled cell leaves running.
     pkill -TERM -f "^$HOME/Library/Caches/machine-service/network-rig/" 2>/dev/null || true
@@ -280,7 +306,7 @@ cell() {
         rm -rf "$stage"
         if [ -n "$image" ]; then
             seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
-            $(host_shell "$target") relay-acceptance-host.sh rig-start "$profile" "$seed" >"$logs/$cell-$profile.agent-rig.json" ||
+            $(host_shell "$target") rig-start "$profile" "$seed" >"$logs/$cell-$profile.agent-rig.json" ||
                 status=1
         fi
         sh "$here/relay-acceptance-ubuntu-client.sh" "$CLIENT_INSTANCE" "$dir/bin/relay-acceptance-linux" \
@@ -292,7 +318,7 @@ cell() {
         fi
         [ -f "$stage/run.log" ] && mv "$stage/run.log" "$logs/$cell-$profile.client.log"
         rm -rf "$stage"
-        [ -z "$image" ] || $(host_shell "$target") relay-acceptance-host.sh rig-stop >/dev/null || true
+        [ -z "$image" ] || $(host_shell "$target") rig-stop >/dev/null || true
         [ -f "$evidence/$cell/$profile/report.json" ] || status=1
         ;;
     esac
