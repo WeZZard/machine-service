@@ -76,10 +76,35 @@ This page is for two readers:
   notarized. pilot-images copies the signature into its lock. Every check reads
   the signature from the executable itself and refuses a record that disagrees.
 - Which signature the installer and the daemon accept:
-  - A Developer ID signature, by the team that
-    `MACHINE_SERVICE_RELAY_AGENT_TEAM_ID` names. Without that setting, the team
-    that the release's `SIGNING.json` names.
+  - A Developer ID signature, by the team that the Mac trusts (DC-231):
+    - `MACHINE_SERVICE_RELAY_AGENT_TEAM_ID`, when set, names that team from
+      the start.
+    - Otherwise, the team that the instance recorded when it first installed
+      a Developer ID relay agent. The record is
+      `<state>/relay/relay-agent-team.json` in the instance's state folder,
+      mode 600.
+    - Before any record, the first Developer ID release is trusted, and its
+      team is recorded once the agent is in place.
+    - A release signed by another team is refused until the operator changes
+      that setting. A release's `SIGNING.json` names its team, but it is
+      never the trust anchor by itself, because it travels with the archive
+      that it describes.
   - An ad hoc signature with the identifier, for a pre-release only.
+- Signing never downgrades (DC-232). machine-service never replaces a relay
+  agent signed with Developer ID by a build that is not, on a guest or on a
+  Mac, because the grants given to the Developer ID agent would no longer
+  match:
+  - The installer and the daemon read the installed agent's signature
+    before they replace it, and refuse with the reason.
+  - At a lease's bootstrap, machine-service reads the guest's agent's
+    signature with `codesign` over SSH. A lease whose only build would
+    downgrade the agent is served over SSH, and its `link_reason` says why.
+  - On a lease that lives on, the agent reports its own signature in its
+    hello (relay protocol 3), and a downgrading replacement is not made.
+  - Ad hoc by ad hoc, and ad hoc by Developer ID, are allowed.
+- `/health` shows the trusted team as `relay_agent_team`: a fingerprint,
+  `sha256:` and 16 hex digits, and whether the team is `configured` or
+  `recorded`. It never shows the team ID itself.
 
 ## Notarization
 
@@ -180,19 +205,32 @@ CODESIGN_IDENTITY="Developer ID Application" rust/scripts/build-relay-agent.sh
 
 ## The operator of a durable Mac: grant the permissions once
 
-1. **Name the team that you trust.** This step is recommended. Without it, the
-   installer trusts the team that the release's `SIGNING.json` names. With it,
-   the installer refuses a Developer ID release from any other team. A later
-   installation keeps the setting:
+1. **Install, and check the team that the Mac trusts.** The first Developer
+   ID release that you install sets the team that this Mac trusts, and the
+   installer records it. Every later release must be signed by the same team:
 
    ```zsh
-   MACHINE_SERVICE_RELAY_AGENT_TEAM_ID=<TEAM_ID> \
-     machine-service-install install --prefix ~/.local/libexec/machine-service --expose-durable on
+   machine-service-install install --prefix ~/.local/libexec/machine-service --expose-durable on
    ```
 
    The installer prints `relay agent release signed Developer ID, team
-   <TEAM_ID>`. A pre-release that is signed ad hoc installs too, but its grants
-   end with the next build.
+   <TEAM_ID>, trusted as this Mac's first Developer ID team and recorded in
+   …/relay/relay-agent-team.json`. Check that `<TEAM_ID>` is the owner's
+   team. A pre-release that is signed ad hoc installs too, records no team,
+   and its grants end with the next build.
+
+   To name the team before the first installation, set
+   `MACHINE_SERVICE_RELAY_AGENT_TEAM_ID=<TEAM_ID>` for the install. A later
+   installation keeps the setting, and it wins over the record.
+
+   To trust another team later, for example after the owner moved to a new
+   team, do one of these, then install again:
+   - Set `MACHINE_SERVICE_RELAY_AGENT_TEAM_ID` to the new team.
+   - Remove `<state>/relay/relay-agent-team.json`, so the next Developer ID
+     release is trusted as the first.
+
+   Until then, the installer and the daemon refuse a release by the new
+   team, and say which team the Mac trusts and where that is recorded.
 2. **Check the installed agent:**
 
    ```zsh
@@ -226,5 +264,7 @@ CODESIGN_IDENTITY="Developer ID Application" rust/scripts/build-relay-agent.sh
    3. Click Allow in each prompt.
 5. **Done.** Every later Developer ID release by the same team keeps these
    grants, including the build that the installer or the daemon puts in place.
-   If an ad hoc pre-release is installed, its grants are not the release's, and
-   you may need to grant again after it.
+   An ad hoc pre-release is never installed over the Developer ID agent,
+   because that would drop these grants (DC-232). To try one, remove the
+   relay agent first (`machine-service-install remove-relay-agent`); its
+   grants are not the release's, and you may need to grant again after it.

@@ -24,6 +24,12 @@
 //! calls it at startup when it runs the broker, so a second instance gets a
 //! registered agent exactly as the installed one does, and the installer
 //! calls it at installation.
+//!
+//! [`check`] decides whether the release may be installed: its signature
+//! against the instance's trust ([`signing::Anchor`], DC-231), and against
+//! the agent in place, whose signing never downgrades (DC-232). The first
+//! Developer ID team installed is recorded in the instance's
+//! [`signing::TRUST_RECORD`].
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +39,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use service_layout::release::{self, Release};
-use service_layout::signing::{self, Signing};
+use service_layout::signing::{self, Anchor, Signature, Signing};
 use sha2::{Digest, Sha256};
 
 /// The LaunchAgent label of the installed instance's relay agent
@@ -184,24 +190,79 @@ pub fn plist(identity: &Identity, paths: &Paths) -> Vec<u8> {
 
 /// The macOS executable of the release in `release_dir`, checked against
 /// its `SHA256SUMS`, holding only `relay-agent`, and signed with
-/// [`IDENTIFIER`]: with Developer ID by the configured `team`, else by the
-/// team the release's `SIGNING.json` names, or, for a pre-release only, ad
-/// hoc (DC-135, DC-140, DC-224). A `SIGNING.json` that disagrees with the
-/// executable is refused. Answers it with the signature it carries.
+/// [`IDENTIFIER`]: with Developer ID by the team the instance trusts
+/// (`anchor`, or on first use any), or, for a pre-release only, ad hoc
+/// (DC-135, DC-140, DC-224, DC-231). A `SIGNING.json` that disagrees with
+/// the executable is refused. Answers it with the signature it carries.
 pub fn release_executable(
     release_dir: &Path,
-    team: Option<&str>,
+    anchor: &Anchor,
 ) -> Result<(Vec<u8>, Signing), String> {
     let platform = release::platform_for("macos");
     let release = Release::open(release_dir)?;
     release.check_members(&platform)?;
     let bytes = release.executable(&platform)?;
-    let team = signing::expected_team(release_dir, team)?;
-    let signing = verify_signature(&bytes, &release.version, team.as_deref())?;
+    let signing = verify_signature(&bytes, &release.version, anchor)?;
     if let Some(record) = signing::Record::read(release_dir)? {
         record.agrees(&signing)?;
     }
     Ok((bytes, signing))
+}
+
+/// A release that [`check`] found may be installed.
+#[derive(Debug, Clone)]
+pub struct Checked {
+    /// The macOS executable.
+    pub bytes: Vec<u8>,
+    /// Its signature.
+    pub signing: Signing,
+    /// The instance's trust it was accepted against.
+    pub anchor: Anchor,
+}
+
+impl Checked {
+    /// How the signature is trusted, for the installer's output.
+    pub fn describe(&self) -> String {
+        match (&self.signing, self.anchor.team()) {
+            (Signing::AdHoc, _) => format!("{}", self.signing),
+            (Signing::DeveloperId { .. }, Some((_, signing::Origin::Configured))) => format!(
+                "{}, the team {} names",
+                self.signing,
+                signing::TEAM_VARIABLE
+            ),
+            (Signing::DeveloperId { .. }, Some((_, signing::Origin::Recorded))) => format!(
+                "{}, the team this Mac trusts ({})",
+                self.signing,
+                self.anchor.record.display()
+            ),
+            (Signing::DeveloperId { .. }, None) => format!(
+                "{}, trusted as this Mac's first Developer ID team and recorded in {}",
+                self.signing,
+                self.anchor.record.display()
+            ),
+        }
+    }
+}
+
+/// Whether the release of `spec` may be installed: its executable is
+/// signed as [`release_executable`] requires against the instance's trust,
+/// and replacing the agent in place with it does not downgrade its signing
+/// (DC-232). Nothing is written.
+pub fn check(spec: &Spec) -> Result<Checked, String> {
+    let anchor = Anchor::resolve(&spec.state_dir, spec.team.clone())?;
+    let (bytes, signing) = release_executable(&spec.release_dir, &anchor)?;
+    let installed = paths(&spec.identity).executable;
+    if installed.exists() && differs(&installed, &bytes) {
+        let present = signing::inspect(&installed)?;
+        if let Some(reason) = signing::downgrade(&present, &Signature::from(&signing)) {
+            return Err(format!("{} is not replaced: {reason}", installed.display()));
+        }
+    }
+    Ok(Checked {
+        bytes,
+        signing,
+        anchor,
+    })
 }
 
 /// The configured Developer ID team of this process's environment
@@ -210,16 +271,27 @@ pub fn configured_team() -> Result<Option<String>, String> {
     signing::configured_team(std::env::var(signing::TEAM_VARIABLE).ok().as_deref())
 }
 
+/// What `/health` shows of the Developer ID team the instance on
+/// `state_dir` trusts: its fingerprint and where it is set, `null` before
+/// any, or that it cannot be read (DC-231), whose reason the installer
+/// and the daemon's log give. The team itself is never shown.
+pub fn trust_health(state_dir: &Path) -> serde_json::Value {
+    match configured_team().and_then(|team| Anchor::resolve(state_dir, team)) {
+        Ok(anchor) => anchor.health(),
+        Err(_) => json!({ "error": "the trusted team cannot be read" }),
+    }
+}
+
 /// Refuse an executable that is not signed as a release of `version` must
 /// be: the privacy grants name its requirement, and an unsigned or
 /// differently signed build would lose them.
-fn verify_signature(bytes: &[u8], version: &str, team: Option<&str>) -> Result<Signing, String> {
+fn verify_signature(bytes: &[u8], version: &str, anchor: &Anchor) -> Result<Signing, String> {
     let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = directory.path().join(release::MEMBER);
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| e.to_string())?;
-    signing::verify(&path, version, team)
+    signing::verify(&path, version, anchor)
 }
 
 /// Whether the instance with `state_dir` holds a current durable lease,
@@ -323,9 +395,9 @@ pub struct Spec {
     pub release_dir: PathBuf,
     /// Make a new agent credential first (RA-4).
     pub rotate: bool,
-    /// The Developer ID team the release must be signed by
-    /// ([`signing::TEAM_VARIABLE`]); `None` accepts only an ad hoc
-    /// pre-release.
+    /// The Developer ID team the operator configured
+    /// ([`signing::TEAM_VARIABLE`]); `None` leaves the instance's record,
+    /// or, before any, trusts the first Developer ID release (DC-231).
     pub team: Option<String>,
 }
 
@@ -373,9 +445,21 @@ fn configured_broker(path: &Path) -> Option<String> {
 /// that `may_restart` forbids, because a durable
 /// lease is current and a stopping agent ends the commands it runs
 /// (DC-118), is refused with nothing changed but the configuration.
-/// Everything is checked before anything is written.
+/// Everything is checked before anything is written ([`check`]). Once the
+/// release's agent is in place, a Developer ID team the instance does not
+/// trust yet by its record is recorded (DC-231).
 pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
-    let (bytes, _) = release_executable(&spec.release_dir, spec.team.as_deref())?;
+    let checked = check(spec)?;
+    let ensured = put_in_place(spec, &checked.bytes, may_restart)?;
+    if let Some(team) = checked.anchor.to_record(&checked.signing) {
+        checked.anchor.record(team).map_err(|error| {
+            format!("the relay agent is in place, and the team it trusts could not be recorded: {error}")
+        })?;
+    }
+    Ok(ensured)
+}
+
+fn put_in_place(spec: &Spec, bytes: &[u8], may_restart: bool) -> Result<Ensured, String> {
     let paths = paths(&spec.identity);
     let domain = domain();
     if !launchctl(&["print", &domain])?.status.success() {
@@ -388,7 +472,7 @@ pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
     let config = crate::relay::agent_config(&spec.broker_url(), &credential, authority.cert_pem());
     let plist = plist(&spec.identity, &paths);
     let moved = configured_broker(&paths.config).is_some_and(|url| url != spec.broker_url());
-    let restart = differs(&paths.executable, &bytes) || differs(&paths.plist, &plist) || moved;
+    let restart = differs(&paths.executable, bytes) || differs(&paths.plist, &plist) || moved;
     let configure = differs(&paths.config, &config);
     let label = &spec.identity.label;
     let running = loaded(label)?;
@@ -409,7 +493,7 @@ pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
     }
     // The old agent stops first, so no executable is replaced under it.
     unload(label)?;
-    write_atomic(&paths.executable, &bytes, 0o755, None)?;
+    write_atomic(&paths.executable, bytes, 0o755, None)?;
     if let Some(parent) = paths.log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
@@ -420,7 +504,7 @@ pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
         let output = launchctl(&["bootstrap", &domain, &plist_path])?;
         if output.status.success() {
             return Ok(Ensured::Started {
-                build: release::sha256_hex(&bytes),
+                build: release::sha256_hex(bytes),
             });
         }
         last = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -560,6 +644,157 @@ mod tests {
             value["ProgramArguments"][0],
             "/state/relay/agent/.local/libexec/relay-agent/relay-agent"
         );
+    }
+
+    /// A release of `version` whose macOS archive holds `executable`, as
+    /// `build-relay-agent.sh` makes it.
+    fn release_of(dir: &Path, version: &str, executable: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::copy(executable, stage.path().join(release::MEMBER)).unwrap();
+        let file = format!(
+            "relay-agent-{version}-{}.tar.gz",
+            release::platform_for("macos")
+        );
+        assert!(Command::new("/usr/bin/tar")
+            .arg("-C")
+            .arg(stage.path())
+            .arg("-czf")
+            .arg(dir.join(&file))
+            .arg(release::MEMBER)
+            .status()
+            .unwrap()
+            .success());
+        let bytes = std::fs::read(dir.join(&file)).unwrap();
+        std::fs::write(
+            dir.join(release::SUMS),
+            format!("{}  {file}\n", release::sha256_hex(&bytes)),
+        )
+        .unwrap();
+    }
+
+    /// A throwaway copy of the system executable `from`, signed with
+    /// `identity` (`-` for ad hoc) and the relay agent's identifier, as the
+    /// release scripts sign.
+    fn signed_executable(dir: &Path, name: &str, from: &str, identity: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::copy(from, &path).unwrap();
+        let mut command = Command::new("/usr/bin/codesign");
+        command.args(["--force", "--sign", identity, "--identifier", IDENTIFIER]);
+        command.args(["--options", "runtime"]);
+        if identity != "-" {
+            command.arg("--timestamp");
+        }
+        let output = command.arg(&path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        path
+    }
+
+    fn spec_in(root: &Path, release_dir: PathBuf, team: Option<&str>) -> Spec {
+        let home = root.join("home");
+        Spec {
+            identity: identity(&home.join(DEFAULT_STATE), &home),
+            state_dir: home.join(DEFAULT_STATE),
+            session_port: 1,
+            release_dir,
+            rotate: false,
+            team: team.map(str::to_string),
+        }
+    }
+
+    fn put(path: &Path, from: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(from, path).unwrap();
+    }
+
+    /// DC-232 allows ad hoc to ad hoc on a Mac, and an ad hoc pre-release
+    /// records no team (DC-231).
+    #[test]
+    fn an_ad_hoc_agent_may_be_replaced_by_an_ad_hoc_pre_release() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let builds = root.join("builds");
+        std::fs::create_dir_all(&builds).unwrap();
+        let old = signed_executable(&builds, "old", "/usr/bin/true", "-");
+        let new = signed_executable(&builds, "new", "/bin/echo", "-");
+        release_of(&root.join("release"), "1.0.0-adhoc", &new);
+        let spec = spec_in(&root, root.join("release"), None);
+        put(&paths(&spec.identity).executable, &old);
+        let checked = check(&spec).unwrap();
+        assert_eq!(checked.signing, Signing::AdHoc);
+        assert_eq!(checked.anchor.to_record(&checked.signing), None);
+        assert_eq!(checked.describe(), "ad hoc");
+        // A damaged trust record refuses, rather than trusting anew.
+        let record = spec.state_dir.join(signing::TRUST_RECORD);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "not json").unwrap();
+        assert!(check(&spec).unwrap_err().contains("fix or remove it"));
+        assert_eq!(
+            trust_health(&spec.state_dir)["error"],
+            "the trusted team cannot be read"
+        );
+    }
+
+    /// DC-231 and DC-232 with a real Developer ID signature, on a Mac whose
+    /// keychain holds the identity:
+    /// `RELAY_AGENT_TEST_IDENTITY="Developer ID Application" cargo test -p
+    /// machine-service-core -- --ignored`. The first Developer ID release is
+    /// trusted and recorded, a configured other team refuses it, and the
+    /// installed Developer ID agent is never replaced by an ad hoc build.
+    #[test]
+    #[ignore = "needs a Developer ID identity in the keychain"]
+    fn a_developer_id_agent_is_trusted_first_and_never_downgraded() {
+        let identity_name =
+            std::env::var("RELAY_AGENT_TEST_IDENTITY").expect("RELAY_AGENT_TEST_IDENTITY");
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let builds = root.join("builds");
+        std::fs::create_dir_all(&builds).unwrap();
+        let developer = signed_executable(&builds, "developer", "/usr/bin/true", &identity_name);
+        release_of(&root.join("signed"), "1.0.0", &developer);
+        let first = spec_in(&root, root.join("signed"), None);
+        let checked = check(&first).unwrap();
+        let Signing::DeveloperId { team } = checked.signing.clone() else {
+            panic!("not Developer ID")
+        };
+        assert!(checked.describe().contains("first Developer ID team"));
+        assert_eq!(
+            checked.anchor.to_record(&checked.signing),
+            Some(team.as_str())
+        );
+        checked.anchor.record(&team).unwrap();
+        let health = trust_health(&first.state_dir);
+        assert_eq!(health["origin"], "recorded");
+        assert_eq!(health["fingerprint"], signing::fingerprint(&team));
+        // The recorded team is trusted again; another configured team wins
+        // over the record and refuses it.
+        assert!(check(&first)
+            .unwrap()
+            .describe()
+            .contains("this Mac trusts"));
+        let other = if team == "EXAMPLE123" {
+            "OTHER45678"
+        } else {
+            "EXAMPLE123"
+        };
+        let configured = spec_in(&root, root.join("signed"), Some(other));
+        assert!(check(&configured)
+            .unwrap_err()
+            .contains(signing::TEAM_VARIABLE));
+        // The Developer ID agent is installed; an ad hoc pre-release would
+        // downgrade it.
+        put(&paths(&first.identity).executable, &developer);
+        let adhoc = signed_executable(&builds, "adhoc", "/bin/echo", "-");
+        release_of(&root.join("adhoc"), "1.0.1-adhoc", &adhoc);
+        let downgrade = spec_in(&root, root.join("adhoc"), None);
+        let refused = check(&downgrade).unwrap_err();
+        assert!(refused.contains("DC-232"), "{refused}");
+        // The same Developer ID build in place is no replacement at all.
+        assert!(check(&first).is_ok());
     }
 
     #[test]

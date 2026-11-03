@@ -263,6 +263,10 @@ pub fn health(body: &mut Value, virtual_kind: bool) {
                 .iter()
                 .map(machine_service_core::durable::lease::PendingPurge::to_json)
                 .collect::<Vec<_>>());
+            // DC-231: the Developer ID team this instance trusts to sign its
+            // relay agent, as a fingerprint and where it is set; `null`
+            // before the first Developer ID installation.
+            body["relay_agent_team"] = relay_agent::trust_health(&machine.config.state_dir);
         }
     }
 }

@@ -491,6 +491,38 @@ fn dc224_an_ad_hoc_release_is_refused() {
     );
 }
 
+/// DC-231: an ad hoc pre-release records no trusted team, and a trust
+/// record that cannot be read refuses the installation before anything is
+/// written, rather than trusting the next team anew.
+#[test]
+fn dc231_the_trust_record_is_kept_and_never_silently_replaced() {
+    let harness = Harness::new();
+    let installed = prefix(&harness);
+    let install = [
+        "install",
+        "--expose-durable",
+        "on",
+        "--prefix",
+        installed.to_str().unwrap(),
+    ];
+    let state = harness.home.join(".local/state/machine-service");
+    let record = state.join(service_layout::signing::TRUST_RECORD);
+    let stdout = assert_ok(harness.run(&install));
+    assert!(
+        stdout.contains("relay agent release signed ad hoc"),
+        "{stdout}"
+    );
+    assert!(!record.exists(), "an ad hoc pre-release names no team");
+    fs::write(&record, "{").unwrap();
+    let removed = harness.home.join(".local/libexec/relay-agent/relay-agent");
+    fs::remove_file(&removed).unwrap();
+    let stderr = harness.assert_refused(&install);
+    assert!(stderr.contains("fix or remove it"), "{stderr}");
+    assert!(!removed.exists(), "nothing was written");
+    let stderr = harness.assert_refused(&["relay-agent"]);
+    assert!(stderr.contains("fix or remove it"), "{stderr}");
+}
+
 /// IN-3: a current durable lease refuses an installation that would
 /// restart its relay agent, which would end the lease's commands.
 #[test]

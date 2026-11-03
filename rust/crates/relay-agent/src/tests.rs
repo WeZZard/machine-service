@@ -27,6 +27,7 @@ fn options(home: &Path) -> AgentOptions {
         retention: Duration::from_secs(3600),
         ownership: guest_actions::ownership::Ownership::detect(),
         executable: std::env::current_exe().unwrap(),
+        signing: None,
     }
 }
 
@@ -175,6 +176,26 @@ fn leftovers(directory: &Path) -> Vec<String> {
 
 // ------------------------------------------------------------------ protocol
 
+/// Protocol 3's `signing` is optional both ways: a hello of an earlier
+/// agent decodes with none, and a hello without one sends no field that an
+/// earlier broker would have to know (DC-232).
+#[test]
+fn a_hello_names_its_signing_from_protocol_3_only() {
+    let earlier = br#"{"hello":{"protocol":2,"build":"b","os":"macos","arch":"aarch64","heartbeat_ms":10,"in_flight":[]}}"#;
+    let Message::Hello(hello) = Message::decode(earlier).unwrap() else {
+        panic!("not a hello")
+    };
+    assert_eq!(hello.signing, None);
+    let unsigned = Message::Hello(Hello {
+        protocol: PROTOCOL,
+        ..hello
+    });
+    assert!(!String::from_utf8(unsigned.encode())
+        .unwrap()
+        .contains("signing"));
+    const { assert!(PROTOCOL >= 3) };
+}
+
 #[test]
 fn every_message_survives_encoding() {
     let digest = Digest {
@@ -188,6 +209,10 @@ fn every_message_survives_encoding() {
             os: "macos".into(),
             arch: "aarch64".into(),
             heartbeat_ms: 10_000,
+            signing: Some(CodeSigning {
+                kind: "developer-id".into(),
+                team: Some("EXAMPLE123".into()),
+            }),
             in_flight: vec![Report {
                 execution: "x".into(),
                 state: ExecutionState::Running { op: OpKind::Exec },

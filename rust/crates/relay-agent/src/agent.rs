@@ -39,8 +39,8 @@ use guest_actions::{
 
 use crate::link::{Link, LinkError};
 use crate::protocol::{
-    Call, CallResult, CancelFound, Digest, ExecutionState, Hello, Message, Op, OpKind, Outcome,
-    Report, Status, MAX_CHUNK, PROGRESS_STEP, PROTOCOL, UPLOAD_WINDOW,
+    Call, CallResult, CancelFound, CodeSigning, Digest, ExecutionState, Hello, Message, Op, OpKind,
+    Outcome, Report, Status, MAX_CHUNK, PROGRESS_STEP, PROTOCOL, UPLOAD_WINDOW,
 };
 use crate::store::{now_ms, Store};
 use crate::uploads::{self, Landing, Upload, Uploads, UPLOAD_RETENTION};
@@ -77,6 +77,8 @@ pub struct AgentOptions {
     /// The executable the agent started from, which a restart executes
     /// again: the path, not the file, so a build renamed into place runs.
     pub executable: PathBuf,
+    /// The executable's code signature, announced in the hello (DC-232).
+    pub signing: Option<CodeSigning>,
 }
 
 impl AgentOptions {
@@ -96,8 +98,24 @@ impl AgentOptions {
             retention: MAX_RETENTION,
             ownership: Ownership::detect(),
             executable: std::env::current_exe().unwrap_or_default(),
+            signing: own_signing(),
         }
     }
+}
+
+/// The code signature of the running executable, as `codesign` shows it:
+/// on macOS only, where a Developer ID signature carries privacy grants
+/// (DC-232). `None` elsewhere, or when it cannot be read.
+pub fn own_signing() -> Option<CodeSigning> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    let signature = service_layout::signing::inspect(&executable).ok()?;
+    Some(CodeSigning {
+        kind: signature.kind().to_string(),
+        team: signature.team().map(str::to_string),
+    })
 }
 
 /// The state directory under a home directory.
@@ -597,6 +615,7 @@ impl Session {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             heartbeat_ms: options.heartbeat.as_millis() as u64,
+            signing: options.signing.clone(),
             in_flight,
         }))?;
         let mut state = self.inner.lock();

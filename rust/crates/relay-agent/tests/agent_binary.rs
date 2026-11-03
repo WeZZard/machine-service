@@ -127,6 +127,16 @@ fn the_hello_carries_the_sha256_of_the_executable() {
         guest_actions::sha256_hex(&std::fs::read(AGENT).unwrap())
     );
     assert_eq!(hello.os, std::env::consts::OS);
+    // Protocol 3: the hello names the executable's own signature, as
+    // `codesign` shows it, on macOS only (DC-232).
+    let expected = cfg!(target_os = "macos").then(|| {
+        let signature = service_layout::signing::inspect(std::path::Path::new(AGENT)).unwrap();
+        relay_agent::protocol::CodeSigning {
+            kind: signature.kind().to_string(),
+            team: signature.team().map(str::to_string),
+        }
+    });
+    assert_eq!(hello.signing, expected);
 }
 
 #[test]

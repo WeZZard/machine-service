@@ -815,3 +815,198 @@ fn wait_until_e2e(mut condition: impl FnMut() -> bool) -> bool {
     }
     condition()
 }
+
+/// A `codesign` on the guest's `PATH` that shows the recorded output
+/// `fixture` of service-layout's tests, so the guest's relay agent reads as
+/// signed that way. The daemon's own checks run `/usr/bin/codesign`.
+fn guest_codesign(lab: &Lab, fixture: &str) {
+    let recorded = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../service-layout/tests/fixtures/codesign")
+        .join(fixture)
+        .canonicalize()
+        .unwrap();
+    write_exec(
+        &lab.fixture.bin,
+        "codesign",
+        &format!("#!/bin/sh\ncat '{}'\n", recorded.display()),
+    );
+}
+
+/// Put `bytes` in place as the guest's relay agent.
+fn guest_agent(lab: &Lab, bytes: &[u8]) -> PathBuf {
+    let installed = lab
+        .guest_home
+        .join(".local/libexec/relay-agent/relay-agent");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    installed
+}
+
+fn service_log(lab: &Lab) -> String {
+    std::fs::read_to_string(lab.fixture.state_dir.join("service.log")).unwrap_or_default()
+}
+
+/// DC-232 at bootstrap: a guest whose relay agent is signed with Developer
+/// ID is never given the instance's ad hoc build; the lease is served over
+/// SSH with the reason, and the guest's agent is left as it is.
+#[test]
+fn bootstrap_never_downgrades_a_developer_id_agent() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    guest_codesign(&lab, "developer-id.txt");
+    let installed = guest_agent(&lab, b"the image's Developer ID build");
+    let _daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(answer["state"], "running");
+    assert_eq!(answer["link"], "ssh-fallback", "{answer}");
+    let reason = answer["link_reason"].as_str().unwrap();
+    assert!(reason.contains("signing never downgrades"), "{reason}");
+    assert!(reason.contains("DC-232"), "{reason}");
+    assert!(
+        !reason.contains("EXAMPLE123"),
+        "a fingerprint, not the team: {reason}"
+    );
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        b"the image's Developer ID build"
+    );
+    let calls = lab.relay_calls();
+    assert!(calls.contains("machine-service-relay-signature"), "{calls}");
+    assert!(!calls.contains("machine-service-relay-upload"), "{calls}");
+    let vm = answer["vm"].as_str().unwrap();
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+}
+
+/// DC-232 allows ad hoc to ad hoc: a guest whose agent is another ad hoc
+/// build gets the instance's build, and the lease runs over the relay.
+#[test]
+fn bootstrap_replaces_an_ad_hoc_agent_with_an_ad_hoc_build() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    guest_codesign(&lab, "adhoc.txt");
+    let installed = guest_agent(&lab, b"an earlier ad hoc build");
+    let agent = AgentProcess::start(&lab.guest_home, &[]);
+    let _daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(
+        answer["link"],
+        "relay",
+        "{answer}\nagent log:\n{}",
+        agent.log()
+    );
+    let calls = lab.relay_calls();
+    assert!(calls.contains("machine-service-relay-signature"), "{calls}");
+    assert!(calls.contains("machine-service-relay-upload"), "{calls}");
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(relay_agent_bin()).unwrap()
+    );
+    // The real agent names its own signature in its hello (protocol 3).
+    if cfg!(target_os = "macos") {
+        assert_eq!(answer["relay_agent"]["signing"], "adhoc", "{answer}");
+    }
+    let vm = answer["vm"].as_str().unwrap();
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+    drop(agent);
+}
+
+/// DC-232 for a lease that lives on: an agent that registers with another
+/// build and says in its hello that it is signed with Developer ID is not
+/// given the instance's ad hoc build; nothing is written, and the lease
+/// keeps its agent.
+#[test]
+fn a_long_lived_lease_never_downgrades_a_developer_id_agent() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    let installed = guest_agent(&lab, &std::fs::read(relay_agent_bin()).unwrap());
+    let agent = AgentProcess::start_from(&installed, &lab.guest_home, &[]);
+    let _daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(
+        answer["link"],
+        "relay",
+        "{answer}\nagent log:\n{}",
+        agent.log()
+    );
+    let vm = answer["vm"].as_str().unwrap().to_string();
+    let build = answer["relay_agent"]["build"].clone();
+    drop(agent);
+
+    // The lease's agent comes back as another build, signed with Developer
+    // ID by its own account, in a home of its own.
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(lab.guest_home.join(".config/relay-agent/config.json")).unwrap(),
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let mut options = relay_common::agent_options(&home);
+    options.signing = Some(relay_agent::protocol::CodeSigning {
+        kind: "developer-id".into(),
+        team: Some("EXAMPLE123".into()),
+    });
+    let signed = relay_agent::Agent::open(options).unwrap();
+    let dial_config = relay_agent::config::Config {
+        broker_url: config["broker_url"].as_str().unwrap().to_string(),
+        agent_credential: config["agent_credential"].as_str().unwrap().to_string(),
+        broker_ca_pem: config["broker_ca_pem"].as_str().map(str::to_string),
+    };
+    let serving = signed.clone();
+    std::thread::spawn(move || {
+        relay_agent::dial::run(
+            &serving,
+            &dial_config,
+            |c| {
+                relay_agent::session_link::dial(
+                    c,
+                    &relay_agent::session_link::DialOptions {
+                        timing: Some(relay_common::fast_timing()),
+                        ..Default::default()
+                    },
+                )
+            },
+            |e| eprintln!("signed agent: {e}"),
+        )
+    });
+    assert!(
+        wait_until_e2e(|| service_log(&lab).contains("the relay agent was not replaced")),
+        "{}",
+        service_log(&lab)
+    );
+    let log = service_log(&lab);
+    assert!(log.contains("signing never downgrades"), "{log}");
+    assert!(log.contains("DC-232"), "{log}");
+    assert!(!log.contains("replacing it (RA-6)"), "{log}");
+    assert!(!home.join(".local/libexec/relay-agent/relay-agent").exists());
+    let record = http(
+        lab.fixture.port(),
+        "GET",
+        &format!("/machines/{vm}"),
+        None,
+        None,
+    )
+    .body;
+    assert_eq!(record["relay_agent"]["build"], build, "{record}");
+    // The lease keeps working through the agent it has.
+    let ran = lab.post(
+        &format!("/machines/{vm}/exec"),
+        &json!({"argv": ["echo", "kept"]}),
+    );
+    assert_eq!(ran.body["output"], "kept\n", "{}", ran.body);
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+    signed.shutdown(Duration::from_secs(1));
+}

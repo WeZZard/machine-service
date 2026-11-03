@@ -966,6 +966,7 @@ dependencies = [
  "remote-session",
  "serde",
  "serde_json",
+ "service-layout",
  "tempfile",
  "thiserror",
 ]

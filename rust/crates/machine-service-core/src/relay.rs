@@ -17,6 +17,11 @@
 //!   this instance holds gets this instance's build written over its
 //!   executable through the relay, and the agent restarts onto it once no
 //!   call is out (RA-6, [`Service::watch_relay_agents`]).
+//! - Neither path downgrades the agent's signing (DC-232): a guest whose
+//!   agent is signed with Developer ID is never given a build that is not.
+//!   Bootstrap reads the guest's agent's signature with `codesign` over
+//!   SSH, and a long-lived lease takes it from the agent's hello (protocol
+//!   3) or, from an earlier agent, with `codesign` through the relay.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, TcpListener};
@@ -32,6 +37,7 @@ use relay_broker::tls::Authority;
 use relay_broker::{Answer, Broker, BrokerConfig, RestartError, Role, RunError, Target, Upload};
 use remote_session::{Listening, ServerConfig, SessionServer};
 use serde_json::{json, Value};
+use service_layout::signing::{self, Signature};
 
 use crate::error::{OpError, OpResult};
 use crate::service::Service;
@@ -384,6 +390,55 @@ pub fn inspect_command() -> String {
         ),
         "inspect",
     )
+}
+
+/// What [`signature_command`] prints where the guest has no `codesign`.
+const NO_CODESIGN: &str = "machine-service-relay: no codesign";
+
+/// Print what `codesign` shows of the guest's relay agent's signature
+/// (DC-232); `codesign` is found on the guest's `PATH`.
+pub fn signature_command() -> String {
+    sh(
+        &format!(
+            "p=\"$HOME/{GUEST_EXECUTABLE}\"; if command -v codesign >/dev/null 2>&1; then \
+codesign -d -r- \"$p\" 2>&1; else echo '{NO_CODESIGN}'; fi; exit 0"
+        ),
+        "signature",
+    )
+}
+
+/// The signature of a relay agent in place from what [`signature_command`]
+/// printed on a guest of `kind`. A guest without `codesign` has no signed
+/// agent, except a macOS guest, whose signature then cannot be told.
+fn guest_signature(kind: &str, output: &str) -> Result<Signature, String> {
+    if !output.contains(NO_CODESIGN) {
+        return Ok(Signature::from_codesign(output));
+    }
+    if kind == "macos" {
+        return Err(
+            "the macOS guest has no codesign, so the signing of its relay agent cannot be told (DC-232)"
+                .into(),
+        );
+    }
+    Ok(Signature::Unsigned)
+}
+
+/// The signature of `build`, a relay agent executable this instance holds,
+/// read with the host's `codesign`: a Linux build is unsigned.
+pub fn build_signature(build: &[u8]) -> Result<Signature, String> {
+    let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = directory.path().join(service_layout::release::MEMBER);
+    std::fs::write(&path, build).map_err(|e| e.to_string())?;
+    signing::inspect(&path)
+}
+
+/// Why replacing a relay agent signed `present` with `build` would
+/// downgrade its signing, if it would (DC-232).
+fn downgrade_of(present: &Signature, build: &[u8]) -> Result<Option<String>, String> {
+    if !matches!(present, Signature::DeveloperId { .. }) {
+        return Ok(None);
+    }
+    Ok(signing::downgrade(present, &build_signature(build)?))
 }
 
 /// Store the relay agent from standard input, atomically.
@@ -758,7 +813,7 @@ impl Service {
         if failed || !first {
             return;
         }
-        let outcome = self.replace_relay_agent_steps(relay, vm, &want, build, &agent.build);
+        let outcome = self.replace_relay_agent_steps(relay, vm, &want, build, agent);
         relay
             .replacing
             .lock()
@@ -780,15 +835,59 @@ impl Service {
         }
     }
 
+    /// The signature of the relay agent `agent` of `target`: from its hello,
+    /// or, from an agent of an earlier protocol on macOS, what `codesign`
+    /// shows of its executable through the relay (DC-232).
+    fn agent_signature(
+        &self,
+        relay: &Relay,
+        target: &Target,
+        agent: &AgentInfo,
+    ) -> Result<Signature, String> {
+        if let Some(signing) = &agent.signing {
+            return Ok(Signature::from_parts(
+                &signing.kind,
+                signing.team.as_deref(),
+            ));
+        }
+        if agent.os != "macos" {
+            return Ok(Signature::Unsigned);
+        }
+        let shown = relay
+            .broker
+            .run(
+                target,
+                &uuid::Uuid::new_v4().to_string(),
+                Op::Exec {
+                    command: format!("codesign -d -r- \"$HOME/{GUEST_EXECUTABLE}\" 2>&1"),
+                    stdin: false,
+                    timeout_s: 60.0,
+                },
+                Upload::bytes(Vec::new()),
+                relay.settings.agent_wait + Duration::from_secs(60),
+            )
+            .map_err(|e| format!("reading the relay agent's signature got no answer: {e:?}"))?;
+        Ok(Signature::from_codesign(&String::from_utf8_lossy(
+            &shown.bytes,
+        )))
+    }
+
     fn replace_relay_agent_steps(
         &self,
         relay: &Relay,
         vm: &str,
         want: &str,
         build: Vec<u8>,
-        have: &str,
+        agent: &AgentInfo,
     ) -> Result<(), String> {
+        let have = agent.build.as_str();
         let target = Target::Lease(vm.to_string());
+        // DC-232: a Developer ID agent is never replaced by a build that is
+        // not; the agent says how it is signed in its hello (protocol 3).
+        let present = self.agent_signature(relay, &target, agent)?;
+        if let Some(reason) = downgrade_of(&present, &build)? {
+            return Err(reason);
+        }
         self.log(&format!(
             "relay: {vm}: the relay agent runs build {}, not this instance's {}; replacing it (RA-6)",
             have.get(..12).unwrap_or(have),
@@ -814,7 +913,7 @@ impl Service {
         }
         // The agent refuses a restart while anything runs, including calls
         // a restarted broker does not know of; wait for it to be idle.
-        let agent = loop {
+        let restarted = loop {
             if !relay.broker.has_credential(&target, Role::Agent) {
                 return Err("the lease ended".into());
             }
@@ -823,15 +922,15 @@ impl Service {
                 Duration::from_secs(3600),
                 relay.settings.register_timeout,
             ) {
-                Ok(agent) => break agent,
+                Ok(restarted) => break restarted,
                 Err(RestartError::Busy) => std::thread::sleep(Duration::from_secs(2)),
                 Err(other) => return Err(format!("the restart failed: {other:?}")),
             }
         };
-        if agent.build != want {
+        if restarted.build != want {
             return Err(format!(
                 "after the restart it runs build {}",
-                agent.build.get(..12).unwrap_or(&agent.build)
+                restarted.build.get(..12).unwrap_or(&restarted.build)
             ));
         }
         let _ = self.state.update(
@@ -841,6 +940,14 @@ impl Service {
                         record.get_mut("relay_agent").and_then(Value::as_object_mut)
                     {
                         object.insert("build".into(), json!(want));
+                        match &restarted.signing {
+                            Some(signing) => {
+                                object.insert("signing".into(), json!(signing.kind));
+                            }
+                            None => {
+                                object.remove("signing");
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -999,6 +1106,21 @@ impl Service {
                 "inspecting the guest's relay agent failed ({rc}): {have}"
             ));
         }
+        if have != want && have != "none" {
+            // DC-232: a Developer ID agent is never replaced by a build that
+            // is not; the lease is served over SSH instead (RA-8).
+            let (rc, shown) = ssh(&signature_command(), None, 60)?;
+            if rc != 0 {
+                return Err(format!(
+                    "reading the guest's relay agent signature failed ({rc}): {}",
+                    shown.trim()
+                ));
+            }
+            let present = guest_signature(kind, &shown)?;
+            if let Some(reason) = downgrade_of(&present, &build)? {
+                return Err(format!("the guest's relay agent is not replaced: {reason}"));
+            }
+        }
         if have != want {
             self.log(&format!(
                 "relay: {vm}: uploading the relay agent ({} bytes; the guest has {})",
@@ -1113,12 +1235,16 @@ impl Service {
             },
             Vec::new(),
         );
-        Ok(json!({
+        let mut fields = json!({
             "os": agent.os,
             "arch": agent.arch,
             "build": agent.build,
             "broker_url": broker_url,
-        }))
+        });
+        if let Some(signing) = &agent.signing {
+            fields["signing"] = json!(signing.kind);
+        }
+        Ok(fields)
     }
 
     /// Run one call on a `relay` lease and map the broker's errors.
@@ -1448,6 +1574,7 @@ mod tests {
             (upload_command(), "upload"),
             (config_command(), "config"),
             (start_command(), "start"),
+            (signature_command(), "signature"),
         ] {
             assert!(
                 command.ends_with(&format!("{COMMAND_MARKER}-{step}")),
@@ -1457,6 +1584,51 @@ mod tests {
         assert!(config_command().contains("chmod 600"));
         assert!(config_command().contains("mv -f"));
         assert!(upload_command().contains(GUEST_EXECUTABLE));
+        assert!(signature_command().contains(GUEST_EXECUTABLE));
+    }
+
+    /// DC-232: the guest's agent's signature is read from `codesign`; a
+    /// guest without it has no signed agent, except a macOS guest, whose
+    /// signing then cannot be told. Only a Developer ID agent in place is
+    /// protected, and the host's ad hoc build would downgrade it.
+    #[test]
+    fn the_guests_signature_decides_whether_a_build_downgrades_it() {
+        let developer = "Executable=/x\ndesignated => identifier \"com.wezzard.relay-agent\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EXAMPLE123\n";
+        assert_eq!(
+            guest_signature("macos", developer).unwrap(),
+            Signature::DeveloperId {
+                team: "EXAMPLE123".into()
+            }
+        );
+        assert_eq!(
+            guest_signature("linux", NO_CODESIGN).unwrap(),
+            Signature::Unsigned
+        );
+        assert!(guest_signature("macos", NO_CODESIGN)
+            .unwrap_err()
+            .contains("DC-232"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent");
+        std::fs::copy("/usr/bin/true", &path).unwrap();
+        assert!(std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let adhoc = std::fs::read(&path).unwrap();
+        assert_eq!(build_signature(&adhoc).unwrap(), Signature::AdHoc);
+        assert_eq!(
+            build_signature(b"#!/bin/sh\n").unwrap(),
+            Signature::Unsigned
+        );
+        let present = guest_signature("macos", developer).unwrap();
+        assert!(downgrade_of(&present, &adhoc)
+            .unwrap()
+            .unwrap()
+            .contains("DC-232"));
+        assert_eq!(downgrade_of(&Signature::AdHoc, &adhoc).unwrap(), None);
+        assert_eq!(downgrade_of(&Signature::Unsigned, &adhoc).unwrap(), None);
     }
 
     #[test]

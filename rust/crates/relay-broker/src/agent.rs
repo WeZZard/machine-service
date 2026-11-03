@@ -61,6 +61,7 @@ impl AgentConn {
             arch: self.hello.arch.clone(),
             build: self.hello.build.clone(),
             protocol: self.hello.protocol,
+            signing: self.hello.signing.clone(),
         }
     }
 

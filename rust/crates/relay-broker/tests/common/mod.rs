@@ -171,6 +171,7 @@ pub fn agent_options(home: &Path) -> AgentOptions {
         retention: Duration::from_secs(3600),
         ownership: guest_actions::ownership::Ownership::detect(),
         executable: std::env::current_exe().unwrap(),
+        signing: None,
     }
 }
 

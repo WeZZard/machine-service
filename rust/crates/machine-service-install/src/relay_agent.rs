@@ -31,32 +31,41 @@ pub struct Spec {
     pub release_dir: PathBuf,
     /// Make a new agent credential first (RA-4).
     pub rotate: bool,
-    /// The Developer ID team the release must be signed by (DC-224).
+    /// The Developer ID team the operator configured
+    /// (`MACHINE_SERVICE_RELAY_AGENT_TEAM_ID`); without it the instance's
+    /// record, or the first Developer ID team installed (DC-231).
     pub team: Option<String>,
 }
 
-/// The macOS executable of the release in `release_dir`, checked against its
-/// `SHA256SUMS` and its signature: Developer ID by `team`, or ad hoc for a
-/// pre-release (DC-135, DC-140, DC-224). Prints which it carries.
-pub fn release_executable(release_dir: &Path, team: Option<&str>) -> Result<Vec<u8>, InstallError> {
-    let (bytes, signing) =
-        core::release_executable(release_dir, team).map_err(InstallError::Refused)?;
-    println!("relay agent release signed {signing}");
-    Ok(bytes)
+impl Spec {
+    fn core(&self, identity: Identity) -> core::Spec {
+        core::Spec {
+            identity,
+            state_dir: self.state_dir.clone(),
+            session_port: self.session_port,
+            release_dir: self.release_dir.clone(),
+            rotate: self.rotate,
+            team: self.team.clone(),
+        }
+    }
+}
+
+/// Check, writing nothing, that the release of `spec` may be installed: its
+/// `SHA256SUMS`, its signature against the instance's trust (DC-224,
+/// DC-231) and against the agent in place, whose signing never downgrades
+/// (DC-232). Prints which signature it carries and how it is trusted.
+pub fn check(spec: &Spec) -> Result<Vec<u8>, InstallError> {
+    let checked = core::check(&spec.core(identity(&spec.state_dir, &spec.home)))
+        .map_err(InstallError::Refused)?;
+    println!("relay agent release signed {}", checked.describe());
+    Ok(checked.bytes)
 }
 
 /// Install the relay agent of `spec` and start it in the desktop session,
 /// restarting it only when its executable or LaunchAgent changed. The
 /// caller has refused a current durable lease already.
 pub fn install(spec: &Spec) -> Result<(), InstallError> {
-    let wanted = core::Spec {
-        identity: identity(&spec.state_dir, &spec.home).with_login_path(),
-        state_dir: spec.state_dir.clone(),
-        session_port: spec.session_port,
-        release_dir: spec.release_dir.clone(),
-        rotate: spec.rotate,
-        team: spec.team.clone(),
-    };
+    let wanted = spec.core(identity(&spec.state_dir, &spec.home).with_login_path());
     let done = core::ensure(&wanted, true).map_err(InstallError::Refused)?;
     let what = match done {
         Ensured::Unchanged => "unchanged".to_string(),

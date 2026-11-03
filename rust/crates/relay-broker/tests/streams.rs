@@ -56,7 +56,9 @@ fn an_upload_streams_through_with_the_agents_progress() {
     let a = lease(&h.broker, "vm-a");
     let agent = TestAgent::start(&h.url("ws"), &a.agent, None);
     let client = client_v2(&h.url("ws"), &a.client);
-    assert_eq!(client.ready.protocol, 2);
+    // The broker announces its own protocol; protocol 3 changes only the
+    // agent's hello, so the client keeps protocol 2's streams.
+    assert!(client.ready.protocol >= 2);
     let whole = pattern(UPLOAD_WINDOW as usize + 3 * MAX_CHUNK + 5, 1);
     let streamed = client.stream(1, "up", write("up.bin"), &whole[..], false, None);
     assert_eq!(streamed, Streamed::Sent { from: 0 });

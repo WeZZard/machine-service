@@ -57,7 +57,7 @@ The remote session ([RS](remote-session.md)) makes one logical session survive a
 | client | `{"role":"client","protocol":2}` | the lease credential, `relay.credential` in the acquisition's answer | that lease's relay agent |
 | agent | `{"role":"agent"}` | the agent credential in `~/.config/relay-agent/config.json` | its lease, or its durable machine |
 
-- `attributes.protocol` is the relay protocol the client speaks ([RP-15](#rp-15-resumable-streams)); this page describes protocol 2. A client that leaves it out is taken as protocol 1, whose uploads the broker holds whole, up to 256 MiB. The session's own `version` stays 1.
+- `attributes.protocol` is the relay protocol the client speaks ([RP-15](#rp-15-resumable-streams)); this page describes protocol 3, whose one change from protocol 2 is the agent's `hello.signing` (RP-4), so a client speaks protocol 2. A client that leaves it out is taken as protocol 1, whose uploads the broker holds whole, up to 256 MiB. The session's own `version` stays 1.
 - `attributes` may also carry `"lease": "<machine name>"`; when it does and names another lease than the credential's, the hello is refused with `unauthorized`.
 - Credentials are opaque bearer tokens of 43 URL-safe base64 characters (32 random bytes). The broker stores only their SHA-256.
 - A virtual machine's lease gets a new client credential and a new agent credential at acquisition. The broker refuses both from the moment the lease starts releasing or expires ([RP-10](#rp-10-revocation)).
@@ -100,11 +100,13 @@ A client's `call` names no lease. On the agent's side of the broker, every `call
 | `progress` | `{"progress":{"call":<u64>,"execution":"<id>","committed":<u64>}}`: how many bytes of the call's upload the relay agent holds, from its first byte ([RP-15](#rp-15-resumable-streams)) |
 | `revoked` | `{"revoked":{"reason":"released"}}`, before the broker closes the session ([RP-10](#rp-10-revocation)) |
 
-`agent` in `ready` is `{"os":"macos","arch":"aarch64","build":"<sha256 of the agent executable>","protocol":2}` when the lease's relay agent has a session, else `null`. A client ignores message names it does not know.
+`agent` in `ready` is `{"os":"macos","arch":"aarch64","build":"<sha256 of the agent executable>","protocol":3,"signing":{"kind":"adhoc"}}` when the lease's relay agent has a session, else `null`. `signing` is the agent's own code signature, from its hello; it is left out for an agent of an earlier protocol or one that cannot read its signature. A client ignores message names and fields it does not know.
 
 On a durable lease, the `call` the relay agent receives for a client's exec or script is an exec of machine-service's launcher, `exec <machine-service> --durable-launch <request>`, with the client's execution ID, `timeout_s` and upload; `stdin` is true for a script, whose upload the launcher's shell reads ([DM-4](durable-machine.md#dm-4-exec)). The relay agent runs it like any exec.
 
 On the agent's side, the broker sends `ready` too, right after the agent's `hello`, with its own `protocol` and `agent` set to `null`; each side speaks the lower of the agent's `hello.protocol` and the broker's. An agent of protocol 1 receives no `progress`, `resume` or `offset`, and the broker reports an upload's progress for it (RP-15).
+
+Protocol 3 adds one field to the agent's `hello`: `signing`, `{"kind":"developer-id","team":"<team ID>"}`, or `kind` `adhoc`, `unsigned` or `other` without a team. It is what `codesign` shows of the executable the agent runs from, read on macOS at start; a Linux agent leaves it out. machine-service reads it before it replaces the agent's build, because signing never downgrades ([RA-6](relay-agent.md#ra-6-delivery-and-update), DC-232). The field is optional both ways: a broker reads a protocol 2 hello as saying nothing of its signing, and a broker of protocol 2 ignores it. Nothing else changes, so a client of protocol 2 keeps every rule of RP-15.
 
 ### Operations (`op`)
 

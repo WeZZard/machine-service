@@ -22,13 +22,19 @@
 //! agent sends back is acknowledged with progress the same way, and a call's
 //! `offset` starts its answer at any byte. The SHA-256 of the whole stream
 //! in the end, and the rename at the commit point, are unchanged.
+//!
+//! Protocol 3 adds the agent's own code signature to its [`Hello`],
+//! `signing`, so machine-service can tell before it replaces a build
+//! whether the replacement would downgrade the agent's signing (DC-232).
+//! A hello without it, from an agent of an earlier protocol, says nothing
+//! of its signing.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The version of this protocol, announced in [`Hello`] and [`Ready`].
 /// Each side speaks the lower of its own and its peer's version.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 /// The most bytes of one stream a sender keeps beyond the receiver's last
 /// [`Message::Progress`] (protocol 2). It bounds what a stream holds in the
 /// broker, whatever the stream's size.
@@ -144,6 +150,20 @@ pub struct AgentInfo {
     pub build: String,
     /// The agent's protocol version.
     pub protocol: u32,
+    /// The agent's code signature, from protocol 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<CodeSigning>,
+}
+
+/// A relay agent's code signature as its hello reports it (protocol 3,
+/// DC-232): what `codesign` shows of the executable it runs from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeSigning {
+    /// `developer-id`, `adhoc`, `unsigned` or `other`.
+    pub kind: String,
+    /// The Developer ID team, for `developer-id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 /// A call or query that waits for the relay agent.
@@ -174,6 +194,10 @@ pub struct Hello {
     pub arch: String,
     /// How often the agent sends a heartbeat.
     pub heartbeat_ms: u64,
+    /// The agent's code signature, from protocol 3; `None` from an earlier
+    /// agent, or where it cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<CodeSigning>,
     /// Executions still running, and executions whose outcome no link has
     /// carried yet (RA-3).
     pub in_flight: Vec<Report>,

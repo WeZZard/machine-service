@@ -543,6 +543,24 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
     let (name, lease, _) = lab.acquire("none");
     lab.wait_for_relay(&name, &lease);
     assert_eq!(lab.release_lease(&name, &lease).status, 200);
+
+    // DC-231: an ad hoc pre-release names no trusted team; a recorded one
+    // shows in `/health` as a fingerprint, never as the team.
+    let health = lab.request("GET", "/health", None).body;
+    assert_eq!(health["relay_agent_team"], Value::Null, "{health}");
+    let record = lab
+        .state
+        .join(machine_service_core::service_layout::signing::TRUST_RECORD);
+    std::fs::write(&record, r#"{"team": "EXAMPLE123"}"#).unwrap();
+    let health = lab.request("GET", "/health", None).body;
+    assert_eq!(
+        health["relay_agent_team"],
+        json!({
+            "fingerprint": machine_service_core::service_layout::signing::fingerprint("EXAMPLE123"),
+            "origin": "recorded",
+        })
+    );
+    assert!(!health.to_string().contains("EXAMPLE123"), "{health}");
 }
 
 /// Everything under `root`, as text.

@@ -344,7 +344,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
             }
         }
         Some(validate_install(
-            cli, &base, &previous, &checked, &env, source, &deployed,
+            cli, &base, &previous, &checked, &env, source, &deployed, home,
         )?)
     } else {
         None
@@ -601,6 +601,7 @@ fn refuse_leases(roots: &BTreeSet<PathBuf>) -> Result<(), InstallError> {
 /// to copy, and the relay agent release, when the installation needs one.
 type Validated = (Vec<u8>, Vec<String>, Option<Release>);
 
+#[allow(clippy::too_many_arguments)]
 fn validate_install(
     cli: &Cli,
     old: &Map<String, Value>,
@@ -609,6 +610,7 @@ fn validate_install(
     written: &BTreeMap<String, String>,
     source: &Path,
     deployed: &Path,
+    home: &Path,
 ) -> Result<Validated, InstallError> {
     let service_name = service_layout::Executable::Service.name();
     let service = source.join(service_name);
@@ -680,7 +682,14 @@ fn validate_install(
                 .map_err(InstallError::Refused)?;
         }
         if exposed {
-            crate::relay_agent::release_executable(&folder, relay_agent_team(written)?.as_deref())?;
+            crate::relay_agent::check(&crate::relay_agent::Spec {
+                home: home.to_path_buf(),
+                state_dir: state_root(written, home)?,
+                session_port: session_port(written)?,
+                release_dir: folder.clone(),
+                rotate: false,
+                team: relay_agent_team(written)?,
+            })?;
         }
         Some(release)
     };
@@ -770,8 +779,9 @@ fn validate_install(
 }
 
 /// The Developer ID team that `env` trusts to sign the relay agent
-/// (`MACHINE_SERVICE_RELAY_AGENT_TEAM_ID`, DC-224); kept by later installs
-/// as every `MACHINE_SERVICE_` setting is.
+/// (`MACHINE_SERVICE_RELAY_AGENT_TEAM_ID`, DC-231); kept by later installs
+/// as every `MACHINE_SERVICE_` setting is. Without it, the instance's
+/// record of the first Developer ID team it installed decides.
 fn relay_agent_team(env: &BTreeMap<String, String>) -> Result<Option<String>, InstallError> {
     service_layout::signing::configured_team(
         env.get(service_layout::signing::TEAM_VARIABLE)
@@ -816,17 +826,15 @@ fn relay_agent_only(
         crate::relay_agent::remove(home, &state_dir)?;
         return Ok(());
     }
-    let release_dir = source.join(service_layout::release::FOLDER);
-    let team = relay_agent_team(env)?;
-    crate::relay_agent::release_executable(&release_dir, team.as_deref())?;
     let spec = crate::relay_agent::Spec {
         home: home.to_path_buf(),
         state_dir,
         session_port: session_port(env)?,
-        release_dir,
+        release_dir: source.join(service_layout::release::FOLDER),
         rotate: cli.rotate_relay_credential,
-        team,
+        team: relay_agent_team(env)?,
     };
+    crate::relay_agent::check(&spec)?;
     if readonly {
         println!("Check passed; no files written and no launchctl calls (relay-agent).");
         return Ok(());
