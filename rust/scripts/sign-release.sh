@@ -28,7 +28,7 @@
 #   --sign-developer-id=IDENTITY  the identity (default "Developer ID
 #              Application"); the script's own command line names it, as
 #              build-relay-agent.sh's does, and a CODESIGN_IDENTITY in the
-#              environment is ignored (DC-1xx-LIVE-8)
+#              environment is ignored (DC-250)
 #   CODESIGN_TEAM      refuse a signature by any other team
 #   GH_REPO            the repository, when not the checkout's
 set -eu

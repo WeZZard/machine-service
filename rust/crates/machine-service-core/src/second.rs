@@ -1,5 +1,5 @@
 //! Whether this daemon is a second instance (`second_instance::from_env`,
-//! DC-1xx-LIVE-2), set once at startup by the daemon's `main` after it has
+//! DC-244), set once at startup by the daemon's `main` after it has
 //! checked its environment. A process that never sets it, such as a
 //! component test's service, is not a second instance.
 

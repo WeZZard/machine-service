@@ -22,7 +22,7 @@
 //! instance's store, which may be the operator's: the source is only read,
 //! the clones carry the instance's prefix, so the launcher's `stop` deletes
 //! them if the test cannot, and no clone prunes the store's cache
-//! (DC-1xx-LIVE-4).
+//! (DC-246).
 
 mod common;
 

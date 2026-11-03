@@ -1,4 +1,4 @@
-//! Who may connect to the chain's one port (DC-1xx-LIVE-6).
+//! Who may connect to the chain's one port (DC-248).
 //!
 //! A client's chain listens on loopback and admits anyone who reaches it.
 //! A relay agent's chain on a VM host must be reached by the host's guests

@@ -57,7 +57,7 @@ fn require_instance(link: &str, port: u16) {
         matches!(&health, Ok(response) if response.status == 200),
         "no machine-service on port {port}; start it with scripts/live-instance.sh"
     );
-    // Only a second instance, never the installed daemon (DC-1xx-LIVE-3).
+    // Only a second instance, never the installed daemon (DC-245).
     if let Err(refused) = second_instance::guard(port, &health.as_ref().unwrap().body) {
         panic!("{refused}");
     }

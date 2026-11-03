@@ -513,7 +513,7 @@ impl RealTarget {
 
 impl RealTarget {
     /// A durable cell's record of what the instance exposes, from its host:
-    /// durable exposure off loopback must name this cell (DC-1xx-LIVE-1),
+    /// durable exposure off loopback must name this cell (DC-243),
     /// and the run's evidence keeps it as `host-exposure.json`.
     fn record_exposure(&mut self, cell: Cell, run_dir: &Path) -> Result<(), String> {
         let control = self
@@ -531,7 +531,7 @@ impl RealTarget {
 
     /// The lease's relay agent, when the suite restarts or stops it: on a
     /// durable Mac only a second instance's own agent, never the installed
-    /// one's (DC-1xx-LIVE-7).
+    /// one's (DC-249).
     pub fn agent_job(&self) -> Result<AgentPlace, Stop> {
         let place = self.agent();
         if self.durable() && !second_instance::owned_agent_label(&place.label) {
@@ -625,7 +625,7 @@ impl Target for RealTarget {
         self.kind = Some(cell.target);
         let discovery = self.instance.discover().map_err(fail)?;
         // Never the installed instance: only one that reports itself as a
-        // second instance, off the installed ports (DC-1xx-LIVE-3).
+        // second instance, off the installed ports (DC-245).
         let id = second_instance::guard(base_port(self.instance.base()), &discovery.health)
             .map_err(fail)?;
         self.note("second instance", json!(id));

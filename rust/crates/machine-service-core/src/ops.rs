@@ -304,7 +304,7 @@ impl Service {
                 }
                 let suffix = &uuid::Uuid::new_v4().simple().to_string()[..6];
                 // A second instance's clones carry its own prefix, so that its
-                // launcher deletes them and no others (DC-1xx-LIVE-4).
+                // launcher deletes them and no others (DC-246).
                 let owned = crate::second::vm_prefix();
                 let vm = format!("{owned}{clone_prefix}{purpose_for_record}-{suffix}");
                 let now = unix_now();

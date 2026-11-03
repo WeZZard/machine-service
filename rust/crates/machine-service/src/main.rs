@@ -70,7 +70,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     };
     config.guest_link = GuestLink::from_environment()?;
     // A second instance runs only on resources of its own, and says so in
-    // `/health`, the one mark the live tools accept (DC-1xx-LIVE-2).
+    // `/health`, the one mark the live tools accept (DC-244).
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/"));

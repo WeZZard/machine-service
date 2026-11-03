@@ -24,7 +24,7 @@
 #   the team the signature carries, or CODESIGN_TEAM when set. Only the flag
 #   signs with Developer ID: a CODESIGN_IDENTITY in the environment, which a
 #   shell profile or a runner may set, is ignored, so no build signs with the
-#   login keychain's key unless its command line asks (DC-1xx-LIVE-8).
+#   login keychain's key unless its command line asks (DC-250).
 # - Without it the signature is ad hoc, and its designated requirement is the
 #   build's code hash. Only a pre-release may be ad hoc, so an ad hoc build of
 #   a version without a pre-release part names itself <version>-adhoc, unless

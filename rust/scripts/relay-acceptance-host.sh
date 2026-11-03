@@ -11,7 +11,7 @@
 # root and the rig's runs and tool cache.
 #
 # The instance is started by the shared launcher, `second-instance`
-# (DC-1xx-LIVE-1), under $RELAY_HOST_DIR/instance: its own ports, state,
+# (DC-243), under $RELAY_HOST_DIR/instance: its own ports, state,
 # configuration and credential packs, a minimal environment, its own
 # session, clones named si-<id>- in the Tart store it is given, and both of
 # its listeners on one address, loopback unless RELAY_HOST_BIND names this
@@ -21,7 +21,7 @@
 # host's address on their network, as machine-service derives it (BK-5).
 # That address is a vmnet bridge, which appears only with the first VM, so
 # the chain listens on every interface and admits only loopback and the
-# bridges' guests (`--admit guests`, DC-1xx-LIVE-6).
+# bridges' guests (`--admit guests`, DC-248).
 #
 # With durable exposure on, the instance brings up its own relay agent
 # (IN-3), whose label and home derive from the instance's state folder, so

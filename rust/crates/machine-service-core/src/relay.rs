@@ -90,7 +90,7 @@ pub struct RelaySettings {
     pub session_port: u16,
     /// The session listener's address: every interface unless
     /// `MACHINE_SERVICE_SESSION_HOST` names one, which a second instance
-    /// must (DC-1xx-LIVE-2).
+    /// must (DC-244).
     pub session_host: String,
     /// The URL discovery advertises (BK-4).
     pub relay_url: String,

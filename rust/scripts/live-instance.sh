@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run a second machine-service instance for live tests (docs/arch/test-layers.md,
 # TL-4), beside the installed daemon and without touching it, through the
-# shared launcher, `second-instance` (DC-1xx-LIVE-1).
+# shared launcher, `second-instance` (DC-243).
 #
 # The launcher gives the instance its own root, LIVE_BIN/<port>, which holds
 # its state, configuration, credential packs, logs and the manifest of what

@@ -7,8 +7,8 @@
 //!
 //! They run only against a second instance that `second-instance` started
 //! (`scripts/live-instance.sh`), named by its root, and never against the
-//! installed daemon (DC-1xx-LIVE-3). Their credentials are a pack fixture
-//! the test owns (DC-1xx-LIVE-5): the files of `LIVE_E2E_PACK`, a folder the
+//! installed daemon (DC-245). Their credentials are a pack fixture
+//! the test owns (DC-247): the files of `LIVE_E2E_PACK`, a folder the
 //! operator prepares, copied into the instance's own pack store under a name
 //! of the test's and removed after it; the operator's `default` pack is
 //! never read, and a second instance cannot read it.

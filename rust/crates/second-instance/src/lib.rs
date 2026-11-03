@@ -8,14 +8,14 @@
 //! - the daemon, which [`from_env`] lets run as a second instance only on
 //!   its own ports, its own state and configuration folders, an explicit
 //!   Tart store and a bind address that is not every interface, and which
-//!   then reports itself in `/health` as `second_instance` (DC-1xx-LIVE-2);
+//!   then reports itself in `/health` as `second_instance` (DC-244);
 //! - the launcher, the `second-instance` binary, which starts one under a
 //!   root it owns and records it in the root's [`Manifest`], and whose
-//!   `stop` removes everything it made (DC-1xx-LIVE-1);
+//!   `stop` removes everything it made (DC-243);
 //! - the live clients (`live_e2e`, `live_image_catalog`, `live_guest_session`
 //!   and `relay-acceptance`), which [`guard`] refuses to run against any
 //!   instance that does not report itself as a second instance, and against
-//!   the installed instance's ports (DC-1xx-LIVE-3). There is no override.
+//!   the installed instance's ports (DC-245). There is no override.
 //!
 //! The installed instance never sets [`MARKER_VARIABLE`], so a positive mark
 //! is what a client checks, not a list of the installed instance's paths: a
@@ -118,7 +118,7 @@ pub fn overlaps(a: &Path, b: &Path) -> bool {
 /// installed instance uses must be named and must be another one: the
 /// port, the broker's port, both bind addresses, the state and
 /// configuration folders, and the Tart store, which must be named
-/// explicitly even when it is the operator's (DC-1xx-LIVE-4).
+/// explicitly even when it is the operator's (DC-246).
 pub fn from_env(
     get: &dyn Fn(&str) -> Option<String>,
     home: &Path,

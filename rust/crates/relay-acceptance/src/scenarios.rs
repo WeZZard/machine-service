@@ -265,7 +265,7 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
         Os::Macos => {
             // The suite's own keychain item, under a name no one else uses,
             // made, read and deleted in one command, so that a durable Mac's
-            // login keychain keeps nothing of the run (DC-1xx-LIVE-7). The
+            // login keychain keeps nothing of the run (DC-249). The
             // item of earlier runs, account `ac55`, is the suite's too.
             let secret = format!("acc-{}", uuid::Uuid::new_v4());
             let account = format!("ac55-{}", uuid::Uuid::new_v4().simple());
@@ -313,7 +313,7 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
             )?;
             // The privacy database is read only in a VM, whose grants are the
             // base image's; a durable Mac's are its operator's, which the
-            // suite never reads (DC-1xx-LIVE-7).
+            // suite never reads (DC-249).
             let grants = if durable {
                 String::new()
             } else {

@@ -1,6 +1,6 @@
 //! `second-instance`: start, restart, stop and report a second
 //! machine-service instance under a root it owns (`docs/arch/test-layers.md`,
-//! TL-4, DC-1xx-LIVE-1).
+//! TL-4, DC-243).
 //!
 //! ```text
 //! second-instance start --root DIR --port N --session-port N --tart-home DIR

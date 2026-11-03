@@ -51,7 +51,7 @@ This page is for two readers:
   2. signs the executable as
      `codesign --force --sign "Developer ID Application" --identifier com.wezzard.relay-agent --options runtime --timestamp`,
      or with the identity that `--sign-developer-id=IDENTITY` names. A
-     `CODESIGN_IDENTITY` in the environment is ignored (DC-1xx-LIVE-8);
+     `CODESIGN_IDENTITY` in the environment is ignored (DC-250);
   3. refuses unless the designated requirement is the Developer ID
      requirement above, with the team that the signature itself carries, and
      the signature has the hardened runtime and a secure timestamp. With
@@ -75,7 +75,7 @@ This page is for two readers:
   it then checks the result as `sign-release.sh` does. A `CODESIGN_IDENTITY`
   in the environment, which a shell profile or a CI runner may set, is
   ignored with a warning, so no build signs with the login keychain's key
-  unless its command line asks (DC-1xx-LIVE-8).
+  unless its command line asks (DC-250).
 - `SIGNING.json` records the version, the identifier, the signature
   (`developer-id` or `adhoc`), whether the release awaits signing, the team,
   the designated requirement, the executable's SHA-256 and whether it is
