@@ -850,7 +850,7 @@ mod tests {
         // The same Developer ID build in place is no replacement at all.
         assert!(check(&first).is_ok());
 
-        // DC-1xx-TRUST2: the daemon's check trusts and records the first
+        // DC-237: the daemon's check trusts and records the first
         // team as an installation does, and its refusal of another
         // configured team names both by fingerprint only.
         let state = root.join("daemon-state");
