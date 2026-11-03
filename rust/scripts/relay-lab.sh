@@ -229,7 +229,10 @@ clean() {
 release_all() {
     curl -fsS -m 20 "$1/machines" 2>/dev/null | python3 -I -c '
 import json, sys
-for record in json.load(sys.stdin).get("machines") or []:
+records = json.load(sys.stdin).get("machines") or []
+if isinstance(records, dict):
+    records = [dict(record, name=record.get("name", name)) for name, record in records.items()]
+for record in records:
     if record.get("lease_id") and record.get("state") in ("pending", "provisioning", "running", "leased"):
         print(record["name"], record["lease_id"])' 2>/dev/null |
         while read -r name lease; do

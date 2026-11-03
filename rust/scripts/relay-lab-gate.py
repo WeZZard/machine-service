@@ -70,6 +70,9 @@ def release_leases():
     try:
         with urllib.request.urlopen(f"{base}/machines", timeout=30) as answer:
             records = json.load(answer).get("machines") or []
+        # The service answers its machines keyed by name.
+        if isinstance(records, dict):
+            records = [dict(record, name=record.get("name", name)) for name, record in records.items()]
     except Exception as error:
         print(f"relay-lab gate: the lab instance did not list its leases: {error}")
         return
@@ -111,7 +114,10 @@ def free_own_lock():
 
 def clean():
     if os.path.isfile(os.path.join(HOST, SCRIPT)):
-        release_leases()
+        try:
+            release_leases()
+        except Exception as error:
+            print(f"relay-lab gate: releasing the lab's leases failed: {error}")
         host_script(["clean"])
     shutil.rmtree(HOST, ignore_errors=True)
     free_own_lock()
