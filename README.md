@@ -118,6 +118,9 @@ curl -s localhost:6240/health
   `guest-session-agent-linux`, `vm-service-dot-forwarder` and
   `vm-service-guest-firewall`. A guest agent runs inside the guest as machine
   code, so a Linux guest needs the `-linux` build.
+- The macOS relay agent of a release is signed with Developer ID; how the
+  owner signs a release and how a durable Mac's operator grants it its
+  permissions once is in [signing](docs/signing.md).
 - `install --prefix DIR` checks that every one is beside the installer and
   refuses by name, before anything changes, when one is missing. After the old
   job has stopped it copies exactly those files into `DIR`, and the LaunchAgent

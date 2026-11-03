@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod release;
+pub mod signing;
 
 /// When an installation needs an executable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

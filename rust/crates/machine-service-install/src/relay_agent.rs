@@ -31,12 +31,18 @@ pub struct Spec {
     pub release_dir: PathBuf,
     /// Make a new agent credential first (RA-4).
     pub rotate: bool,
+    /// The Developer ID team the release must be signed by (DC-224).
+    pub team: Option<String>,
 }
 
 /// The macOS executable of the release in `release_dir`, checked against its
-/// `SHA256SUMS` and its signature (DC-135, DC-140).
-pub fn release_executable(release_dir: &Path) -> Result<Vec<u8>, InstallError> {
-    core::release_executable(release_dir).map_err(InstallError::Refused)
+/// `SHA256SUMS` and its signature: Developer ID by `team`, or ad hoc for a
+/// pre-release (DC-135, DC-140, DC-224). Prints which it carries.
+pub fn release_executable(release_dir: &Path, team: Option<&str>) -> Result<Vec<u8>, InstallError> {
+    let (bytes, signing) =
+        core::release_executable(release_dir, team).map_err(InstallError::Refused)?;
+    println!("relay agent release signed {signing}");
+    Ok(bytes)
 }
 
 /// Install the relay agent of `spec` and start it in the desktop session,
@@ -49,6 +55,7 @@ pub fn install(spec: &Spec) -> Result<(), InstallError> {
         session_port: spec.session_port,
         release_dir: spec.release_dir.clone(),
         rotate: spec.rotate,
+        team: spec.team.clone(),
     };
     let done = core::ensure(&wanted, true).map_err(InstallError::Refused)?;
     let what = match done {

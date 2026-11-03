@@ -33,13 +33,14 @@ use std::time::Duration;
 
 use serde_json::json;
 use service_layout::release::{self, Release};
+use service_layout::signing::{self, Signing};
 use sha2::{Digest, Sha256};
 
 /// The LaunchAgent label of the installed instance's relay agent
 /// (pilot-images RA-I2).
 pub const DEFAULT_LABEL: &str = crate::relay::LAUNCH_AGENT_LABEL;
 /// The code-signing identifier every release build carries (DC-135).
-pub const IDENTIFIER: &str = "com.wezzard.relay-agent";
+pub const IDENTIFIER: &str = signing::IDENTIFIER;
 /// Where the executable lives under the agent's home, as in every guest
 /// (pilot-images RA-I1).
 pub const EXECUTABLE: &str = crate::relay::GUEST_EXECUTABLE;
@@ -183,38 +184,42 @@ pub fn plist(identity: &Identity, paths: &Paths) -> Vec<u8> {
 
 /// The macOS executable of the release in `release_dir`, checked against
 /// its `SHA256SUMS`, holding only `relay-agent`, and signed with
-/// [`IDENTIFIER`] (DC-135, DC-140).
-pub fn release_executable(release_dir: &Path) -> Result<Vec<u8>, String> {
+/// [`IDENTIFIER`]: with Developer ID by the configured `team`, else by the
+/// team the release's `SIGNING.json` names, or, for a pre-release only, ad
+/// hoc (DC-135, DC-140, DC-224). A `SIGNING.json` that disagrees with the
+/// executable is refused. Answers it with the signature it carries.
+pub fn release_executable(
+    release_dir: &Path,
+    team: Option<&str>,
+) -> Result<(Vec<u8>, Signing), String> {
     let platform = release::platform_for("macos");
     let release = Release::open(release_dir)?;
     release.check_members(&platform)?;
     let bytes = release.executable(&platform)?;
-    verify_signature(&bytes)?;
-    Ok(bytes)
+    let team = signing::expected_team(release_dir, team)?;
+    let signing = verify_signature(&bytes, &release.version, team.as_deref())?;
+    if let Some(record) = signing::Record::read(release_dir)? {
+        record.agrees(&signing)?;
+    }
+    Ok((bytes, signing))
 }
 
-/// Refuse an executable that is not signed with [`IDENTIFIER`]: the
-/// privacy grants name that identifier, and an unsigned or differently
-/// signed build would lose them.
-fn verify_signature(bytes: &[u8]) -> Result<(), String> {
+/// The configured Developer ID team of this process's environment
+/// ([`signing::TEAM_VARIABLE`]).
+pub fn configured_team() -> Result<Option<String>, String> {
+    signing::configured_team(std::env::var(signing::TEAM_VARIABLE).ok().as_deref())
+}
+
+/// Refuse an executable that is not signed as a release of `version` must
+/// be: the privacy grants name its requirement, and an unsigned or
+/// differently signed build would lose them.
+fn verify_signature(bytes: &[u8], version: &str, team: Option<&str>) -> Result<Signing, String> {
     let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = directory.path().join(release::MEMBER);
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| e.to_string())?;
-    let mut command = Command::new("/usr/bin/codesign");
-    command
-        .args(["--verify", "--strict"])
-        .arg(format!("-R=identifier \"{IDENTIFIER}\""))
-        .arg(&path);
-    let output = crate::proc::run_capture(&mut command, None, Duration::from_secs(30))
-        .map_err(|e| format!("codesign: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "the release's relay agent is not signed with the identifier {IDENTIFIER} (DC-135)"
-        ));
-    }
-    Ok(())
+    signing::verify(&path, version, team)
 }
 
 /// Whether the instance with `state_dir` holds a current durable lease,
@@ -318,6 +323,10 @@ pub struct Spec {
     pub release_dir: PathBuf,
     /// Make a new agent credential first (RA-4).
     pub rotate: bool,
+    /// The Developer ID team the release must be signed by
+    /// ([`signing::TEAM_VARIABLE`]); `None` accepts only an ad hoc
+    /// pre-release.
+    pub team: Option<String>,
 }
 
 impl Spec {
@@ -366,7 +375,7 @@ fn configured_broker(path: &Path) -> Option<String> {
 /// (DC-118), is refused with nothing changed but the configuration.
 /// Everything is checked before anything is written.
 pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
-    let bytes = release_executable(&spec.release_dir)?;
+    let (bytes, _) = release_executable(&spec.release_dir, spec.team.as_deref())?;
     let paths = paths(&spec.identity);
     let domain = domain();
     if !launchctl(&["print", &domain])?.status.success() {

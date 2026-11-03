@@ -42,6 +42,8 @@ jobs:
         run: |
           rustup target add aarch64-unknown-linux-musl && rustup component add llvm-tools
           scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent" darwin-arm64 linux-arm64
+          # Without a Developer ID identity the build is ad hoc and records it.
+          jq -e '.signature == "adhoc" and (.version | contains("-"))' "$RUNNER_TEMP/relay-agent/SIGNING.json"
 
   # The TL-7 network rig's opt-in self-tests run the pinned Toxiproxy and
   # mitmproxy on every platform the rig pins, so the Linux pins and launch

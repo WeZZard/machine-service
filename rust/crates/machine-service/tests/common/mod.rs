@@ -632,7 +632,7 @@ pub fn relay_agent_bin() -> &'static PathBuf {
 }
 
 /// A relay agent release in `folder`, in the form `build-relay-agent.sh`
-/// makes, whose archives for this host's macOS and Linux platforms hold
+/// makes without a Developer ID identity (a pre-release, DC-224), whose archives for this host's macOS and Linux platforms hold
 /// `executable` (DC-140). Answers the folder.
 pub fn write_relay_release(folder: &Path, executable: &Path) -> PathBuf {
     use machine_service_core::service_layout::release;
@@ -642,7 +642,10 @@ pub fn write_relay_release(folder: &Path, executable: &Path) -> PathBuf {
     std::fs::copy(executable, stage.path().join(release::MEMBER)).unwrap();
     let mut sums = String::new();
     for kind in ["macos", "linux"] {
-        let file = format!("relay-agent-0.0.0-{}.tar.gz", release::platform_for(kind));
+        let file = format!(
+            "relay-agent-0.0.0-adhoc-{}.tar.gz",
+            release::platform_for(kind)
+        );
         let status = Command::new("/usr/bin/tar")
             .arg("-C")
             .arg(stage.path())

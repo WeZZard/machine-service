@@ -76,9 +76,16 @@ exit 0
 "#;
 
 /// A relay agent release in `folder`, as `scripts/build-relay-agent.sh`
-/// makes it: the macOS archive holds a copy of a system executable signed
-/// ad hoc with the release identifier (DC-135), the Linux one a stand-in.
+/// makes it without a Developer ID identity: the macOS archive holds a copy
+/// of a system executable signed ad hoc with the release identifier
+/// (DC-135), the Linux one a stand-in, and the version is the pre-release
+/// an ad hoc build names itself (DC-224).
 pub fn write_release(folder: &Path, signed: bool) {
+    write_release_of(folder, "9.9.9-adhoc", signed);
+}
+
+/// [`write_release`] with the version `version`.
+pub fn write_release_of(folder: &Path, version: &str, signed: bool) {
     use service_layout::release;
     let _ = fs::remove_dir_all(folder);
     fs::create_dir_all(folder).unwrap();
@@ -107,7 +114,7 @@ pub fn write_release(folder: &Path, signed: bool) {
         } else {
             fs::write(&member, "ELF stand-in\n").unwrap();
         }
-        let file = format!("relay-agent-9.9.9-{platform}.tar.gz");
+        let file = format!("relay-agent-{version}-{platform}.tar.gz");
         let status = Command::new("/usr/bin/tar")
             .arg("-C")
             .arg(stage.path())

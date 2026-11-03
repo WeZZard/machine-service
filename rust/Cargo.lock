@@ -1135,6 +1135,7 @@ dependencies = [
 name = "service-layout"
 version = "0.2.0-rc.3"
 dependencies = [
+ "serde_json",
  "sha2",
  "tempfile",
 ]

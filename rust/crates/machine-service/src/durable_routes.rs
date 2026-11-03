@@ -109,12 +109,23 @@ fn provision_agent(
             return;
         }
     };
+    let team = match relay_agent::configured_team() {
+        Ok(team) => team,
+        Err(error) => {
+            log(&format!(
+                "WARN: relay: the relay agent {} is not provisioned: {error}",
+                agent.label
+            ));
+            return;
+        }
+    };
     let mut spec = relay_agent::Spec {
         identity: agent,
         state_dir: state_dir.to_path_buf(),
         session_port: relay.settings.session_port,
         release_dir,
         rotate: false,
+        team,
     };
     std::thread::spawn(move || {
         spec.identity = spec.identity.clone().with_login_path();

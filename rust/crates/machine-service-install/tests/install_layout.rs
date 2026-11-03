@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use common::{release_executable, write_exec, write_release, Harness};
+use common::{release_executable, write_exec, write_release, write_release_of, Harness};
 use serde_json::json;
 use service_layout::Executable;
 
@@ -436,6 +436,59 @@ fn dc135_an_unsigned_relay_agent_is_refused() {
     assert!(stderr.contains("com.wezzard.relay-agent"), "{stderr}");
     assert!(!prefix(&harness).exists());
     assert!(!harness.plist.exists());
+}
+
+/// DC-224: a release, a version without a pre-release part, must be signed
+/// with Developer ID; an ad hoc one is refused on an exposed Mac before
+/// anything is written, and so are a `SIGNING.json` that disagrees with
+/// the executable and a configured team that is no team ID.
+#[test]
+fn dc224_an_ad_hoc_release_is_refused() {
+    let mut harness = Harness::new();
+    write_release_of(
+        &harness.bin.join(service_layout::release::FOLDER),
+        "9.9.9",
+        true,
+    );
+    let installed = prefix(&harness);
+    let install = [
+        "install",
+        "--expose-durable",
+        "on",
+        "--prefix",
+        installed.to_str().unwrap(),
+    ];
+    let stderr = harness.assert_refused(&install);
+    assert!(
+        stderr.contains("must be signed with Developer ID"),
+        "{stderr}"
+    );
+    assert!(!prefix(&harness).exists());
+    assert!(!harness.plist.exists());
+    // Without exposure the Mac installs no relay agent, so nothing asks for
+    // its signature.
+    let plain = ["install", "--prefix", installed.to_str().unwrap()];
+    assert_ok(harness.run(&plain));
+    // A record that says Developer ID beside an ad hoc executable.
+    let folder = harness.bin.join(service_layout::release::FOLDER);
+    write_release(&folder, true);
+    fs::write(
+        folder.join(service_layout::signing::METADATA),
+        r#"{"signature": "developer-id", "team": "EXAMPLE123"}"#,
+    )
+    .unwrap();
+    let stderr = harness.assert_refused(&install);
+    assert!(
+        stderr.contains("SIGNING.json says developer-id"),
+        "{stderr}"
+    );
+    write_release(&folder, true);
+    harness.set_env(service_layout::signing::TEAM_VARIABLE, "not-a-team");
+    let stderr = harness.assert_refused(&install);
+    assert!(
+        stderr.contains("MACHINE_SERVICE_RELAY_AGENT_TEAM_ID"),
+        "{stderr}"
+    );
 }
 
 /// IN-3: a current durable lease refuses an installation that would

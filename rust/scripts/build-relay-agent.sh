@@ -13,22 +13,35 @@
 # linux-x86_64 cannot, because clang has no C library headers for it there.
 #
 # The macOS executable is signed with the identifier com.wezzard.relay-agent,
-# the LaunchAgent's label, instead of the linker's per-build identifier. A
-# guest grants privacy permissions to the code requirement
-# `identifier "com.wezzard.relay-agent"`, which every build signed here
-# satisfies, so a new build keeps the grants (decision DC-135). The
-# signature is ad hoc unless CODESIGN_IDENTITY names a signing identity.
+# the LaunchAgent's label, instead of the linker's per-build identifier, and
+# with the hardened runtime (DC-135, DC-224, docs/signing.md):
+#
+# - CODESIGN_IDENTITY names a Developer ID Application identity of the
+#   keychain: the signature carries a secure timestamp, and its designated
+#   requirement names the identifier and the team, so a privacy grant holds
+#   for every later build the team signs. The script checks that requirement
+#   against the team the signature carries, or CODESIGN_TEAM when set.
+# - Without it the signature is ad hoc, and its designated requirement is the
+#   build's code hash. Only a pre-release may be ad hoc, so an ad hoc build of
+#   a version without a pre-release part names itself <version>-adhoc, unless
+#   RELAY_AGENT_AWAITS_SIGNING=1: the release workflow's build of a release,
+#   which the owner signs with rust/scripts/sign-release.sh before it is
+#   published.
+#
+# Either way the script prints the designated requirement and writes
+# SIGNING.json beside the archives, the release's record of the signature;
+# every consumer checks the executable itself.
 #
 # Usage: scripts/build-relay-agent.sh [output-dir [platform ...]]
 #        (default target/relay-agent, every platform this host can build)
+#        CODESIGN_IDENTITY, CODESIGN_TEAM, RELAY_AGENT_AWAITS_SIGNING: above
 set -eu
 
 cd "$(dirname "$0")/.."
+. scripts/relay-agent-signing.sh
 out="${1:-target/relay-agent}"
 [ $# -gt 0 ] && shift
 target_dir="${CARGO_TARGET_DIR:-target}"
-identifier=com.wezzard.relay-agent
-
 version=$(cargo pkgid -p relay-agent | sed 's/.*[#@]//')
 case "$version" in
     [0-9]*.[0-9]*.[0-9]*) ;;
@@ -43,6 +56,24 @@ if [ $# -eq 0 ]; then
         *) echo "error: no default platform for $(uname -s)-$(uname -m); name one" >&2; exit 1 ;;
     esac
 fi
+
+identity="${CODESIGN_IDENTITY:--}"
+wanted_team="${CODESIGN_TEAM:-}"
+awaits=false
+[ "${RELAY_AGENT_AWAITS_SIGNING:-}" != 1 ] || awaits=true
+[ -z "$wanted_team" ] || [ "$identity" != - ] || {
+    echo "error: CODESIGN_TEAM needs CODESIGN_IDENTITY, a Developer ID Application identity" >&2; exit 1; }
+[ "$awaits" = false ] || [ "$identity" = - ] || {
+    echo "error: RELAY_AGENT_AWAITS_SIGNING is for an ad hoc build; CODESIGN_IDENTITY signs it now" >&2; exit 1; }
+for platform in "$@"; do
+    if [ "$platform" = darwin-arm64 ] && [ "$identity" = - ] && [ "$awaits" = false ]; then
+        case "$version" in
+            *-*) ;;
+            *) version="$version-adhoc"
+               echo "warning: no CODESIGN_IDENTITY: the macOS build is ad hoc, so this is the pre-release $version (DC-224)" >&2 ;;
+        esac
+    fi
+done
 
 rm -rf "$out"
 mkdir -p "$out"
@@ -92,15 +123,22 @@ for platform in "$@"; do
     cp "$target_dir/$target/release/relay-agent" "$stage/$platform/relay-agent"
     chmod 755 "$stage/$platform/relay-agent"
     if [ "$platform" = darwin-arm64 ]; then
-        codesign --force --sign "${CODESIGN_IDENTITY:--}" --identifier "$identifier" "$stage/$platform/relay-agent"
-        codesign --verify --strict -R="identifier \"$identifier\"" "$stage/$platform/relay-agent"
+        executable="$stage/$platform/relay-agent"
+        if [ "$identity" = - ]; then
+            sign_ad_hoc "$executable"
+            signature=adhoc
+        else
+            sign_developer_id "$identity" "$executable"
+            verify_developer_id "$executable" "$wanted_team"
+            signature=developer-id
+        fi
+        codesign --verify --strict -R="identifier \"$identifier\"" "$executable"
+        echo "designated requirement: $(designated_requirement "$executable")"
+        [ "$signature" = adhoc ] || echo "verified: Developer ID, identifier $identifier, the signature's team, hardened runtime, secure timestamp"
+        write_signing_record "$out/SIGNING.json" "$executable" "$version" "$signature" "$awaits"
     fi
     # The archive names no builder: owner root, as an installer expects.
-    if tar --version 2>/dev/null | grep -q GNU; then
-        tar --owner=0 --group=0 --numeric-owner -C "$stage/$platform" -czf "$out/relay-agent-$version-$platform.tar.gz" relay-agent
-    else
-        tar --uid 0 --gid 0 --uname root --gname root -C "$stage/$platform" -czf "$out/relay-agent-$version-$platform.tar.gz" relay-agent
-    fi
+    archive_executable "$stage/$platform/relay-agent" "$out/relay-agent-$version-$platform.tar.gz"
 done
 
 (

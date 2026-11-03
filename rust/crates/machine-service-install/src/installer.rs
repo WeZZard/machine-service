@@ -447,6 +447,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
             session_port: session_port(&env)?,
             release_dir: deployed.join(service_layout::release::FOLDER),
             rotate: cli.rotate_relay_credential,
+            team: relay_agent_team(&env)?,
         })?;
     } else {
         crate::relay_agent::remove(home, &state_root(&env, home)?)?;
@@ -679,7 +680,7 @@ fn validate_install(
                 .map_err(InstallError::Refused)?;
         }
         if exposed {
-            crate::relay_agent::release_executable(&folder)?;
+            crate::relay_agent::release_executable(&folder, relay_agent_team(written)?.as_deref())?;
         }
         Some(release)
     };
@@ -768,6 +769,17 @@ fn validate_install(
     Ok((plist::dumps(&Value::Object(data)), helpers, release))
 }
 
+/// The Developer ID team that `env` trusts to sign the relay agent
+/// (`MACHINE_SERVICE_RELAY_AGENT_TEAM_ID`, DC-224); kept by later installs
+/// as every `MACHINE_SERVICE_` setting is.
+fn relay_agent_team(env: &BTreeMap<String, String>) -> Result<Option<String>, InstallError> {
+    service_layout::signing::configured_team(
+        env.get(service_layout::signing::TEAM_VARIABLE)
+            .map(String::as_str),
+    )
+    .map_err(InstallError::Refused)
+}
+
 /// The session port of the instance `env` configures (BK-1).
 fn session_port(env: &BTreeMap<String, String>) -> Result<u16, InstallError> {
     let variable = machine_service_core::remote_session::SESSION_PORT_ENV;
@@ -805,13 +817,15 @@ fn relay_agent_only(
         return Ok(());
     }
     let release_dir = source.join(service_layout::release::FOLDER);
-    crate::relay_agent::release_executable(&release_dir)?;
+    let team = relay_agent_team(env)?;
+    crate::relay_agent::release_executable(&release_dir, team.as_deref())?;
     let spec = crate::relay_agent::Spec {
         home: home.to_path_buf(),
         state_dir,
         session_port: session_port(env)?,
         release_dir,
         rotate: cli.rotate_relay_credential,
+        team,
     };
     if readonly {
         println!("Check passed; no files written and no launchctl calls (relay-agent).");

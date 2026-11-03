@@ -50,8 +50,17 @@ jobs:
             exit 1
           }
 
+      # No signing key reaches CI (DC-224, docs/signing.md). The macOS
+      # executable is signed ad hoc: a release's build awaits the owner's
+      # Developer ID signature, which rust/scripts/sign-release.sh adds on
+      # the owner's Mac before it publishes the draft; a pre-release
+      # (a tag with a `-` part) is published ad hoc with a warning.
       - name: Build, sign and archive
         run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) ;;
+            *) export RELAY_AGENT_AWAITS_SIGNING=1 ;;
+          esac
           scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent" "${{ matrix.platform }}"
           mv "$RUNNER_TEMP/relay-agent/SHA256SUMS" "$RUNNER_TEMP/relay-agent/SHA256SUMS.${{ matrix.platform }}"
 
@@ -84,12 +93,45 @@ jobs:
           test "$(wc -l < SHA256SUMS)" -eq 3
           sha256sum --check --strict SHA256SUMS
 
+      # SIGNING.json records the macOS executable's signature (DC-224). A
+      # release is drafted, its notes marked as awaiting the owner's
+      # signature; a pre-release is published ad hoc, its notes warning first.
+      - name: Signature record and notes
+        working-directory: dist
+        run: |
+          jq -e --arg version "${GITHUB_REF_NAME#v}" \
+            '.version == $version and .identifier == "com.wezzard.relay-agent" and .signature == "adhoc" and (.executableSha256 | test("^[0-9a-f]{64}$"))' \
+            SIGNING.json >/dev/null
+          awaits=$(jq -r '.awaitsSigning' SIGNING.json)
+          case "$GITHUB_REF_NAME:$awaits" in
+            *-*:false)
+              {
+                echo "> [!WARNING]"
+                echo "> $(jq -r '.warning' SIGNING.json)"
+                echo
+              } > "$RUNNER_TEMP/notes.md" ;;
+            *-*:*) echo "::error::a pre-release does not await signing"; exit 1 ;;
+            *:true)
+              {
+                echo "<!-- relay-agent: awaits Developer ID signing -->"
+                echo "> [!IMPORTANT]"
+                echo "> This draft awaits the Developer ID signature of its macOS relay agent. On the owner's Mac, run \`rust/scripts/sign-release.sh $GITHUB_REF_NAME\`, which signs it, checks it and publishes the release."
+                echo "<!-- end -->"
+                echo
+              } > "$RUNNER_TEMP/notes.md" ;;
+            *) echo "::error::a release's build must await signing"; exit 1 ;;
+          esac
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # A tag with a pre-release part (v0.2.0-rc.1) is published as a
           # pre-release, so it never becomes the repository's latest release.
+          # A release is a draft until the owner signs it (sign-release.sh).
           flags=()
-          case "$GITHUB_REF_NAME" in *-*) flags=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag "${flags[@]}" dist/*
+          case "$GITHUB_REF_NAME" in
+            *-*) flags=(--prerelease) ;;
+            *) flags=(--draft) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" --generate-notes --notes-file "$RUNNER_TEMP/notes.md" --verify-tag "${flags[@]}" dist/*
