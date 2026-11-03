@@ -1,6 +1,6 @@
 //! The live regression of FD-7: catalog questions from a Mac whose own
 //! instance offers nothing (`docs/arch/federation.md` FD-7, CL-4,
-//! DC-1xx-FED-6).
+//! DC-282).
 //!
 //! It runs only on request, on a Mac on the lab's network:
 //!

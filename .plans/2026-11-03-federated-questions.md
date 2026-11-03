@@ -17,10 +17,10 @@
 | # | Change | Repository | Makes true |
 | --- | --- | --- | --- |
 | 1 | `questions.rs`: ask a path of every gathered instance at once, keep each answer unchanged under its instance, keep unreachable instances; the `images` table per instance; the image candidates for an acquisition | vm-service | [FD-7](../docs/arch/federation.md#fd-7-catalog-questions-and-image-acquisition), [CL-4](../docs/ux/cli/list.md#cl-4-catalog-questions) |
-| 2 | `machctl images`, `images-show`, `capabilities`, `acquisition-capabilities` ask every instance, with `--local` and `--instance`; JSON is one object per instance; exit 2 when none answered; `--reload` on every instance asked | vm-service | CL-4, DC-1xx-FED-2 |
-| 3 | `machctl acquire --image` without `--instance` chooses an instance that offers the image, prints why, passes capacity refusals on | vm-service | FD-7 (image acquisition), [CL-2](../docs/ux/cli/list.md#cl-2-acquire-by-capability), DC-1xx-FED-3 |
-| 4 | `--instance` accepts a `machine_id` | vm-service | FD-7, [MI-1](../docs/arch/identity.md#mi-1-the-permanent-id-and-the-name), DC-1xx-FED-4 |
-| 5 | FD-3 and FD-2 extended to catalog questions; FD-7 written; CN-1 updated; TL-6 exception recorded | vm-service | [FD-3](../docs/arch/federation.md#fd-3-aggregation), [CN-1](../docs/arch/consumers.md#cn-1-mcp-relay), [TL-6](../docs/arch/test-layers.md#tl-6-live-durable-machine), DC-1xx-FED-5, DC-1xx-FED-6 |
+| 2 | `machctl images`, `images-show`, `capabilities`, `acquisition-capabilities` ask every instance, with `--local` and `--instance`; JSON is one object per instance; exit 2 when none answered; `--reload` on every instance asked | vm-service | CL-4, DC-278 |
+| 3 | `machctl acquire --image` without `--instance` chooses an instance that offers the image, prints why, passes capacity refusals on | vm-service | FD-7 (image acquisition), [CL-2](../docs/ux/cli/list.md#cl-2-acquire-by-capability), DC-279 |
+| 4 | `--instance` accepts a `machine_id` | vm-service | FD-7, [MI-1](../docs/arch/identity.md#mi-1-the-permanent-id-and-the-name), DC-280 |
+| 5 | FD-3 and FD-2 extended to catalog questions; FD-7 written; CN-1 updated; TL-6 exception recorded | vm-service | [FD-3](../docs/arch/federation.md#fd-3-aggregation), [CN-1](../docs/arch/consumers.md#cn-1-mcp-relay), [TL-6](../docs/arch/test-layers.md#tl-6-live-durable-machine), DC-281, DC-282 |
 | 6 | `discoverInstances`: one discovery for questions, image acquisition and durable owners; isolation refusal reported, never thrown | mcp-relay | mcp-relay `docs/instances.md` §2, DC-7x-FED-1, DC-67 |
 | 7 | relay_search per instance with installation `instances` and catalog `generation`; relay_probe and relay_acquisition_capabilities per instance; `instance` argument | mcp-relay | `docs/instances.md` §3, `docs/search-contract.md` "Every instance", DC-7x-FED-2, DC-7x-FED-3 |
 | 8 | Image acquisition chooses among instances in FD-7's order, records `chosen`, passes capacity refusals on; `instance` pins it | mcp-relay | `docs/instances.md` §4, FD-7, DC-7x-FED-4 |
@@ -30,7 +30,7 @@
 ## Verification
 
 - Component tests: vm-service `machctl/tests/questions.rs` (a client Mac that offers nothing, two VM hosts with different catalog generations, a stopped instance, through a fake Consul agent) and mcp-relay `tests/federation.test.ts` (the same lab through the injected Bonjour seam), plus the updated component tests that read these commands' output.
-- The reproducer is kept as two opt-in, read-only live checks that find the instances at run time and name none (DC-1xx-FED-6, DC-7x-FED-6):
+- The reproducer is kept as two opt-in, read-only live checks that find the instances at run time and name none (DC-282, DC-7x-FED-6):
   - `MACHINE_SERVICE_TEST_LIVE=TL-6 cargo test -p machctl --test questions_live -- --ignored` reads each discovered instance's `/images` directly, then requires `machctl images --json`, with a local instance that is a closed port, to list every such image under its instance, and `machctl acquisition-capabilities` to answer for each. On the code before change 2 it fails: `machctl images` cannot reach the local instance and exits 2.
   - `npx tsx scripts/live-federation.ts --name Xcode --os macos <outDir>` in mcp-relay reads each discovered instance's `/applications` directly, then requires the built relay, whose loopback instance answers an empty catalog, to name every instance that lists Xcode in relay_search and to answer relay_acquisition_capabilities for each. On the relay before change 7 it fails with `{"applications":[],"truncated":false}`.
 - Both live checks were run before and after the change on 2026-11-03: each failed on the old code and passed on the new.

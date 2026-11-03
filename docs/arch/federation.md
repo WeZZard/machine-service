@@ -95,7 +95,7 @@ flowchart LR
 - `--instance <ID or address>` in machctl, and `instance` in the relay's tools, narrow a question to one instance. A former name or a `machine_id` names the instance too. `--local` in machctl narrows it to the local instance.
 - A selected environment pins its own instance, so a question under a selected environment asks only that instance (DC-64).
 - The gathering keeps FD-3's budget of 5 seconds for each instance. A question to an instance that answered the gathering waits up to 35 seconds, because an instance may wait 30 seconds for a catalog rebuild before it answers ([IC-3](image-catalog.md#ic-3-when-the-catalog-is-rebuilt)).
-- The opt-in live test `machctl/tests/questions_live.rs` and mcp-relay's `scripts/live-federation.ts` check these rules against the instances that the network holds at run time, read-only (DC-1xx-FED-6).
+- The opt-in live test `machctl/tests/questions_live.rs` and mcp-relay's `scripts/live-federation.ts` check these rules against the instances that the network holds at run time, read-only (DC-282).
 
 ### Image acquisition
 
