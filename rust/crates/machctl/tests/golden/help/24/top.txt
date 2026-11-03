@@ -28,12 +28,14 @@ positional arguments:
     from every
     instance
     images
-    query available
-    images and
-    capacity
+    query every
+    instance's images
+    and capacity
     images-show
     show one image's
-    full record (JSON)
+    full record on
+    every instance
+    (JSON)
     status
     show one lease
     exec
@@ -53,12 +55,15 @@ positional arguments:
     deleted and
     unregistered
     capabilities
-    show supported and
+    show every
+    instance's
+    supported and
     unavailable
     network
     capabilities
     acquisition-capabilities
-    describe
+    describe every
+    instance's
     acquisition and
     console
     prerequisites

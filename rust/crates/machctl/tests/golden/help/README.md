@@ -61,3 +61,8 @@ are present.
   top-level description and the `acquire`, `heartbeat` and `release`
   summaries stopped describing only Tart VMs, since a lease can also be of a
   durable Mac (MM-1). No other file changed.
+- `top.txt`, `images.txt`, `images-show.txt`, `capabilities.txt` and
+  `acquisition-capabilities.txt` at every width were regenerated from the Rust
+  `machctl` when the catalog questions began to ask every instance (CL-4,
+  FD-7): their descriptions say so, and the four commands gained `--local` and
+  `--instance`. No other file changed.

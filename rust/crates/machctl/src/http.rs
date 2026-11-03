@@ -22,6 +22,25 @@ pub fn get_json(
     timeout: Duration,
     headers: &[(String, String)],
 ) -> Result<(u16, Value), String> {
+    request_json("GET", url, timeout, headers)
+}
+
+/// One `POST` with an empty body, read as [`get_json`] reads its answer:
+/// a reload of an instance's image catalog (IC-3, CL-4).
+pub fn post_json(
+    url: &str,
+    timeout: Duration,
+    headers: &[(String, String)],
+) -> Result<(u16, Value), String> {
+    request_json("POST", url, timeout, headers)
+}
+
+fn request_json(
+    method: &str,
+    url: &str,
+    timeout: Duration,
+    headers: &[(String, String)],
+) -> Result<(u16, Value), String> {
     if timeout.is_zero() {
         return Err(timed_out(timeout));
     }
@@ -32,11 +51,23 @@ pub fn get_json(
         .max_redirects(0)
         .build()
         .into();
-    let mut request = agent.get(url).header("Accept", "application/json");
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    let mut response = request.call().map_err(|error| reason(&error, timeout))?;
+    let response = if method == "POST" {
+        let mut request = agent
+            .post(url)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json");
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request.send("")
+    } else {
+        let mut request = agent.get(url).header("Accept", "application/json");
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request.call()
+    };
+    let mut response = response.map_err(|error| reason(&error, timeout))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()

@@ -522,7 +522,8 @@ fn disambiguate(instances: &mut [Instance]) {
 }
 
 /// Whether `instance` is the one `wanted` names: its label, its ID, its
-/// `host:port`, its host, or its base URL.
+/// machine ID, a former name, its `host:port`, its host, or its base URL
+/// (FD-7).
 pub fn names(instance: &Instance, wanted: &str) -> bool {
     let wanted = wanted.trim_end_matches('/');
     let authority = authority_of(&instance.address);
@@ -532,6 +533,7 @@ pub fn names(instance: &Instance, wanted: &str) -> bool {
         .unwrap_or(authority);
     instance.label == wanted
         || instance.id.as_deref() == Some(wanted)
+        || instance.machine_id.as_deref() == Some(wanted)
         || instance.former_names.iter().any(|name| name == wanted)
         || instance.address == wanted
         || authority == wanted

@@ -143,8 +143,9 @@ fn ac40_editing_a_line_and_promoting_a_base_without_a_restart() {
     let cpu = |fixture: &LegacyFixture| {
         let output = common::run_machctl(&["images-show", "macos26"], &fixture.machctl_env());
         assert!(output.status.success(), "{output:?}");
-        let record: Value = serde_json::from_slice(&output.stdout).expect("image json");
-        record["defaults"]["cpu"].clone()
+        let shown: Value = serde_json::from_slice(&output.stdout).expect("image json");
+        // One object per instance that lists the image (CL-4).
+        shown[0]["answer"]["defaults"]["cpu"].clone()
     };
     assert_eq!(cpu(&fixture), 6);
     write_line(

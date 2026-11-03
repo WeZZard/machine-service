@@ -698,7 +698,9 @@ fn test_images_table_and_json() {
     assert!(text.contains("acquirable="));
     let output = live.machctl_ok(&["images", "--json"]);
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("images json");
-    assert_eq!(parsed["capacity"]["macos_limit"], 2);
+    // One object per instance, its answer unchanged (CL-4).
+    assert_eq!(parsed[0]["local"], true);
+    assert_eq!(parsed[0]["answer"]["capacity"]["macos_limit"], 2);
 }
 
 #[test]
@@ -706,7 +708,9 @@ fn test_images_show() {
     let live = Live::new();
     let output = live.machctl_ok(&["images-show", "ubuntu2404"]);
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("image json");
-    assert_eq!(parsed["kind"], "linux");
+    // One object per instance that lists the image (CL-4).
+    assert_eq!(parsed[0]["answer"]["kind"], "linux");
+    assert_eq!(parsed[0]["local"], true);
 }
 
 #[test]

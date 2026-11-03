@@ -369,6 +369,13 @@ fn mi5_virtual_lease_saves_machine_identity_from_health() {
             200,
             json!({"instance":"Mac-A","machine_id":"machine-a"}),
         ),
+        // An image acquisition asks an instance that offers the image (FD-7).
+        (
+            "/machines",
+            200,
+            json!({"machines": {}, "offers": [{"name": "macos26", "kind": "virtual",
+                "state": "offer", "concurrency": {"acquirable": true}}]}),
+        ),
         (
             "/acquire",
             200,

@@ -16,6 +16,7 @@ mod files;
 mod http;
 mod leases;
 mod listing;
+mod questions;
 mod textwrap;
 
 use std::fs;
@@ -30,6 +31,14 @@ const DEFAULT_PORT: &str = "6240";
 
 /// Default per-request timeout in seconds, matching Python `call(timeout=3600)`.
 const DEFAULT_TIMEOUT_S: u64 = 3600;
+
+/// The budget of one catalog question to an instance that answered the
+/// gathering: an instance may wait 30 s for a catalog rebuild before it
+/// answers (IC-3, FD-7).
+const QUESTION_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// The budget of one catalog reload (IC-3).
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 // `argparse` has no `help` subcommand: `machctl help` is an invalid choice that
 // exits 2, so clap's built-in `help` subcommand must stay off to keep the
@@ -78,7 +87,7 @@ enum Cmd {
         #[arg(long)]
         require: Vec<String>,
     },
-    /// query available images and capacity
+    /// query every instance's images and capacity
     Images {
         /// machine-readable output
         #[arg(long)]
@@ -86,10 +95,16 @@ enum Cmd {
         /// rebuild the image catalog first; exit 1 unless it is current
         #[arg(long)]
         reload: bool,
+        #[command(flatten)]
+        scope: Scope,
     },
-    /// show one image's full record (JSON)
+    /// show one image's full record on every instance (JSON)
     #[command(name = "images-show")]
-    ImagesShow { image: String },
+    ImagesShow {
+        image: String,
+        #[command(flatten)]
+        scope: Scope,
+    },
     /// show one lease
     Status { vm: String },
     /// run a command in the guest
@@ -134,10 +149,16 @@ enum Cmd {
         #[arg(long)]
         lease_id: Option<String>,
     },
-    /// show supported and unavailable network capabilities
-    Capabilities,
-    /// describe acquisition and console prerequisites without allocating a VM
-    AcquisitionCapabilities,
+    /// show every instance's supported and unavailable network capabilities
+    Capabilities {
+        #[command(flatten)]
+        scope: Scope,
+    },
+    /// describe every instance's acquisition and console prerequisites without allocating a VM
+    AcquisitionCapabilities {
+        #[command(flatten)]
+        scope: Scope,
+    },
     /// resolve the exact lease console; viewer is on the service host
     #[command(name = "console-resolve")]
     ConsoleResolve(ConsoleResolveArgs),
@@ -149,6 +170,17 @@ enum Cmd {
     ConsoleCancel(ConsoleArgs),
     /// run TTL reclaim now
     Gc,
+}
+
+/// Which instances a catalog question asks (CL-4, FD-7).
+#[derive(Args, Debug)]
+struct Scope {
+    /// ask only the local instance
+    #[arg(long)]
+    local: bool,
+    /// ask only this instance (ID or address)
+    #[arg(long)]
+    instance: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -514,22 +546,20 @@ fn main() {
             }
         },
 
-        Cmd::Capabilities => {
-            let (status, resp) = client.call("GET", "/capabilities", None, DEFAULT_TIMEOUT_S);
-            if status != 200 {
-                die_from(status, &resp, None);
-            }
-            println!("{}", pretty(&resp));
-        }
+        // Every instance's answer, unchanged, under its name (CL-4, FD-7).
+        Cmd::Capabilities { scope } => answer_question(
+            &federation_settings,
+            &scope,
+            &consul_address,
+            "/capabilities",
+        ),
 
-        Cmd::AcquisitionCapabilities => {
-            let (status, resp) =
-                client.call("GET", "/acquisition-capabilities", None, DEFAULT_TIMEOUT_S);
-            if status != 200 {
-                die_from(status, &resp, None);
-            }
-            println!("{}", pretty(&resp));
-        }
+        Cmd::AcquisitionCapabilities { scope } => answer_question(
+            &federation_settings,
+            &scope,
+            &consul_address,
+            "/acquisition-capabilities",
+        ),
 
         Cmd::ConsoleResolve(args) => {
             let mut body = Map::new();
@@ -581,6 +611,10 @@ fn main() {
             let settings = federation_settings(true);
             let pinned = environment.is_some();
             let (status, resp, owner) = match target {
+                acquire::Target::Image {
+                    image,
+                    instance: None,
+                } if !pinned => acquire_image(&args, &image, &settings, environment.as_ref()),
                 acquire::Target::Image { image, instance } => {
                     let body = virtual_body(&args, &image);
                     let base = match instance {
@@ -689,54 +723,83 @@ fn main() {
             }
         }
 
-        Cmd::Images { json, reload } => {
-            // A reload rebuilds even unchanged files and reports the result
-            // in the listing that follows (IC-3).
+        Cmd::Images {
+            json,
+            reload,
+            scope,
+        } => {
+            let (settings, merged) = gather_scope(&federation_settings, &scope, &consul_address);
+            // A reload rebuilds even unchanged files on every instance asked,
+            // and the listing that follows reports the result (IC-3, CL-4).
             let mut reload_failed = false;
             if reload {
-                let (status, resp) = client.call("POST", "/images/reload", None, DEFAULT_TIMEOUT_S);
-                if status != 200 && status != 503 {
-                    die_from(status, &resp, None);
+                for (instance, answer) in merged.instances.iter().zip(questions::ask(
+                    &merged,
+                    &settings,
+                    "POST",
+                    "/images/reload",
+                    RELOAD_TIMEOUT,
+                )) {
+                    let status = match &answer {
+                        questions::Answer::Answered { body, .. } => body
+                            .get("catalog")
+                            .and_then(|catalog| catalog.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        questions::Answer::Unreachable(_) => continue,
+                    };
+                    if status != "current" {
+                        eprintln!(
+                            "machctl: {}: the reload left the image catalog {status}",
+                            instance.label
+                        );
+                        reload_failed = true;
+                    }
                 }
-                reload_failed = resp
-                    .get("catalog")
-                    .and_then(|catalog| catalog.get("status"))
-                    .and_then(Value::as_str)
-                    != Some("current");
             }
-            let (_status, resp) = client.call("GET", "/images", None, DEFAULT_TIMEOUT_S);
+            let answers = questions::ask(&merged, &settings, "GET", "/images", QUESTION_TIMEOUT);
             if json {
-                println!("{}", pretty(&resp));
+                println!("{}", pretty(&questions::to_json(&merged, &answers)));
             } else {
-                if let Some(warning) = catalog_warning(&resp) {
-                    println!("{warning}");
-                }
-                print!("{}", format_images(&resp));
+                print!("{}", questions::format_images(&merged, &answers));
             }
-            if reload_failed || resp.get("images").is_none() {
+            exit_unanswered(&merged, &answers);
+            let catalogless = answers.iter().any(|answer| {
+                answer
+                    .body()
+                    .is_some_and(|body| body.get("images").is_none())
+            });
+            if reload_failed || catalogless {
                 std::process::exit(1);
             }
         }
 
-        Cmd::ImagesShow { image } => {
-            let (_status, resp) = client.call("GET", "/images", None, DEFAULT_TIMEOUT_S);
-            if resp.get("images").is_none() {
-                // No catalog to look in: say why instead of "unknown image".
-                eprintln!("machctl: {}", error_message_text(&resp));
+        Cmd::ImagesShow { image, scope } => {
+            let (settings, merged) = gather_scope(&federation_settings, &scope, &consul_address);
+            let answers = questions::ask(&merged, &settings, "GET", "/images", QUESTION_TIMEOUT);
+            let shown: Vec<Value> = merged
+                .instances
+                .iter()
+                .zip(&answers)
+                .filter_map(|(instance, answer)| {
+                    let record = answer
+                        .body()?
+                        .get("images")?
+                        .get(&image)
+                        .filter(|record| !is_falsy(record))?;
+                    Some(questions::entry(instance, answer, Some(record.clone())))
+                })
+                .collect();
+            if shown.is_empty() {
+                exit_unanswered(&merged, &answers);
+                eprintln!(
+                    "machctl: unknown image '{image}' (available: {})",
+                    questions::offered(&merged, &answers)
+                );
                 std::process::exit(1);
             }
-            let found = resp
-                .get("images")
-                .and_then(Value::as_object)
-                .and_then(|images| images.get(&image))
-                .filter(|record| !is_falsy(record));
-            match found {
-                Some(record) => println!("{}", pretty(record)),
-                None => {
-                    eprintln!("{}", format_unknown_image(&image, &resp));
-                    std::process::exit(1);
-                }
-            }
+            println!("{}", pretty(&Value::Array(shown)));
         }
 
         Cmd::List {
@@ -1059,6 +1122,174 @@ fn durable_body(args: &AcquireArgs, machine: &str) -> Map<String, Value> {
     body.insert("env".to_string(), Value::String(args.env.clone()));
     body.insert("ttl_hours".to_string(), acquire_ttl_hours(args.ttl_hours));
     body
+}
+
+/// Gather the instances a catalog question asks (CL-4): every instance,
+/// only the local one with `--local`, or only the one `--instance` names.
+/// What discovery leaves unsaid goes to standard error, as for `list`.
+fn gather_scope(
+    federation_settings: &dyn Fn(bool) -> federation::Settings,
+    scope: &Scope,
+    consul_address: &str,
+) -> (federation::Settings, federation::Merged) {
+    if scope.local && scope.instance.is_some() {
+        usage_error("--local and --instance cannot be combined");
+    }
+    let settings = federation_settings(!scope.local);
+    let merged = match federation::gather(&settings, scope.instance.as_deref()) {
+        Ok(merged) => merged,
+        Err(error) => {
+            eprintln!("machctl: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(error) = &merged.consul_error {
+        eprintln!(
+            "machctl: warning: Consul at {consul_address} did not answer ({error}); asking only the local instance"
+        );
+    }
+    browse_notes(&merged, "asking only the local instance");
+    for note in &merged.notes {
+        eprintln!("machctl: note: {note}");
+    }
+    (settings, merged)
+}
+
+/// Ask `path` of the instances `scope` names and print each answer as
+/// CL-4's JSON: exit 2 when none answered, 1 when none answered HTTP 200.
+fn answer_question(
+    federation_settings: &dyn Fn(bool) -> federation::Settings,
+    scope: &Scope,
+    consul_address: &str,
+    path: &str,
+) {
+    let (settings, merged) = gather_scope(federation_settings, scope, consul_address);
+    let answers = questions::ask(&merged, &settings, "GET", path, QUESTION_TIMEOUT);
+    println!("{}", pretty(&questions::to_json(&merged, &answers)));
+    exit_unanswered(&merged, &answers);
+    if !answers.iter().any(|answer| answer.ok().is_some()) {
+        std::process::exit(1);
+    }
+}
+
+/// Exit 2 with the hint to start the service when no instance answered a
+/// question (CL-4), as `list` does.
+fn exit_unanswered(merged: &federation::Merged, answers: &[questions::Answer]) {
+    if answers
+        .iter()
+        .any(|answer| matches!(answer, questions::Answer::Answered { .. }))
+    {
+        return;
+    }
+    eprintln!("machctl: no machine-service instance answered");
+    if merged.instances.iter().any(|instance| instance.local) {
+        eprintln!("start it with: machine-service-install install (launchd) or: machine-service");
+    }
+    std::process::exit(2);
+}
+
+/// `machctl acquire --image` without `--instance` (FD-7, CL-2): list every
+/// instance, keep those whose offer of the image has its base built,
+/// acquirable offers first and the local instance first, and lease from
+/// the first. The choice is printed before each attempt, and a candidate
+/// refused for capacity passes to the next.
+fn acquire_image(
+    args: &AcquireArgs,
+    image: &str,
+    settings: &federation::Settings,
+    environment: Option<&Value>,
+) -> (u16, Value, String) {
+    // The flags are checked before any instance is asked.
+    let body = virtual_body(args, image);
+    let merged = match federation::gather(settings, None) {
+        Ok(merged) => merged,
+        Err(error) => {
+            eprintln!("machctl: {error}");
+            std::process::exit(1);
+        }
+    };
+    browse_notes(&merged, "choosing among the local instance only");
+    for note in &merged.notes {
+        eprintln!("machctl: note: {note}");
+    }
+    let candidates = questions::image_candidates(&merged, image);
+    if candidates.is_empty() {
+        if merged.none_reachable() {
+            eprintln!("machctl: no machine-service instance answered");
+            std::process::exit(2);
+        }
+        let offers: Vec<String> = merged
+            .instances
+            .iter()
+            .map(|instance| match instance.error.as_deref() {
+                Some(error) if !instance.reachable => {
+                    format!("{}: unreachable ({error})", instance.label)
+                }
+                _ => {
+                    let images: Vec<String> = instance
+                        .machines()
+                        .into_iter()
+                        .filter(capability::is_offer)
+                        .filter_map(|offer| {
+                            offer
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .collect();
+                    format!(
+                        "{}: {}",
+                        instance.label,
+                        if images.is_empty() {
+                            "none".to_string()
+                        } else {
+                            images.join(", ")
+                        }
+                    )
+                }
+            })
+            .collect();
+        eprintln!(
+            "machctl: no instance offers image {image} with its base built (offers: {}; see: machctl images)",
+            offers.join("; ")
+        );
+        std::process::exit(1);
+    }
+    let mut refusals = Vec::new();
+    let mut last = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        eprintln!("{}", candidate.reason);
+        let client = Client::new(candidate.address.clone(), environment);
+        let (status, resp) = client.call(
+            "POST",
+            "/acquire",
+            Some(&Value::Object(body.clone())),
+            DEFAULT_TIMEOUT_S,
+        );
+        if status == 200 {
+            return (status, resp, candidate.address.clone());
+        }
+        let error = error_message_text(&resp);
+        if !acquire::capacity_refusal(status, &error) {
+            return (status, resp, candidate.address.clone());
+        }
+        if index + 1 < candidates.len() {
+            eprintln!(
+                "machctl: {} refused: {error}; trying the next candidate",
+                candidate.instance
+            );
+        }
+        refusals.push(format!("{}: {error}", candidate.instance));
+        last = Some((status, resp, candidate.address.clone()));
+    }
+    if refusals.len() > 1 {
+        eprintln!(
+            "machctl: every instance offering {image} refused for capacity ({})",
+            refusals.join("; ")
+        );
+    }
+    // The last refusal ends the command with its own hint (CL-2).
+    last.expect("at least one candidate was asked")
 }
 
 /// The base URL of the instance `wanted` names (`--instance`, FD-2).
@@ -1573,16 +1804,6 @@ fn utc_timestamp(seconds: f64) -> String {
     )
 }
 
-/// `machctl images-show` unknown-image diagnostic.
-fn format_unknown_image(image: &str, resp: &Value) -> String {
-    let available = resp
-        .get("images")
-        .and_then(Value::as_object)
-        .map(|images| images.keys().cloned().collect::<Vec<String>>().join(", "))
-        .unwrap_or_default();
-    format!("machctl: unknown image '{image}' (available: {available})")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,15 +2073,6 @@ mod tests {
             catalog_warning(&unavailable).expect("warning"),
             "machctl: warning: image catalog unavailable since 1970-01-01T00:00:00Z: \
              /pilot/images: no configured image lines"
-        );
-    }
-
-    #[test]
-    fn unknown_image_message_lists_available_keys() {
-        let resp = json!({"images": {"macos26": {}, "ubuntu2404": {}}});
-        assert_eq!(
-            format_unknown_image("nope", &resp),
-            "machctl: unknown image 'nope' (available: macos26, ubuntu2404)"
         );
     }
 
