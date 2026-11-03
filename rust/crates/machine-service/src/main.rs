@@ -69,6 +69,20 @@ fn run(arguments: &[String]) -> Result<(), String> {
         None => Config::legacy(),
     };
     config.guest_link = GuestLink::from_environment()?;
+    // A second instance runs only on resources of its own, and says so in
+    // `/health`, the one mark the live tools accept (DC-1xx-LIVE-2).
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    if let Some(marker) = second_instance::from_process_env(&home)? {
+        if bundle.is_some() {
+            return Err(format!(
+                "{}: a second instance never runs a selected environment",
+                second_instance::MARKER_VARIABLE
+            ));
+        }
+        machine_service_core::second::set(marker);
+    }
     // An unknown mode stops the daemon before it serves (FD-1, DC-84).
     let discovery_mode = discovery::Mode::from_environment()?;
 
@@ -421,6 +435,9 @@ fn handle_get(service: &Service, request: &mut Request, url: &str) -> OpResult<(
             body["environment"] = environment.clone();
         }
         durable_routes::health(&mut body, offers_virtual(service));
+        if let Some(marker) = machine_service_core::second::get() {
+            body["second_instance"] = json!({"id": marker.id});
+        }
         if let Some(relay) = service.relay() {
             for (key, value) in relay.discovery() {
                 body[key] = json!(value);

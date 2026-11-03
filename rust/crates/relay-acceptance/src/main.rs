@@ -11,6 +11,8 @@
 //!
 //! Every name comes from the operator: the instance is named, never
 //! addressed, and the host shell is whatever reaches the target's host. The
+//! instance must be a second instance, which its `/health` says; the
+//! installed instance is refused (DC-1xx-LIVE-3). The
 //! run's report is `<dir>/<cell>/<profile>/report.json`; the exit status is
 //! 1 when a scenario failed.
 

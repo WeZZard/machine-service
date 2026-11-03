@@ -1,68 +1,52 @@
 #!/bin/sh
 # Run a second machine-service instance for live tests (docs/arch/test-layers.md,
-# TL-4), beside the installed daemon and without touching it.
+# TL-4), beside the installed daemon and without touching it, through the
+# shared launcher, `second-instance` (DC-1xx-LIVE-1).
 #
-# The instance runs detached in its own session, so stopping the shell or
-# task that started it cannot signal the `tart run` processes of its VMs.
-# `stop` signals only the daemon's own PID; its VMs keep running, and the
-# next `start` adopts their leases from the state directory.
+# The launcher gives the instance its own root, LIVE_BIN/<port>, which holds
+# its state, configuration, credential packs, logs and the manifest of what
+# it owns; a minimal environment; loopback listeners only; and its own
+# session, so stopping the shell that started it cannot signal the `tart
+# run` processes of its VMs. Its clones carry the prefix si-<id>-, the only
+# VMs it ever deletes. `restart` restarts the daemon alone, whose leases live
+# on; `stop` releases every lease, deletes every VM it made and removes the
+# root, and finishes what a crashed run left when run again.
 #
-# Usage: scripts/live-instance.sh start <guest-link> | stop | status
-# Environment: LIVE_PORT (default 6250); LIVE_BIN (default target/live), the
-# directory holding `machine-service` and the agents from build-guest-agents.sh.
-# Each port keeps its state, logs and PID under LIVE_BIN/<port>, so two
-# instances, one per guest link, can run at once.
+# Usage: scripts/live-instance.sh start <guest-link> | restart | stop | status
+# Environment, each required by start; none defaults to the installed
+# instance's:
+#   LIVE_PORT         the instance's HTTP port (never 6240)
+#   LIVE_BROKER_PORT  its broker's port (never 6241)
+#   LIVE_TART_HOME    the Tart store it clones its bases from
+# Optional:
+#   LIVE_BIN          the folder holding machine-service, second-instance and
+#                     the agents from build-guest-agents.sh (default target/live)
+#   PILOT_REPO        the instance's image checkout
 set -eu
 
 cd "$(dirname "$0")/.."
-port="${LIVE_PORT:-6250}"
+port="${LIVE_PORT:?set LIVE_PORT, the HTTP port of the second instance}"
 bin="$(cd "${LIVE_BIN:-target/live}" && pwd)"
-dir="$bin/$port"
-mkdir -p "$dir"
-pidfile="$dir/daemon.pid"
-
-running() {
-    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
-}
+root="$bin/$port"
+launcher="$bin/second-instance"
 
 case "${1:-}" in
 start)
     link="${2:?usage: live-instance.sh start <guest-link>}"
-    if running; then
-        echo "already running: pid $(cat "$pidfile")" >&2
-        exit 1
+    set -- start --root "$root" --port "$port" \
+        --session-port "${LIVE_BROKER_PORT:?set LIVE_BROKER_PORT, the port of its broker}" \
+        --tart-home "${LIVE_TART_HOME:?set LIVE_TART_HOME, the Tart store it clones in}" \
+        --executable "$bin/machine-service" --guest-link "$link"
+    if [ -n "${PILOT_REPO:-}" ]; then
+        set -- "$@" --env "PILOT_REPO=$PILOT_REPO"
     fi
-    mkdir -p "$dir/state"
-    MACHINE_SERVICE_PORT="$port" MACHINE_SERVICE_HOST=127.0.0.1 \
-        MACHINE_SERVICE_STATE="$dir/state" MACHINE_SERVICE_GUEST_LINK="$link" \
-        nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' \
-        "$bin/machine-service" >>"$dir/daemon.out" 2>>"$dir/daemon.err" </dev/null &
-    echo $! >"$pidfile"
-    tries=0
-    until curl -fsS -m 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 40 ] || ! running; then
-            echo "daemon did not answer on port $port; see $dir/daemon.err" >&2
-            exit 1
-        fi
-        sleep 0.25
-    done
-    echo "started: pid $(cat "$pidfile"), port $port, guest link $link"
+    exec "$launcher" "$@"
     ;;
-stop)
-    if running; then
-        pid="$(cat "$pidfile")"
-        kill "$pid"
-        while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
-        echo "stopped: pid $pid"
-    fi
-    rm -f "$pidfile"
-    ;;
-status)
-    if running; then echo "running: pid $(cat "$pidfile")"; else echo "stopped"; fi
+restart | stop | status)
+    exec "$launcher" "$1" --root "$root"
     ;;
 *)
-    echo "usage: live-instance.sh start <guest-link> | stop | status" >&2
+    echo "usage: live-instance.sh start <guest-link> | restart | stop | status" >&2
     exit 2
     ;;
 esac

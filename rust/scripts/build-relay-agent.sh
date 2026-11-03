@@ -16,11 +16,15 @@
 # the LaunchAgent's label, instead of the linker's per-build identifier, and
 # with the hardened runtime (DC-135, DC-224, docs/signing.md):
 #
-# - CODESIGN_IDENTITY names a Developer ID Application identity of the
-#   keychain: the signature carries a secure timestamp, and its designated
-#   requirement names the identifier and the team, so a privacy grant holds
-#   for every later build the team signs. The script checks that requirement
-#   against the team the signature carries, or CODESIGN_TEAM when set.
+# - --sign-developer-id signs with a Developer ID Application identity of
+#   the keychain, "Developer ID Application" or the one named after `=`: the
+#   signature carries a secure timestamp, and its designated requirement
+#   names the identifier and the team, so a privacy grant holds for every
+#   later build the team signs. The script checks that requirement against
+#   the team the signature carries, or CODESIGN_TEAM when set. Only the flag
+#   signs with Developer ID: a CODESIGN_IDENTITY in the environment, which a
+#   shell profile or a runner may set, is ignored, so no build signs with the
+#   login keychain's key unless its command line asks (DC-1xx-LIVE-8).
 # - Without it the signature is ad hoc, and its designated requirement is the
 #   build's code hash. Only a pre-release may be ad hoc, so an ad hoc build of
 #   a version without a pre-release part names itself <version>-adhoc, unless
@@ -32,13 +36,22 @@
 # SIGNING.json beside the archives, the release's record of the signature;
 # every consumer checks the executable itself.
 #
-# Usage: scripts/build-relay-agent.sh [output-dir [platform ...]]
+# Usage: scripts/build-relay-agent.sh [--sign-developer-id[=IDENTITY]] [output-dir [platform ...]]
 #        (default target/relay-agent, every platform this host can build)
-#        CODESIGN_IDENTITY, CODESIGN_TEAM, RELAY_AGENT_AWAITS_SIGNING: above
+#        CODESIGN_TEAM, RELAY_AGENT_AWAITS_SIGNING: above
 set -eu
 
 cd "$(dirname "$0")/.."
 . scripts/relay-agent-signing.sh
+identity=-
+case "${1:-}" in
+    --sign-developer-id) identity="Developer ID Application"; shift ;;
+    --sign-developer-id=?*) identity="${1#--sign-developer-id=}"; shift ;;
+    -*) echo "error: unknown option $1" >&2; exit 2 ;;
+esac
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    echo "warning: CODESIGN_IDENTITY is ignored; only --sign-developer-id signs with Developer ID" >&2
+fi
 out="${1:-target/relay-agent}"
 [ $# -gt 0 ] && shift
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -57,20 +70,19 @@ if [ $# -eq 0 ]; then
     esac
 fi
 
-identity="${CODESIGN_IDENTITY:--}"
 wanted_team="${CODESIGN_TEAM:-}"
 awaits=false
 [ "${RELAY_AGENT_AWAITS_SIGNING:-}" != 1 ] || awaits=true
 [ -z "$wanted_team" ] || [ "$identity" != - ] || {
-    echo "error: CODESIGN_TEAM needs CODESIGN_IDENTITY, a Developer ID Application identity" >&2; exit 1; }
+    echo "error: CODESIGN_TEAM needs --sign-developer-id" >&2; exit 1; }
 [ "$awaits" = false ] || [ "$identity" = - ] || {
-    echo "error: RELAY_AGENT_AWAITS_SIGNING is for an ad hoc build; CODESIGN_IDENTITY signs it now" >&2; exit 1; }
+    echo "error: RELAY_AGENT_AWAITS_SIGNING is for an ad hoc build; --sign-developer-id signs it now" >&2; exit 1; }
 for platform in "$@"; do
     if [ "$platform" = darwin-arm64 ] && [ "$identity" = - ] && [ "$awaits" = false ]; then
         case "$version" in
             *-*) ;;
             *) version="$version-adhoc"
-               echo "warning: no CODESIGN_IDENTITY: the macOS build is ad hoc, so this is the pre-release $version (DC-224)" >&2 ;;
+               echo "warning: no --sign-developer-id: the macOS build is ad hoc, so this is the pre-release $version (DC-224)" >&2 ;;
         esac
     fi
 done

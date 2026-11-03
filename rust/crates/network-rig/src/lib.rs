@@ -16,6 +16,7 @@
 //! [`cell`] runs one cell under one profile against a target; for now the
 //! target is the [`standin`] WebSocket echo server.
 
+pub mod admit;
 pub mod cell;
 pub mod client;
 pub mod prng;

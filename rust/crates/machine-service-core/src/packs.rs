@@ -13,10 +13,16 @@ pub const DEFAULT_PACK: &str = "default";
 
 /// Resolve an env pack name to its directory, or `None` for `none`.
 pub fn pack_dir(home: &Path, name: &str) -> OpResult<Option<PathBuf>> {
+    pack_dir_in(&home.join(".config/vm-credentials"), name)
+}
+
+/// Resolve an env pack name to its directory under `packs`, or `None` for
+/// `none`.
+pub fn pack_dir_in(packs: &Path, name: &str) -> OpResult<Option<PathBuf>> {
     if name.is_empty() || name == "none" {
         return Ok(None);
     }
-    let path = home.join(".config/vm-credentials").join(name);
+    let path = packs.join(name);
     if !path.is_dir() {
         return Err(OpError::new(format!(
             "credential pack not found: {}",

@@ -28,6 +28,7 @@ guest-session = { path = "../guest-session" }
 relay-agent = { path = "../relay-agent" }
 relay-broker = { path = "../relay-broker" }
 remote-session = { path = "../remote-session" }
+second-instance = { path = "../second-instance" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

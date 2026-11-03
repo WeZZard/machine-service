@@ -10,7 +10,7 @@
 
 ## BK-1: Endpoint
 
-- The broker accepts WebSocket connections on the remote session listener, `MACHINE_SERVICE_SESSION_PORT` (6241 by default), at path `/relay`, under TLS ([RS-1](remote-session.md#rs-1-transport)). The listener binds every interface, because the guests reach it on their network's host address (BK-5); it accepts nothing but authenticated sessions.
+- The broker accepts WebSocket connections on the remote session listener, `MACHINE_SERVICE_SESSION_PORT` (6241 by default), at path `/relay`, under TLS ([RS-1](remote-session.md#rs-1-transport)). The listener binds every interface, because the guests reach it on their network's host address (BK-5); it accepts nothing but authenticated sessions. `MACHINE_SERVICE_SESSION_HOST` binds it to one address instead, which a second instance for tests must do ([TL-4](test-layers.md#the-second-instance-launcher)).
 - Relay agents and clients connect to the same endpoint, and the first message of a session says which role it takes: `attributes.role` in the hello is `agent` or `client` ([RP-3](relay-protocol.md#rp-3-roles-and-credentials)).
 - machine-service runs the broker when `MACHINE_SERVICE_GUEST_LINK=relay`. Until the relay acceptance passes (M7), SSH stays the default link and the relay link is chosen by the operator (DC-141). An instance told to run it that cannot open the listener does not start.
 - The broker's TLS comes from a per-instance authority kept in the state folder, `relay/tls/`. It signs a certificate for the TLS server name each client sends, and for the host's own addresses when a client sends none, so the broker is reached by any of its names (TC-6). Clients pin the authority by `relay_ca_sha256` ([RP-1](relay-protocol.md#rp-1-endpoint-and-trust), DC-143).

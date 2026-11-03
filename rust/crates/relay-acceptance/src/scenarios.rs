@@ -263,15 +263,37 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
     let name = |what: &str| format!("{prefix}{what}");
     match os {
         Os::Macos => {
+            // The suite's own keychain item, under a name no one else uses,
+            // made, read and deleted in one command, so that a durable Mac's
+            // login keychain keeps nothing of the run (DC-1xx-LIVE-7). The
+            // item of earlier runs, account `ac55`, is the suite's too.
             let secret = format!("acc-{}", uuid::Uuid::new_v4());
+            let account = format!("ac55-{}", uuid::Uuid::new_v4().simple());
             let keychain = client.exec(
                 &format!(
-                    "security add-generic-password -U -s relay-acceptance -a ac55 -w {secret} && \
-                     security find-generic-password -s relay-acceptance -a ac55 -w"
+                    "security delete-generic-password -s relay-acceptance -a ac55 >/dev/null 2>&1; \
+                     security add-generic-password -s relay-acceptance -a {account} -w {secret} && \
+                     security find-generic-password -s relay-acceptance -a {account} -w; rc=$?; \
+                     security delete-generic-password -s relay-acceptance -a {account} >/dev/null 2>&1; \
+                     exit $rc"
                 ),
                 60.0,
                 Duration::from_secs(300),
             )?;
+            let left = client.exec(
+                &format!(
+                    "security find-generic-password -s relay-acceptance -a {account} >/dev/null 2>&1 \
+                     && echo left || echo gone"
+                ),
+                60.0,
+                Duration::from_secs(300),
+            )?;
+            ctx.check(
+                &name("the suite's keychain item is deleted"),
+                expect(left.text().trim() == "gone", || {
+                    format!("security still finds {account}: {}", left.text().trim())
+                }),
+            );
             ctx.check(
                 &name("the login keychain is read without unlocking it"),
                 match keychain.rc()? {
@@ -282,19 +304,31 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                     ))),
                 },
             );
+            // An Apple Event that only reads Finder's state, never one that
+            // changes anything.
             let finder = client.exec(
                 "osascript -e 'tell application \"Finder\" to get name of startup disk'",
                 90.0,
                 Duration::from_secs(300),
             )?;
-            let grants = client.exec(
-                "for db in \"$HOME/Library/Application Support/com.apple.TCC/TCC.db\" \"/Library/Application Support/com.apple.TCC/TCC.db\"; do \
-                 sqlite3 \"$db\" \"select service || ' ' || client from access where client like '%sshd-keygen-wrapper%' or client = 'com.wezzard.relay-agent'\" 2>/dev/null; done",
-                60.0,
-                Duration::from_secs(300),
-            )?;
-            let grants = grants.text();
-            ctx.record(&name("tcc"), json!(grants.lines().collect::<Vec<_>>()));
+            // The privacy database is read only in a VM, whose grants are the
+            // base image's; a durable Mac's are its operator's, which the
+            // suite never reads (DC-1xx-LIVE-7).
+            let grants = if durable {
+                String::new()
+            } else {
+                client
+                    .exec(
+                        "for db in \"$HOME/Library/Application Support/com.apple.TCC/TCC.db\" \"/Library/Application Support/com.apple.TCC/TCC.db\"; do \
+                         sqlite3 \"$db\" \"select service || ' ' || client from access where client like '%sshd-keygen-wrapper%' or client = 'com.wezzard.relay-agent'\" 2>/dev/null; done",
+                        60.0,
+                        Duration::from_secs(300),
+                    )?
+                    .text()
+            };
+            if !durable {
+                ctx.record(&name("tcc"), json!(grants.lines().collect::<Vec<_>>()));
+            }
             let agent_events = grants.lines().any(|l| {
                 l.contains("kTCCServiceAppleEvents") && l.contains("com.wezzard.relay-agent")
             });
@@ -303,7 +337,7 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                 &name("Finder answers osascript without a consent dialog"),
                 match finder.rc()? {
                     Some(0) => Ok(()),
-                    _ if !agent_events && durable => Err(Stop::Blocked(format!(
+                    _ if durable => Err(Stop::Blocked(format!(
                         "blocked by the Mac's own grants: its operator has not granted Apple \
                          Events to com.wezzard.relay-agent, so macOS asks for consent on the \
                          Mac's display ({}); the operator grants it once, as for CuaDriver (CN-3)",
@@ -321,19 +355,22 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                     ))),
                 },
             );
-            ctx.check(
-                &name("no TCC grant for sshd-keygen-wrapper"),
-                if grants.contains("sshd-keygen-wrapper") {
-                    Err(Stop::Blocked(
-                        "blocked by the base image: it still grants privacy permissions to \
+            // A base image's property, which a durable Mac does not have.
+            if !durable {
+                ctx.check(
+                    &name("no TCC grant for sshd-keygen-wrapper"),
+                    if grants.contains("sshd-keygen-wrapper") {
+                        Err(Stop::Blocked(
+                            "blocked by the base image: it still grants privacy permissions to \
                          sshd-keygen-wrapper (pilot-images phase 65), so the run cannot show that \
                          none is needed; a base built with M5 drops them"
-                            .into(),
-                    ))
-                } else {
-                    Ok(())
-                },
-            );
+                                .into(),
+                        ))
+                    } else {
+                        Ok(())
+                    },
+                );
+            }
             // `/tmp` is a link on macOS, and cua-driver refuses an output
             // path whose existing ancestor is not a folder; only the output
             // file is named, which every cua-driver release takes.
@@ -1438,7 +1475,7 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
     }
     let agent = restart_case(ctx, "agent", &|ctx| {
         let os = ctx.target.os();
-        let label = ctx.target.agent().label;
+        let label = ctx.target.agent_job()?.label;
         let client = lease_client(ctx)?;
         Ok(client.run(&os.detached(&format!("sleep 1; {}", os.kill_agent(&label))))?)
     });
@@ -1456,7 +1493,7 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
 fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
-    let label = ctx.target.agent().label;
+    let label = ctx.target.agent_job()?.label;
     let before = client.run(&os.agent_pid(&label))?.trim().to_string();
     client.run(&os.detached(&format!("sleep 2; {}", os.restart_agent_job(&label))))?;
     let started = Instant::now();

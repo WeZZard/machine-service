@@ -511,6 +511,66 @@ impl RealTarget {
     }
 }
 
+impl RealTarget {
+    /// A durable cell's record of what the instance exposes, from its host:
+    /// durable exposure off loopback must name this cell (DC-1xx-LIVE-1),
+    /// and the run's evidence keeps it as `host-exposure.json`.
+    fn record_exposure(&mut self, cell: Cell, run_dir: &Path) -> Result<(), String> {
+        let control = self
+            .settings
+            .host
+            .as_ref()
+            .ok_or("a durable cell needs --host-shell, to record what its instance exposes")?;
+        let text = control.run(&["exposure"])?;
+        let exposure: Value = serde_json::from_str(text.trim())
+            .map_err(|e| format!("the host's exposure is not JSON ({e}): {}", text.trim()))?;
+        std::fs::write(run_dir.join("host-exposure.json"), &text).map_err(|e| e.to_string())?;
+        self.note("host exposure", exposure.clone());
+        exposure_admits(&exposure, &cell.id())
+    }
+
+    /// The lease's relay agent, when the suite restarts or stops it: on a
+    /// durable Mac only a second instance's own agent, never the installed
+    /// one's (DC-1xx-LIVE-7).
+    pub fn agent_job(&self) -> Result<AgentPlace, Stop> {
+        let place = self.agent();
+        if self.durable() && !second_instance::owned_agent_label(&place.label) {
+            return Err(Stop::Failed(format!(
+                "the lease names relay agent {}, which is not a second instance's; the suite \
+never restarts the installed instance's agent",
+                place.label
+            )));
+        }
+        Ok(place)
+    }
+}
+
+/// Whether a durable cell may run against an instance exposing `exposure`:
+/// durable exposure on, and, off loopback, for this cell.
+fn exposure_admits(exposure: &Value, cell: &str) -> Result<(), String> {
+    if exposure["durable"] != true {
+        return Err("the instance has durable exposure off".into());
+    }
+    if exposure["loopback"] != true && exposure["durable_cell"] != cell {
+        return Err(format!(
+            "the instance exposes its Mac on {} for cell {}, not for {cell}",
+            exposure["bind"], exposure["durable_cell"]
+        ));
+    }
+    Ok(())
+}
+
+/// The port of an `http://host:port` base URL; 80 when it names none.
+pub fn base_port(base: &str) -> u16 {
+    let rest = base.split_once("://").map_or(base, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or_default();
+    authority
+        .rsplit_once(':')
+        .filter(|(host, _)| !host.ends_with('[') && (!host.contains(':') || host.ends_with(']')))
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(80)
+}
+
 /// The TTL of AC-66's short lease, the shortest an acquisition takes.
 pub const SHORT_TTL_HOURS: f64 = 0.1;
 
@@ -564,6 +624,14 @@ impl Target for RealTarget {
         };
         self.kind = Some(cell.target);
         let discovery = self.instance.discover().map_err(fail)?;
+        // Never the installed instance: only one that reports itself as a
+        // second instance, off the installed ports (DC-1xx-LIVE-3).
+        let id = second_instance::guard(base_port(self.instance.base()), &discovery.health)
+            .map_err(fail)?;
+        self.note("second instance", json!(id));
+        if cell.target == TargetKind::DurableMac {
+            self.record_exposure(cell, run_dir).map_err(fail)?;
+        }
         let (host, port) = url_host_port(&discovery.relay_url).map_err(fail)?;
         // The rig, as the network, finds where the name leads; the client
         // is only ever told the name.
@@ -641,6 +709,24 @@ mod tests {
         let guest = AgentPlace::of_record(&json!({"relay_agent": {"os": "linux"}}));
         assert_eq!(guest, AgentPlace::guest());
         assert_eq!(guest.config(), "~/.config/relay-agent/config.json");
+    }
+
+    #[test]
+    fn a_base_url_names_its_port() {
+        assert_eq!(base_port("http://mac.local:6262"), 6262);
+        assert_eq!(base_port("http://mac.local:6240/"), 6240);
+        assert_eq!(base_port("http://[2001:db8::1]:6262"), 6262);
+        assert_eq!(base_port("http://mac.local"), 80);
+    }
+
+    #[test]
+    fn a_durable_cell_runs_only_where_its_exposure_names_it() {
+        let lan = json!({"durable": true, "loopback": false, "bind": "192.0.2.4", "durable_cell": "macos-client.durable-mac"});
+        assert!(exposure_admits(&lan, "macos-client.durable-mac").is_ok());
+        assert!(exposure_admits(&lan, "ubuntu-client.durable-mac").is_err());
+        let local = json!({"durable": true, "loopback": true, "durable_cell": null});
+        assert!(exposure_admits(&local, "macos-client.durable-mac").is_ok());
+        assert!(exposure_admits(&json!({"durable": false, "loopback": true}), "x").is_err());
     }
 
     #[test]

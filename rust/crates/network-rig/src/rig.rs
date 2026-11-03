@@ -72,6 +72,9 @@ pub struct RigConfig {
     /// Where the chain's one port listens: a free loopback port unless set.
     /// A relay agent's chain on a VM host listens where its guests reach it.
     pub listen: SocketAddr,
+    /// Who the chain's one port admits: anyone, or only the host's guests
+    /// for a relay agent's chain that listens on every interface.
+    pub admit: crate::admit::Admit,
     /// The authority the edge signs its certificates with, instead of one
     /// made for the run: the authority a client already trusts, such as the
     /// broker's own for a relay agent that trusts only that one.
@@ -112,6 +115,7 @@ impl RigConfig {
             run_dir: run_dir.into(),
             idle_close_s: None,
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            admit: crate::admit::Admit::Any,
             edge_authority: None,
             edge_addresses: Vec::new(),
         }
@@ -365,6 +369,7 @@ impl Rig {
         let pairs = run_dir.join("edge-pairs.jsonl");
         let stage = Arc::new(Stage::start_on(
             config.listen,
+            config.admit,
             toxiproxy_addr,
             config.upstream,
             &pairs,

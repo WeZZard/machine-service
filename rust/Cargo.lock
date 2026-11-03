@@ -712,6 +712,7 @@ dependencies = [
  "relay-broker",
  "remote-session",
  "rustls",
+ "second-instance",
  "serde_json",
  "sha2",
  "tempfile",
@@ -737,6 +738,7 @@ dependencies = [
  "relay-agent",
  "relay-broker",
  "remote-session",
+ "second-instance",
  "serde",
  "serde_json",
  "service-layout",
@@ -948,6 +950,7 @@ dependencies = [
  "rand",
  "relay-agent",
  "remote-session",
+ "second-instance",
  "serde",
  "serde_json",
  "sha2",
@@ -1087,6 +1090,18 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "second-instance"
+version = "0.2.0-rc.3"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "uuid",
+]
 
 [[package]]
 name = "serde"

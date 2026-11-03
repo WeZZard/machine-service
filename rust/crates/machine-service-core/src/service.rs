@@ -152,7 +152,12 @@ impl Service {
     }
 
     /// Resolve an env pack name to its directory through the host's home.
+    /// A second instance reads only the packs in its own configuration
+    /// folder, never the operator's (DC-1xx-LIVE-5).
     pub fn pack_dir(&self, name: &str) -> OpResult<Option<PathBuf>> {
+        if let Some(marker) = crate::second::get() {
+            return crate::packs::pack_dir_in(&marker.packs_dir, name);
+        }
         let home = self.host.home_dir().unwrap_or_else(|| PathBuf::from("/"));
         crate::packs::pack_dir(&home, name)
     }

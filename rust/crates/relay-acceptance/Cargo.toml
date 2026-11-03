@@ -18,6 +18,7 @@ byte-transfer = { path = "../byte-transfer" }
 network-rig = { path = "../network-rig" }
 remote-session = { path = "../remote-session" }
 relay-agent = { path = "../relay-agent" }
+second-instance = { path = "../second-instance" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

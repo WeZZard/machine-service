@@ -49,7 +49,9 @@ This page is for two readers:
      `SHA256SUMS`, and `SIGNING.json` names this version, an executable that
      awaits signing, and that executable's SHA-256;
   2. signs the executable as
-     `codesign --force --sign "Developer ID Application" --identifier com.wezzard.relay-agent --options runtime --timestamp`;
+     `codesign --force --sign "Developer ID Application" --identifier com.wezzard.relay-agent --options runtime --timestamp`,
+     or with the identity that `--sign-developer-id=IDENTITY` names. A
+     `CODESIGN_IDENTITY` in the environment is ignored (DC-1xx-LIVE-8);
   3. refuses unless the designated requirement is the Developer ID
      requirement above, with the team that the signature itself carries, and
      the signature has the hardened runtime and a secure timestamp. With
@@ -68,8 +70,12 @@ This page is for two readers:
 - `rust/scripts/build-relay-agent.sh` prints the designated requirement and
   writes `SIGNING.json`. A local build signed ad hoc makes a version without a
   pre-release part into `<version>-adhoc`, so a local build is always a
-  pre-release. With `CODESIGN_IDENTITY` set, the script signs with Developer ID
-  and checks the result as `sign-release.sh` does.
+  pre-release. Only with `--sign-developer-id` (or
+  `--sign-developer-id=IDENTITY`) does the script sign with Developer ID, and
+  it then checks the result as `sign-release.sh` does. A `CODESIGN_IDENTITY`
+  in the environment, which a shell profile or a CI runner may set, is
+  ignored with a warning, so no build signs with the login keychain's key
+  unless its command line asks (DC-1xx-LIVE-8).
 - `SIGNING.json` records the version, the identifier, the signature
   (`developer-id` or `adhoc`), whether the release awaits signing, the team,
   the designated requirement, the executable's SHA-256 and whether it is
@@ -217,7 +223,7 @@ Delete the draft and run the tag's workflow again with `gh run rerun <run-id>`.
 To sign a local build with the same identity:
 
 ```zsh
-CODESIGN_IDENTITY="Developer ID Application" rust/scripts/build-relay-agent.sh
+rust/scripts/build-relay-agent.sh --sign-developer-id
 ```
 
 ## The operator of a durable Mac: grant the permissions once

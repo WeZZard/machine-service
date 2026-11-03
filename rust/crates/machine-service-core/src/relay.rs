@@ -88,6 +88,10 @@ pub const COMMAND_MARKER: &str = "machine-service-relay";
 pub struct RelaySettings {
     /// The session listener's port (BK-1).
     pub session_port: u16,
+    /// The session listener's address: every interface unless
+    /// `MACHINE_SERVICE_SESSION_HOST` names one, which a second instance
+    /// must (DC-1xx-LIVE-2).
+    pub session_host: String,
     /// The URL discovery advertises (BK-4).
     pub relay_url: String,
     /// The URL guests are given, when not derived from the guest's network.
@@ -136,12 +140,18 @@ pub fn default_relay_url(port: u16) -> String {
 
 impl RelaySettings {
     /// Read the settings: `MACHINE_SERVICE_SESSION_PORT` (6241),
+    /// `MACHINE_SERVICE_SESSION_HOST` (every interface),
     /// `MACHINE_SERVICE_RELAY_URL`, `MACHINE_SERVICE_RELAY_GUEST_URL`,
     /// `MACHINE_SERVICE_RELAY_GUEST_PORT`,
     /// `MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT` (120 s) and
     /// `MACHINE_SERVICE_RELAY_AGENT_WAIT` (600 s).
     pub fn from_environment() -> Result<RelaySettings, String> {
         let session_port = remote_session::session_port_from_env().map_err(|e| e.to_string())?;
+        let session_host = std::env::var(second_instance::SESSION_HOST_VARIABLE)
+            .ok()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "0.0.0.0".into());
         let relay_url = match std::env::var(RELAY_URL_VARIABLE) {
             Ok(value) if !value.trim().is_empty() => websocket_url(RELAY_URL_VARIABLE, &value)?,
             _ => default_relay_url(session_port),
@@ -165,6 +175,7 @@ impl RelaySettings {
         };
         Ok(RelaySettings {
             session_port,
+            session_host,
             relay_url,
             guest_url,
             guest_port,
@@ -286,8 +297,9 @@ pub struct Relay {
 
 impl Relay {
     /// Make or load the authority under `<state>/relay/tls`, and start the
-    /// broker on the session listener, on every interface, under TLS: the
-    /// guests reach it on their network's host address (BK-5).
+    /// broker on the session listener, under TLS: on every interface, where
+    /// the guests reach it on their network's host address (BK-5), unless
+    /// the settings name one address.
     pub fn start(
         settings: RelaySettings,
         state_dir: &Path,
@@ -308,9 +320,13 @@ impl Relay {
             relay_broker::tls::host_names,
         )?);
         let server = SessionServer::new(server).map_err(|e| e.to_string())?;
-        let listener = TcpListener::bind(("0.0.0.0", settings.session_port)).map_err(|e| {
+        let host = settings
+            .session_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let listener = TcpListener::bind((host, settings.session_port)).map_err(|e| {
             format!(
-                "relay: cannot listen on port {} ({}): {e}",
+                "relay: cannot listen on {host} port {} ({}): {e}",
                 settings.session_port,
                 remote_session::SESSION_PORT_ENV
             )
@@ -1841,6 +1857,7 @@ mod tests {
     fn the_guest_url_is_the_override_or_the_hosts_address_on_the_guests_subnet() {
         let mut settings = RelaySettings {
             session_port: 6241,
+            session_host: "0.0.0.0".into(),
             relay_url: "wss://h:6241/relay".into(),
             guest_url: Some("wss://o:1/relay".into()),
             guest_port: None,

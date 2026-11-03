@@ -13,6 +13,7 @@ path = "src/main.rs"
 machine-service-core = { path = "../machine-service-core" }
 byte-transfer = { path = "../byte-transfer" }
 discovery = { path = "../discovery" }
+second-instance = { path = "../second-instance" }
 uuid.workspace = true
 tiny_http.workspace = true
 serde_json.workspace = true
@@ -33,4 +34,5 @@ relay-broker = { path = "../relay-broker" }
 remote-session = { path = "../remote-session" }
 guest-actions = { path = "../guest-actions" }
 network-rig = { path = "../network-rig" }
+second-instance = { path = "../second-instance" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! network-rig serve --profile N1 --seed 7 --upstream 127.0.0.1:6241 \
-//!     --upstream-ca ca.pem --broker-name host.example --listen 0.0.0.0:6244 \
+//!     --upstream-ca ca.pem --broker-name host.example --listen 0.0.0.0:6244 --admit guests \
 //!     [--edge-ca-key ca.key --edge-ca-cert ca.pem --edge-ca-name ca.name] \
 //!     [--edge-host-addresses] --run-dir DIR
 //! network-rig ctl --run-dir DIR '{"cut":{"side":"both"}}'
@@ -14,7 +14,9 @@
 //! of this machine's IPv4 addresses instead of the name, as a relay agent
 //! dials its host's address on the guest network (BK-5), and starts again
 //! when the addresses change, since a guest network appears with its first
-//! VM. `serve` starts the chain, writes `serve.json` (its port, URL and PID) into
+//! VM. `--admit guests` closes every connection from a peer that is neither
+//! on loopback nor on a bridge interface's subnet, so a chain that listens
+//! on every interface for its guests never serves the LAN. `serve` starts the chain, writes `serve.json` (its port, URL and PID) into
 //! the run directory, plays the profile's schedule unless `--no-play`, logs
 //! each played step to `notes.jsonl`, and serves control requests on the Unix
 //! socket `control.sock` there until it receives SIGTERM, SIGINT or a
@@ -44,7 +46,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 fn usage() -> ! {
     eprintln!(
         "usage: network-rig serve --profile <N0..N3> [--profile-file <json>] [--seed <n>] \
---upstream <addr:port> --upstream-ca <pem> --broker-name <name> [--listen <addr:port>] \
+--upstream <addr:port> --upstream-ca <pem> --broker-name <name> [--listen <addr:port> [--admit any|guests]] \
 [--edge-ca-key <pem> --edge-ca-cert <pem> [--edge-ca-name <file>]] [--edge-host-addresses] \
 --run-dir <dir> [--no-play]\n       \
 network-rig ctl --run-dir <dir> <json request>"
@@ -169,6 +171,9 @@ fn serve(args: &Args) {
         config.listen = listen
             .parse()
             .unwrap_or_else(|_| fail("--listen is not addr:port"));
+    }
+    if let Some(admit) = args.get("admit") {
+        config.admit = network_rig::admit::Admit::parse(admit).unwrap_or_else(|error| fail(error));
     }
     if let (Some(key), Some(cert)) = (args.get("edge-ca-key"), args.get("edge-ca-cert")) {
         config.edge_authority = Some(EdgeAuthority {

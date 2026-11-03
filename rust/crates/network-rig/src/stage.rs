@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
+use crate::admit::Admit;
 use crate::RigError;
 
 /// Which end of a connection a cut resets.
@@ -130,6 +131,7 @@ impl Stage {
     ) -> Result<Stage, RigError> {
         Stage::start_on(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Admit::Any,
             edge_side,
             broker,
             pairs,
@@ -137,10 +139,11 @@ impl Stage {
     }
 
     /// [`Stage::start`] with the front hop, the chain's one port, listening
-    /// on `listen`: a relay agent's chain on a VM host listens where the
-    /// host's guests reach it.
+    /// on `listen` and admitting `admit`: a relay agent's chain on a VM host
+    /// listens where the host's guests reach it, and admits only them.
     pub fn start_on(
         listen: SocketAddr,
+        admit: Admit,
         edge_side: SocketAddr,
         broker: SocketAddr,
         pairs: &Path,
@@ -151,8 +154,9 @@ impl Stage {
             broker,
             Some(source.clone()),
             false,
+            Admit::Any,
         )?;
-        let front = Hop::start_with(listen, edge_side, None, true)?;
+        let front = Hop::start_with(listen, edge_side, None, true, admit)?;
         Ok(Stage {
             front,
             back,
@@ -359,6 +363,7 @@ struct Shared {
     upstream: SocketAddr,
     source: Option<Arc<SourceAddress>>,
     read_hello: bool,
+    admit: Admit,
     next_id: AtomicU64,
     open: Mutex<BTreeMap<u64, Entry>>,
     stopping: AtomicBool,
@@ -389,6 +394,7 @@ impl Hop {
             upstream,
             None,
             false,
+            Admit::Any,
         )
     }
 
@@ -397,6 +403,7 @@ impl Hop {
         upstream: SocketAddr,
         source: Option<Arc<SourceAddress>>,
         read_hello: bool,
+        admit: Admit,
     ) -> Result<Hop, RigError> {
         let listener = TcpListener::bind(listen)
             .map_err(RigError::io(format!("bind the reset stage on {listen}")))?;
@@ -407,6 +414,7 @@ impl Hop {
             upstream,
             source,
             read_hello,
+            admit,
             next_id: AtomicU64::new(0),
             open: Mutex::new(BTreeMap::new()),
             stopping: AtomicBool::new(false),
@@ -490,6 +498,13 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             return;
         }
         let Ok(down) = down else { continue };
+        // A peer the hop does not admit is closed before anything is read.
+        if !down
+            .peer_addr()
+            .is_ok_and(|peer| shared.admit.admits(peer.ip()))
+        {
+            continue;
+        }
         let id = shared.next_id.fetch_add(1, Ordering::SeqCst);
         let shared = shared.clone();
         std::thread::spawn(move || serve(&shared, id, down));

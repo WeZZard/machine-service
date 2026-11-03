@@ -21,11 +21,14 @@
 # The team is read from the signature and written only where the signature
 # already carries it: the executable and SIGNING.json, never the notes.
 #
-# Usage: scripts/sign-release.sh [--dry-run] [--dir DIR] <tag>
+# Usage: scripts/sign-release.sh [--dry-run] [--dir DIR] [--sign-developer-id=IDENTITY] <tag>
 #   --dry-run  stop before anything is uploaded or published
 #   --dir DIR  sign the assets already in DIR instead of downloading the
 #              draft (implies --dry-run); the signed files are left there
-#   CODESIGN_IDENTITY  the identity (default "Developer ID Application")
+#   --sign-developer-id=IDENTITY  the identity (default "Developer ID
+#              Application"); the script's own command line names it, as
+#              build-relay-agent.sh's does, and a CODESIGN_IDENTITY in the
+#              environment is ignored (DC-1xx-LIVE-8)
 #   CODESIGN_TEAM      refuse a signature by any other team
 #   GH_REPO            the repository, when not the checkout's
 set -eu
@@ -35,20 +38,25 @@ cd "$(dirname "$0")/.."
 
 dry_run=false
 dir=
+identity="Developer ID Application"
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
         --dir) dir=$2; dry_run=true; shift 2 ;;
+        --sign-developer-id) shift ;;
+        --sign-developer-id=?*) identity="${1#--sign-developer-id=}"; shift ;;
         -*) echo "error: unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
 done
-[ $# -eq 1 ] || { echo "usage: scripts/sign-release.sh [--dry-run] [--dir DIR] <tag>" >&2; exit 2; }
+[ $# -eq 1 ] || { echo "usage: scripts/sign-release.sh [--dry-run] [--dir DIR] [--sign-developer-id=IDENTITY] <tag>" >&2; exit 2; }
 tag=$1
 version=${tag#v}
 [ "$tag" = "v$version" ] || { echo "error: a release tag is v<version>, not $tag" >&2; exit 2; }
 [ "$(uname -s)" = Darwin ] || { echo "error: signing needs macOS and its keychain" >&2; exit 1; }
-identity="${CODESIGN_IDENTITY:-Developer ID Application}"
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    echo "warning: CODESIGN_IDENTITY is ignored; --sign-developer-id=IDENTITY names the identity" >&2
+fi
 marker='<!-- relay-agent: awaits Developer ID signing -->'
 darwin="relay-agent-$version-darwin-arm64.tar.gz"
 platforms="darwin-arm64 linux-arm64 linux-x86_64"

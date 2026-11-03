@@ -303,7 +303,10 @@ impl Service {
                     }
                 }
                 let suffix = &uuid::Uuid::new_v4().simple().to_string()[..6];
-                let vm = format!("{clone_prefix}{purpose_for_record}-{suffix}");
+                // A second instance's clones carry its own prefix, so that its
+                // launcher deletes them and no others (DC-1xx-LIVE-4).
+                let owned = crate::second::vm_prefix();
+                let vm = format!("{owned}{clone_prefix}{purpose_for_record}-{suffix}");
                 let now = unix_now();
                 let mut record = Map::new();
                 record.insert("vm".to_string(), Value::String(vm.clone()));
