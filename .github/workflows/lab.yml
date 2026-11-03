@@ -8,7 +8,7 @@ name: Lab
 
 on:
   push:
-    branches: [claude/relay-agent]
+    branches: [claude/relay-agent, claude/relay-lab]
   workflow_dispatch:
     inputs:
       cells:
@@ -31,7 +31,8 @@ jobs:
   relay-acceptance:
     name: Relay acceptance (${{ inputs.profiles || 'N0' }})
     if: >-
-      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/claude/relay-agent') ||
+      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, macOS, ARM64, lab]
