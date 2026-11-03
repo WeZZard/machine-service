@@ -49,8 +49,25 @@ host_shell() {
 plan() {
     dir="$1"
     mkdir -p "$dir"
-    machctl list --json >"$dir/list.json" || die "machctl list failed"
-    python3 -I - "$dir/list.json" >"$dir/plan.env" <<'EOF'
+    # An instance busy with a release can miss the listing's 5 s, so the
+    # listing is read again before the plan gives up.
+    tries=0
+    until machctl list --json >"$dir/list.json" && plan_from "$dir/list.json" >"$dir/plan.new" 2>"$dir/plan.err"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 5 ]; then
+            cat "$dir/plan.err" >&2
+            rm -f "$dir/plan.new" "$dir/plan.err"
+            exit 1
+        fi
+        sleep 15
+    done
+    mv "$dir/plan.new" "$dir/plan.env"
+    rm -f "$dir/plan.err"
+    echo "plan: this Mac is the macOS client; the durable cells target the other durable Mac; the VM cells one VM host"
+}
+
+plan_from() {
+    python3 -I - "$1" <<'EOF'
 import json, shlex, sys
 
 instances = json.load(open(sys.argv[1]))
@@ -67,7 +84,8 @@ if own[0][1].get("purpose", "") and not str(own[0][1].get("purpose")).startswith
     fail("this Mac is leased to another client")
 others = [(i, m) for i, m in durables if m["name"] != own_name]
 if not others:
-    fail("no other durable Mac answered; the durable cells need one")
+    silent = [i.get("error") for i in instances if not i.get("reachable", True)]
+    fail(f"no other durable Mac answered; the durable cells need one (instances without an answer: {silent})")
 free = [(i, m) for i, m in others if m.get("state") == "available" and not m.get("lease_id")]
 if not free:
     i, m = others[0]
@@ -94,7 +112,6 @@ for key, value in (("OWN", own_name), ("DURABLE", durable), ("VM_HOST", vm_host)
                    ("CLIENT_INSTANCE", f"http://{vm_host}.local:{vm_port}")):
     print(f"{key}={shlex.quote(value)}")
 EOF
-    echo "plan: this Mac is the macOS client; the durable cells target the other durable Mac; the VM cells one VM host"
 }
 
 load_plan() {
@@ -152,6 +169,7 @@ deploy() {
 
 clean() {
     dir="$1"
+    [ -f "$dir/plan.env" ] || { echo "relay-lab: no plan, so nothing was deployed"; return 0; }
     load_plan "$dir"
     for target in "$VM_HOST" "$DURABLE"; do
         $(host_shell "$target") clean || echo "relay-lab: clean of a target failed" >&2

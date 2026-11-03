@@ -3,13 +3,13 @@
 # runner holds its durable Mac's lease for as long as it runs, as any other
 # client of machine-service does, so it never shares the desktop with a lease.
 #
-# The runner calls this script through two links in its folder, and the
-# link's name says which hook it is:
-#   hooks/job-started.sh    ACTIONS_RUNNER_HOOK_JOB_STARTED: release a lease
+# The runner calls this script through two links, and the link's name says
+# which hook it is:
+#   job-started.sh          ACTIONS_RUNNER_HOOK_JOB_STARTED: release a lease
 #                           an earlier job of this runner left, then acquire
 #                           this Mac's lease for purpose ci-<run id>, or fail
 #                           the job at once when the Mac is leased.
-#   hooks/job-completed.sh  ACTIONS_RUNNER_HOOK_JOB_COMPLETED: release the
+#   job-completed.sh        ACTIONS_RUNNER_HOOK_JOB_COMPLETED: release the
 #                           lease (sweep, inventory, purge) and keep its
 #                           hygiene record.
 #
@@ -26,7 +26,9 @@
 # lease's hygiene record).
 set -eu
 
-runner="$(cd "$(dirname "$0")/.." && pwd)"
+# The runner calls the hook through a link outside the home folder, so its
+# public log shows no home path: resolve every link to find the runner.
+runner="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 lab="$runner/_lab"
 ttl_hours=2
 beat_seconds=600
@@ -162,7 +164,7 @@ job-completed*) completed ;;
 *)
     case "${1:-}" in
     heartbeat) shift; heartbeat "$@" ;;
-    *) echo "usage: link as hooks/job-started.sh or hooks/job-completed.sh" >&2; exit 2 ;;
+    *) echo "usage: link as job-started.sh or job-completed.sh" >&2; exit 2 ;;
     esac
     ;;
 esac

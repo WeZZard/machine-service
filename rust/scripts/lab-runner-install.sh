@@ -52,8 +52,15 @@ rm -f "$archive"
 mkdir -p hooks "$logs"
 cp lab-runner-hook.sh hooks/lab-runner-hook.sh
 chmod 755 hooks/lab-runner-hook.sh
-ln -sf lab-runner-hook.sh hooks/job-started.sh
-ln -sf lab-runner-hook.sh hooks/job-completed.sh
+# The runner prints a hook's path in the job's public log before any step
+# can mask it, so the runner is given links outside the home folder, in a
+# folder of this account's that survives a restart.
+links=/var/tmp/lab-runner-hooks
+mkdir -p "$links"
+chmod 755 "$links"
+[ -O "$links" ] || { echo "$links belongs to another account" >&2; exit 1; }
+ln -sf "$dir/hooks/lab-runner-hook.sh" "$links/job-started.sh"
+ln -sf "$dir/hooks/lab-runner-hook.sh" "$links/job-completed.sh"
 
 name="lab-$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}' | shasum -a 256 | cut -c1-6)"
 path="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -64,8 +71,8 @@ token=""
 
 # The hooks, and the PATH a job and its hooks start with.
 {
-    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$dir/hooks/job-started.sh"
-    echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$dir/hooks/job-completed.sh"
+    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$links/job-started.sh"
+    echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$links/job-completed.sh"
 } >>.env
 printf '%s\n' "$path" >.path
 
