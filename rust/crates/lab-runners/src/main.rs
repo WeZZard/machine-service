@@ -184,7 +184,10 @@ impl Host {
             .collect();
         entries.sort();
         entries.dedup();
-        let comments = ["lab hosts an egress guest may reach on the lab ports (DC-267); written by lab-host".to_string()];
+        let comments = [
+            "lab hosts an egress guest may reach on the lab ports (DC-267); written by lab-host"
+                .to_string(),
+        ];
         if let Err(error) = guest_firewall::write_addresses(&self.egress.lab, &comments, &entries) {
             log(&format!("lab table: {error}"));
         }

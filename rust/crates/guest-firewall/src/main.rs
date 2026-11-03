@@ -252,13 +252,14 @@ fn remove() -> Result<(), String> {
 
 fn status() -> Result<(), String> {
     let table = match std::fs::read_to_string(ANCHOR_FILE) {
-        Ok(text) => match parse_anchor_table(&text) {
-            Some(table) => {
-                println!(
-                    "anchor file: {ANCHOR_FILE} (table file {})",
-                    table.display()
-                );
-                match guest_firewall::parse_anchor_egress(&text) {
+        Ok(text) => {
+            match parse_anchor_table(&text) {
+                Some(table) => {
+                    println!(
+                        "anchor file: {ANCHOR_FILE} (table file {})",
+                        table.display()
+                    );
+                    match guest_firewall::parse_anchor_egress(&text) {
                     Some(files) => println!(
                         "egress section: guests {}, allow {}, lab {} (DC-267)",
                         files.guests.display(),
@@ -267,17 +268,18 @@ fn status() -> Result<(), String> {
                     ),
                     None => println!("egress section: none; egress leases are refused (reinstall for DC-267)"),
                 }
-                match parse_anchor_broker_port(&text) {
+                    match parse_anchor_broker_port(&text) {
                     Some(port) => println!("broker port internet guests may reach: {port} (DC-107)"),
                     None => println!("broker port: none; internet guests reach no host port (reinstall for DC-107)"),
                 }
-                Some(table)
+                    Some(table)
+                }
+                None => {
+                    println!("anchor file: {ANCHOR_FILE} (no table file; reinstall it)");
+                    None
+                }
             }
-            None => {
-                println!("anchor file: {ANCHOR_FILE} (no table file; reinstall it)");
-                None
-            }
-        },
+        }
         Err(_) => {
             println!("anchor file: missing ({ANCHOR_FILE})");
             None
