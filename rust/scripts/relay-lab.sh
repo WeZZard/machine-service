@@ -188,9 +188,19 @@ cell() {
     *.ubuntu-vm) target="$VM_HOST" image=ubuntu2404 ;;
     esac
     set -- --cell "$cell" --profile "$profile" --instance "http://$target.local:6272" \
-        --host-shell "$(host_shell "$target")" --host-script relay-acceptance-host.sh \
         --purpose "lab-$(printf %s "$cell-$profile" | tr 'A-Z.' 'a-z-')"
     [ -n "$image" ] && set -- "$@" --image "$image"
+    case "$cell" in
+    macos-client.*)
+        set -- "$@" --host-shell "$(host_shell "$target")" --host-script relay-acceptance-host.sh
+        ;;
+    ubuntu-client.*)
+        # The client VM has no way to the target's host: this Mac runs the
+        # agents' chain for it, and the scenarios that cut or restart on the
+        # host have no host control there.
+        set -- "$@" --agent-rig external
+        ;;
+    esac
     log="$logs/$cell-$profile.log"
     echo "[$cell $profile] started"
     status=0
@@ -201,6 +211,11 @@ cell() {
     ubuntu-client.*)
         stage="$dir/uc-$cell-$profile"
         rm -rf "$stage"
+        if [ -n "$image" ]; then
+            seed="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+            $(host_shell "$target") relay-acceptance-host.sh rig-start "$profile" "$seed" >"$logs/$cell-$profile.agent-rig.json" ||
+                status=1
+        fi
         sh "$here/relay-acceptance-ubuntu-client.sh" "$CLIENT_INSTANCE" "$dir/bin/relay-acceptance-linux" \
             "$stage" "$@" >"$log" 2>&1 || status=$?
         if [ -d "$stage/$cell/$profile" ]; then
@@ -210,6 +225,7 @@ cell() {
         fi
         [ -f "$stage/run.log" ] && mv "$stage/run.log" "$logs/$cell-$profile.client.log"
         rm -rf "$stage"
+        [ -z "$image" ] || $(host_shell "$target") relay-acceptance-host.sh rig-stop >/dev/null || true
         [ -f "$evidence/$cell/$profile/report.json" ] || status=1
         ;;
     esac
