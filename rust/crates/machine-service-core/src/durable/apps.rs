@@ -23,7 +23,7 @@
 //! output is never logged or stored, because the job inherits whatever the
 //! caller's environment held. It is always the system `launchctl`
 //! ([`crate::launchd::LAUNCHCTL`]), in a test build too: it only reads, and
-//! the lease's applications are real launchd jobs (DC-1xx-LCTL-1).
+//! the lease's applications are real launchd jobs (DC-242).
 //!
 //! A matched application is first asked to quit, as the Dock's Quit does
 //! (`NSRunningApplication.terminate`, an Apple event), and is given the

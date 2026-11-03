@@ -1,7 +1,7 @@
 //! The `launchctl` that loads, unloads and inspects this service's own
 //! LaunchAgents: the relay agent's (`docs/arch/relay-agent.md` RA-2) and the
 //! installation's (`docs/arch/installation.md` IN-3); DC-241,
-//! DC-1xx-LCTL-1.
+//! DC-242.
 //!
 //! A release always runs [`LAUNCHCTL`], macOS's only system `launchctl`,
 //! and never one that `PATH` finds: whoever controls the service's
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn the_test_seam_follows_the_feature() {
-        // Workspace tests build the seam in (DC-1xx-LCTL-1); a release
+        // Workspace tests build the seam in (DC-242); a release
         // build resolves the system launchctl whatever its environment.
         match (is_test_build(), Launchctl::resolve()) {
             (false, resolved) => assert_eq!(resolved.unwrap().program(), Path::new(LAUNCHCTL)),

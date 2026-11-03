@@ -1126,7 +1126,7 @@ fn pid_alive(pid: i32) -> bool {
 
 /// A command that runs `launchctl` with `arguments`: the system one, never
 /// one `PATH` finds, and a test's own only in a test build
-/// ([`Launchctl`], DC-1xx-LCTL-1).
+/// ([`Launchctl`], DC-242).
 fn launchctl_command<I, S>(arguments: I) -> Result<Command, InstallError>
 where
     I: IntoIterator<Item = S>,

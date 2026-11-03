@@ -67,7 +67,7 @@ fn default_install_and_remove() {
     assert!(fs::read_to_string(&harness.log).unwrap().contains("load "));
 }
 
-/// DC-1xx-LCTL-1, keeping DC-241's guarantee: a test build of the
+/// DC-242, keeping DC-241's guarantee: a test build of the
 /// installer runs only the `launchctl` its test names through the seam. Named
 /// none, with the stub first on its `PATH`, it refuses before it runs any:
 /// neither the one `PATH` finds nor `/bin/launchctl`.

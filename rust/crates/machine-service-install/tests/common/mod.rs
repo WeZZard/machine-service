@@ -5,7 +5,7 @@
 //! `launchctl` stub, exactly as the Python test runs the shell script. The
 //! stub reaches the installer through the test build's seam
 //! (`machine_service_core::launchd`), never `PATH`, and a test build without
-//! it refuses to run any `launchctl` (DC-1xx-LCTL-1).
+//! it refuses to run any `launchctl` (DC-242).
 
 #![allow(dead_code)]
 
@@ -184,7 +184,7 @@ impl Harness {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tart.log\"\n[ \"$1\" = --version ] || exit 99\nprintf '2.32.1\\n'\n",
         );
         // The stub lies off `PATH`: the installer is given it through the
-        // test build's seam only (DC-1xx-LCTL-1).
+        // test build's seam only (DC-242).
         let launchctl = home.join("launchd/launchctl");
         fs::create_dir_all(launchctl.parent().unwrap()).unwrap();
         write_exec(&launchctl, LAUNCHCTL_STUB);
@@ -269,7 +269,7 @@ impl Harness {
     }
 
     /// Run the installer named no `launchctl` through the test build's seam
-    /// (DC-1xx-LCTL-1).
+    /// (DC-242).
     pub fn run_without_launchctl(&self, args: &[&str]) -> Output {
         self.run_given(args, false)
     }

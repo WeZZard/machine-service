@@ -94,7 +94,7 @@ struct Lab {
     seam: Seam,
 }
 
-/// How a test daemon is given its test's `launchctl` (DC-1xx-LCTL-1).
+/// How a test daemon is given its test's `launchctl` (DC-242).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Seam {
     /// Named by the test build's variable: the daemon runs it.
@@ -177,7 +177,7 @@ impl Lab {
     }
 
     /// A second instance whose fake launchd is only first on its `PATH`,
-    /// as every test daemon's was before DC-1xx-LCTL-1.
+    /// as every test daemon's was before DC-242.
     fn unnamed(release_of: &Path) -> Lab {
         Lab::with_launchd(release_of, true, Seam::PathOnly)
     }
@@ -623,7 +623,7 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
     assert!(!health.to_string().contains("EXAMPLE123"), "{health}");
 }
 
-/// DC-1xx-LCTL-1, keeping DC-241's guarantee: a test daemon runs only the
+/// DC-242, keeping DC-241's guarantee: a test daemon runs only the
 /// `launchctl` its test names through the test build's seam. One named
 /// none, with a recording `launchctl` first on its `PATH`, refuses before
 /// it runs any: neither the one `PATH` finds nor `/bin/launchctl`. Its

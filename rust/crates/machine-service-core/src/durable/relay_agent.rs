@@ -366,7 +366,7 @@ fn job(label: &str) -> String {
 }
 
 /// Run `launchctl` with `arguments`: always the system one in a release
-/// ([`Launchctl`], DC-1xx-LCTL-1).
+/// ([`Launchctl`], DC-242).
 fn run(launchctl: &Launchctl, arguments: &[&str]) -> Result<std::process::Output, String> {
     crate::proc::run_capture(
         &mut launchctl.command(arguments),
