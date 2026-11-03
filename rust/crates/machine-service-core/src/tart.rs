@@ -142,11 +142,12 @@ pub fn spawn_run(
     config: &Config,
     vm: &str,
     network: acquisition_options::GuestNetwork,
+    softnet_allow: &[String],
 ) -> OpResult<std::process::Child> {
     let log_path = format!("/tmp/tart-run-{vm}.log");
     let stdout = std::fs::File::create(&log_path)?;
     let stderr = stdout.try_clone()?;
-    let args = crate::network::run_args(vm, network);
+    let args = crate::network::run_args_allowing(vm, network, softnet_allow);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut command = tart_command(config, &args)?;
     command

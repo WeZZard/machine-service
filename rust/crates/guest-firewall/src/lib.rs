@@ -47,7 +47,202 @@ pub const DEFAULT_TABLE_FILE: &str = "/var/db/com.wezzard.vm-service/internet-gu
 /// machine-service's session listener (BK-1, DC-107).
 pub const DEFAULT_BROKER_PORT: u16 = 6241;
 
-/// The pf rules of the anchor, with the table read from `table_file`.
+// ------------------------------------------------------------------ egress
+
+/// The pf table of the egress guests' addresses (DC-1xx-EPH-9).
+pub const EGRESS_TABLE: &str = "vm_service_egress";
+/// The pf table of the public addresses an egress guest may reach.
+pub const EGRESS_ALLOW_TABLE: &str = "vm_service_egress_allow";
+/// The pf table of the lab hosts' addresses an egress guest may reach on
+/// the lab ports.
+pub const EGRESS_LAB_TABLE: &str = "vm_service_egress_lab";
+/// The egress guests' table file, beside the `internet` table file.
+pub const EGRESS_GUESTS_FILE: &str = "egress-guests";
+/// The allow table's file, beside the `internet` table file.
+pub const EGRESS_ALLOW_FILE: &str = "egress-allow";
+/// The lab table's file, beside the `internet` table file.
+pub const EGRESS_LAB_FILE: &str = "egress-lab";
+/// The lab instance's ports: its HTTP API and its broker (DC-1xx-EPH-12).
+pub const LAB_PORTS: [u16; 2] = [6272, 6273];
+/// The ports an egress guest may reach on the allow table's addresses:
+/// HTTPS and DNS over TLS (DC-16).
+pub const ALLOW_PORTS: [u16; 2] = [443, 853];
+/// The comment of the allow file that names the name an egress guest's
+/// isolation check loads over HTTPS.
+pub const CHECK_PREFIX: &str = "# check: ";
+
+/// The egress section's three table files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressFiles {
+    /// The egress guests' addresses, which the instances write.
+    pub guests: PathBuf,
+    /// The allowed public addresses, which `lab-host` writes.
+    pub allow: PathBuf,
+    /// The lab hosts' addresses, which `lab-host` writes.
+    pub lab: PathBuf,
+}
+
+impl EgressFiles {
+    /// The files beside the `internet` table file, by convention, so the
+    /// firewall's LaunchDaemon, which watches that folder, reloads the
+    /// anchor whenever one changes.
+    pub fn beside(table_file: &Path) -> EgressFiles {
+        let directory = table_file.parent().unwrap_or_else(|| Path::new("/"));
+        EgressFiles {
+            guests: directory.join(EGRESS_GUESTS_FILE),
+            allow: directory.join(EGRESS_ALLOW_FILE),
+            lab: directory.join(EGRESS_LAB_FILE),
+        }
+    }
+
+    /// Every file of the section.
+    pub fn all(&self) -> [&Path; 3] {
+        [&self.guests, &self.allow, &self.lab]
+    }
+}
+
+fn port_list(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The egress section of the anchor (DC-1xx-EPH-9). It applies only to the
+/// addresses in the egress table and comes before the `internet` rules, so
+/// an egress guest, which is an `internet` guest too, meets it first:
+///
+/// - the host's connections to the guests keep state, and DHCP reaches
+///   bootpd(8), as for every `internet` guest;
+/// - a guest may open TCP to this host's own addresses on the lab ports,
+///   to the lab table's addresses on the lab ports, and to the allow
+///   table's addresses on HTTPS and DNS over TLS;
+/// - everything else a guest sends is dropped, the installed instance's
+///   broker port of DC-107 included.
+pub fn egress_rules(files: &EgressFiles) -> String {
+    let lab = port_list(&LAB_PORTS);
+    let allow = port_list(&ALLOW_PORTS);
+    format!(
+        "# Egress guests (DC-1xx-EPH-9): the lab's ports, and HTTPS and DNS over TLS to the allow table.\n\
+table <{EGRESS_TABLE}> persist file \"{guests}\"\n\
+table <{EGRESS_ALLOW_TABLE}> persist file \"{allow_file}\"\n\
+table <{EGRESS_LAB_TABLE}> persist file \"{lab_file}\"\n\
+pass out quick inet to <{EGRESS_TABLE}> keep state\n\
+pass in quick inet proto udp from <{EGRESS_TABLE}> port 68 to any port 67\n\
+pass in quick inet proto tcp from <{EGRESS_TABLE}> to self port {{ {lab} }} keep state\n\
+pass in quick inet proto tcp from <{EGRESS_TABLE}> to <{EGRESS_LAB_TABLE}> port {{ {lab} }} keep state\n\
+pass in quick inet proto tcp from <{EGRESS_TABLE}> to <{EGRESS_ALLOW_TABLE}> port {{ {allow} }} keep state\n\
+# Anything else an egress guest sends is dropped.\n\
+block drop in quick inet from <{EGRESS_TABLE}> to any\n",
+        guests = files.guests.display(),
+        allow_file = files.allow.display(),
+        lab_file = files.lab.display(),
+    )
+}
+
+/// Read the egress section's files from an installed anchor's text; an
+/// anchor installed before DC-1xx-EPH-9 has none.
+pub fn parse_anchor_egress(text: &str) -> Option<EgressFiles> {
+    let file_of = |table: &str| -> Option<PathBuf> {
+        text.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix(&format!("table <{table}>"))?;
+            let rest = rest
+                .trim()
+                .strip_prefix("persist")?
+                .trim()
+                .strip_prefix("file")?;
+            let path = rest.trim().strip_prefix('"')?.strip_suffix('"')?;
+            (!path.is_empty()).then(|| PathBuf::from(path))
+        })
+    };
+    let blocks = text.lines().any(|line| {
+        line.trim() == format!("block drop in quick inet from <{EGRESS_TABLE}> to any")
+    });
+    blocks.then_some(EgressFiles {
+        guests: file_of(EGRESS_TABLE)?,
+        allow: file_of(EGRESS_ALLOW_TABLE)?,
+        lab: file_of(EGRESS_LAB_TABLE)?,
+    })
+}
+
+/// An IPv4 address or network as a pf table file takes it: `a.b.c.d` or
+/// `a.b.c.d/n`.
+pub fn valid_entry(entry: &str) -> bool {
+    let (address, prefix) = match entry.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (entry, None),
+    };
+    address.parse::<Ipv4Addr>().is_ok()
+        && prefix.is_none_or(|prefix| prefix.parse::<u8>().is_ok_and(|bits| bits <= 32))
+}
+
+/// The entries of an address file (allow or lab): every line that is not a
+/// comment.
+pub fn parse_addresses(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The name an allow file names for the isolation check, if any.
+pub fn parse_check_name(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(CHECK_PREFIX.trim_end()))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Replace an address file atomically: `comments` first (each a line
+/// without its `# `), then one valid entry per line. Refuses an invalid
+/// entry before it writes anything, so pf never loads a file it cannot
+/// read. The rename is what wakes the LaunchDaemon.
+pub fn write_addresses(
+    path: &Path,
+    comments: &[String],
+    entries: &[String],
+) -> std::io::Result<()> {
+    if let Some(bad) = entries.iter().find(|entry| !valid_entry(entry)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not an IPv4 address or network: {bad:?}"),
+        ));
+    }
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "address file has no directory",
+        )
+    })?;
+    let mut text = String::new();
+    for comment in comments {
+        text.push_str("# ");
+        text.push_str(&comment.replace('\n', " "));
+        text.push('\n');
+    }
+    for entry in entries {
+        text.push_str(entry);
+        text.push('\n');
+    }
+    if std::fs::read_to_string(path).is_ok_and(|current| current == text) {
+        return Ok(());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644))?;
+    }
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// The pf rules of the anchor, with the table read from `table_file`. The
+/// egress section ([`egress_rules`]) comes first, with its files beside
+/// `table_file`; then the `internet` rules:
 ///
 /// - The host's connections to the table's guests create state, so their
 ///   replies, such as the guest's side of the service's SSH, pass.
@@ -76,6 +271,8 @@ pass in quick inet proto tcp from <{TABLE}> to self port {port} keep state\n"
     format!(
         "# vm-service guest firewall (DC-14, DC-15), loaded into the pf anchor {ANCHOR}.\n\
 # Generated by {INSTALLER}; reinstall it rather than editing this file.\n\
+{egress}\
+# Internet guests (DC-14, DC-15).\n\
 table <{TABLE}> persist file \"{}\"\n\
 # The host's connections to the guests keep state, so their replies pass.\n\
 pass out quick inet to <{TABLE}> keep state\n\
@@ -84,7 +281,8 @@ pass in quick inet proto udp from <{TABLE}> port 68 to any port 67\n\
 {broker}\
 # Any other connection a guest opens to this host is dropped.\n\
 block drop in quick inet proto {{ tcp udp }} from <{TABLE}> to self\n",
-        table_file.display()
+        table_file.display(),
+        egress = egress_rules(&EgressFiles::beside(table_file)),
     )
 }
 
@@ -376,7 +574,7 @@ mod tests {
         let rules = anchor_rules(&default_table(), None);
         let lines: Vec<&str> = rules
             .lines()
-            .filter(|line| !line.starts_with('#'))
+            .filter(|line| !line.starts_with('#') && !line.contains(EGRESS_TABLE))
             .collect();
         assert_eq!(
             lines,
@@ -397,7 +595,7 @@ mod tests {
         let rules = anchor_rules(&default_table(), Some(DEFAULT_BROKER_PORT));
         let lines: Vec<&str> = rules
             .lines()
-            .filter(|line| !line.starts_with('#'))
+            .filter(|line| !line.starts_with('#') && !line.contains(EGRESS_TABLE))
             .collect();
         assert_eq!(
             lines,
@@ -411,7 +609,9 @@ mod tests {
         );
         // pf evaluates `quick` rules in order: the exception must come first.
         let pass = rules.find("to self port 6241").unwrap();
-        let block = rules.find("block drop").unwrap();
+        let block = rules
+            .find("block drop in quick inet proto { tcp udp }")
+            .unwrap();
         assert!(pass < block);
         assert_eq!(parse_anchor_broker_port(&rules), Some(6241));
         assert_eq!(
@@ -453,6 +653,113 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let table = directory.path().join("internet-guests");
         add_guest(&table, guest("192.168.2.9", "/state", "pilot-a")).unwrap();
+        for file in EgressFiles::beside(&table).all() {
+            write_addresses(file, &[], &[]).unwrap();
+        }
+        let anchor = directory.path().join("anchor");
+        std::fs::write(&anchor, anchor_rules(&table, Some(DEFAULT_BROKER_PORT))).unwrap();
+        let output = Command::new("/sbin/pfctl")
+            .arg("-nf")
+            .arg(&anchor)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pfctl -nf failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// DC-1xx-EPH-9: the egress section passes only the lab's ports and the
+    /// allow table's HTTPS and DNS over TLS, and drops the rest, before any
+    /// `internet` rule.
+    #[test]
+    fn egress_guests_reach_only_the_lab_ports_and_the_allow_table() {
+        let rules = anchor_rules(&default_table(), Some(DEFAULT_BROKER_PORT));
+        let lines: Vec<&str> = rules
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.contains(EGRESS_TABLE))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "table <vm_service_egress> persist file \"/var/db/com.wezzard.vm-service/egress-guests\"",
+                "table <vm_service_egress_allow> persist file \"/var/db/com.wezzard.vm-service/egress-allow\"",
+                "table <vm_service_egress_lab> persist file \"/var/db/com.wezzard.vm-service/egress-lab\"",
+                "pass out quick inet to <vm_service_egress> keep state",
+                "pass in quick inet proto udp from <vm_service_egress> port 68 to any port 67",
+                "pass in quick inet proto tcp from <vm_service_egress> to self port { 6272 6273 } keep state",
+                "pass in quick inet proto tcp from <vm_service_egress> to <vm_service_egress_lab> port { 6272 6273 } keep state",
+                "pass in quick inet proto tcp from <vm_service_egress> to <vm_service_egress_allow> port { 443 853 } keep state",
+                "block drop in quick inet from <vm_service_egress> to any",
+            ]
+        );
+        let egress_block = rules.find("from <vm_service_egress> to any").unwrap();
+        let broker = rules.find("to self port 6241").unwrap();
+        assert!(egress_block < broker, "the egress rules come first");
+        assert_eq!(
+            parse_anchor_egress(&rules),
+            Some(EgressFiles::beside(&default_table()))
+        );
+        assert_eq!(parse_anchor_egress("block drop all\n"), None);
+        // An anchor from before DC-1xx-EPH-9 has no egress section.
+        let old: String = rules
+            .lines()
+            .filter(|line| !line.contains(EGRESS_TABLE))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(parse_anchor_egress(&old), None);
+        assert_eq!(parse_anchor_table(&old), Some(default_table()));
+    }
+
+    #[test]
+    fn address_files_hold_only_valid_entries_and_a_check_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("egress-allow");
+        write_addresses(
+            &path,
+            &["check: api.github.com".into(), "written by a test".into()],
+            &["140.82.112.0/20".into(), "1.1.1.1".into()],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_addresses(&text), vec!["140.82.112.0/20", "1.1.1.1"]);
+        assert_eq!(parse_check_name(&text).as_deref(), Some("api.github.com"));
+        for bad in ["example.com", "1.2.3.4/33", "::1", "1.2.3", ""] {
+            assert!(
+                write_addresses(&path, &[], &[bad.to_string()]).is_err(),
+                "{bad}"
+            );
+        }
+        // A refused write leaves the file as it was.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(parse_check_name("1.1.1.1\n"), None);
+    }
+
+    /// `pfctl -n` parses the whole anchor, egress section included, with
+    /// every table file present.
+    #[test]
+    fn pfctl_accepts_the_egress_section() {
+        if !Path::new("/sbin/pfctl").exists() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let table = directory.path().join("internet-guests");
+        add_guest(&table, guest("192.168.2.9", "/state", "pilot-a")).unwrap();
+        let files = EgressFiles::beside(&table);
+        add_guest(&files.guests, guest("192.168.2.10", "/state", "si-lab-a")).unwrap();
+        write_addresses(
+            &files.allow,
+            &["check: api.github.com".into()],
+            &["140.82.112.0/20".into()],
+        )
+        .unwrap();
+        write_addresses(&files.lab, &[], &["192.0.2.4".into()]).unwrap();
         let anchor = directory.path().join("anchor");
         std::fs::write(&anchor, anchor_rules(&table, Some(DEFAULT_BROKER_PORT))).unwrap();
         let output = Command::new("/sbin/pfctl")

@@ -143,8 +143,9 @@ fn install(table: &Path, owner: Option<u32>, broker_port: Option<u16>) -> Result
             .unwrap_or(false);
         if loaded.contains("block drop in quick") && enabled {
             println!(
-                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}",
-                table.display()
+                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}, and limits the egress guests of {} (DC-1xx-EPH-9)",
+                table.display(),
+                guest_firewall::EgressFiles::beside(table).guests.display()
             );
             println!("{}", loaded.trim_end());
             return Ok(());
@@ -205,6 +206,18 @@ fn prepare_table(table: &Path, uid: u32, gid: u32) -> Result<(), String> {
     chown(table, uid, gid)?;
     std::fs::set_permissions(table, std::fs::Permissions::from_mode(0o644))
         .map_err(|error| error.to_string())?;
+    // The egress section's files (DC-1xx-EPH-9): pf refuses an anchor whose
+    // table file is missing, so each exists, empty until it is written.
+    let egress = guest_firewall::EgressFiles::beside(table);
+    for file in egress.all() {
+        if !file.exists() {
+            guest_firewall::write_addresses(file, &[], &[])
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+        }
+        chown(file, uid, gid)?;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -245,6 +258,15 @@ fn status() -> Result<(), String> {
                     "anchor file: {ANCHOR_FILE} (table file {})",
                     table.display()
                 );
+                match guest_firewall::parse_anchor_egress(&text) {
+                    Some(files) => println!(
+                        "egress section: guests {}, allow {}, lab {} (DC-1xx-EPH-9)",
+                        files.guests.display(),
+                        files.allow.display(),
+                        files.lab.display()
+                    ),
+                    None => println!("egress section: none; egress leases are refused (reinstall for DC-1xx-EPH-9)"),
+                }
                 match parse_anchor_broker_port(&text) {
                     Some(port) => println!("broker port internet guests may reach: {port} (DC-107)"),
                     None => println!("broker port: none; internet guests reach no host port (reinstall for DC-107)"),

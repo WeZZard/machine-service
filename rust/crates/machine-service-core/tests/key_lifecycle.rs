@@ -334,6 +334,7 @@ impl KeyFixture {
             "base",
             None,
             false,
+            false,
         )
     }
 

@@ -37,6 +37,7 @@ fn service_acquire(
 ) -> OpResult<Value> {
     service.acquire(
         purpose, image, env, ttl_hours, None, None, None, wait, "nat", None, "base", None, false,
+        false,
     )
 }
 
@@ -245,6 +246,7 @@ fn test_requested_resources_override_the_image_configuration() {
             None,
             "base",
             None,
+            false,
             false,
         )
         .expect("acquire");
@@ -1698,6 +1700,7 @@ fn test_a_macos_internet_guest_runs_the_dot_forwarder() {
             "base",
             None,
             false,
+            false,
         )
         .expect("acquire");
     assert_eq!(rec["isolation"]["status"], json!("verified"));
@@ -1953,4 +1956,135 @@ fn relay_credentials_end_within_one_ttl_of_the_lease() {
     );
     assert_eq!(relay_credential_until(1_000.0, 0.1, 0.0), 1_000.0);
     assert_eq!(relay_credential_until(1_000.0, 1.0, 0.25), 1_900.0);
+}
+
+/// Write the egress section's allow and lab files beside the fake host's
+/// `internet` table, as `lab-host` does (DC-1xx-EPH-9).
+fn write_egress_lists(fixture: &common::Fixture, allow: &[&str], lab: &[&str]) {
+    use machine_service_core::guest_firewall::{write_addresses, EgressFiles};
+    use machine_service_core::host::Host as _;
+    let files = EgressFiles::beside(&fixture.host.firewall_table());
+    let owned = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
+    };
+    write_addresses(
+        &files.allow,
+        &["check: api.github.com".to_string()],
+        &owned(allow),
+    )
+    .unwrap();
+    write_addresses(&files.lab, &[], &owned(lab)).unwrap();
+}
+
+/// The fake guest answers HTTPS for the check name and not for
+/// `example.com`, as a guest behind the egress fence does.
+fn fence_the_fake_guest(fixture: &common::Fixture) {
+    let mut map = fixture.host.ssh.rc_map.lock().expect("rc_map");
+    map.insert(
+        0,
+        (
+            "https://example.com/".to_string(),
+            (
+                0,
+                "egress name=example.com address=104.20.23.154 https=000".to_string(),
+            ),
+        ),
+    );
+    map.insert(
+        0,
+        (
+            "https://api.github.com/".to_string(),
+            (
+                0,
+                "egress name=api.github.com address=140.82.112.6 https=200".to_string(),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn test_an_egress_lease_is_fenced_by_the_allowlist() {
+    let fixture = common::Fixture::new();
+    write_egress_lists(
+        &fixture,
+        &["140.82.112.0/20", "1.1.1.1", "8.8.8.8"],
+        &["192.0.2.3", "192.0.2.4"],
+    );
+    fence_the_fake_guest(&fixture);
+    let rec = fixture.try_acquire_egress("lab-1").expect("acquire");
+    let vm = rec["vm"].as_str().expect("vm name").to_string();
+    assert_eq!(rec["egress"], json!("allowlist"));
+    // Softnet passes the lab hosts, which pf limits to the lab ports.
+    assert_eq!(
+        run_call(&fixture, &vm),
+        vec![
+            vm.clone(),
+            "--no-graphics".to_string(),
+            "--net-softnet".to_string(),
+            "--net-softnet-allow=192.0.2.3/32,192.0.2.4/32".to_string(),
+        ]
+    );
+    let files = {
+        use machine_service_core::host::Host as _;
+        machine_service_core::guest_firewall::EgressFiles::beside(&fixture.host.firewall_table())
+    };
+    let guests = std::fs::read_to_string(&files.guests).expect("egress guests");
+    assert!(guests.contains(&vm), "{guests}");
+    let isolation = &fixture.read_state()[&vm]["isolation"];
+    assert_eq!(isolation["egress"]["name"], json!("api.github.com"));
+    assert_eq!(isolation["egress_denied"]["https"], json!("000"));
+    fixture.release(&vm);
+    let guests = std::fs::read_to_string(&files.guests).expect("egress guests");
+    assert!(!guests.contains(&vm), "release left the guest: {guests}");
+}
+
+#[test]
+fn test_an_egress_guest_that_reaches_a_name_off_the_list_is_refused() {
+    let fixture = common::Fixture::new();
+    write_egress_lists(&fixture, &["140.82.112.0/20", "1.1.1.1", "8.8.8.8"], &[]);
+    // Only the check name is fenced; example.com still answers 200.
+    fixture.host.ssh.rc_map.lock().expect("rc_map").insert(
+        0,
+        (
+            "https://api.github.com/".to_string(),
+            (
+                0,
+                "egress name=api.github.com address=140.82.112.6 https=200".to_string(),
+            ),
+        ),
+    );
+    let error = fixture
+        .try_acquire_egress("lab-2")
+        .expect_err("an open guest must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("guest egress fence check failed"),
+        "{error}"
+    );
+    assert!(fixture.read_state().is_empty(), "a refused lease stayed");
+}
+
+#[test]
+fn test_an_egress_lease_needs_a_list_that_holds_its_resolvers() {
+    let fixture = common::Fixture::new();
+    write_egress_lists(&fixture, &["140.82.112.0/20"], &[]);
+    let error = fixture
+        .try_acquire_egress("lab-3")
+        .expect_err("no resolvers");
+    assert!(
+        error
+            .to_string()
+            .contains("does not hold the guest resolver 1.1.1.1"),
+        "{error}"
+    );
+    assert!(!fixture.host.tart.ops().contains(&"clone".to_string()));
+    // Without the allow file's check name it is refused too.
+    let fixture = common::Fixture::new();
+    let error = fixture.try_acquire_egress("lab-4").expect_err("no list");
+    assert!(error.to_string().contains("names no check name"), "{error}");
+    assert!(!fixture.host.tart.ops().contains(&"clone".to_string()));
 }

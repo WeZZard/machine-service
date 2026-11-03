@@ -157,6 +157,19 @@ pub trait Host: Send + Sync {
     /// a guest on the `internet` network.
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>>;
 
+    /// Spawn `tart run` as [`Host::spawn_run`] does, letting Softnet pass
+    /// `softnet_allow`, the lab hosts of an egress guest (DC-1xx-EPH-9). A
+    /// host that cannot pass them boots without them.
+    fn spawn_run_allowing(
+        &self,
+        vm: &str,
+        network: GuestNetwork,
+        softnet_allow: &[String],
+    ) -> OpResult<Box<dyn BootProcess>> {
+        let _ = softnet_allow;
+        self.spawn_run(vm, network)
+    }
+
     /// The Softnet executable Tart would run for a guest on the `internet`
     /// network, or the reason, naming Softnet, that Tart cannot run it.
     ///
@@ -433,7 +446,16 @@ impl Host for RealHost {
     }
 
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>> {
-        let child = crate::tart::spawn_run(&self.config, vm, network)?;
+        self.spawn_run_allowing(vm, network, &[])
+    }
+
+    fn spawn_run_allowing(
+        &self,
+        vm: &str,
+        network: GuestNetwork,
+        softnet_allow: &[String],
+    ) -> OpResult<Box<dyn BootProcess>> {
+        let child = crate::tart::spawn_run(&self.config, vm, network, softnet_allow)?;
         Ok(Box::new(ChildBootProcess { child }))
     }
 

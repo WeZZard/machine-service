@@ -571,6 +571,7 @@ fn handle_post(service: &Service, request: &mut Request, url: &str) -> OpResult<
             ));
         }
         machine_service_core::network::validate_request(&body)?;
+        let egress = machine_service_core::network::validate_egress(&body)?;
         let Some(purpose) = body.get("purpose").and_then(Value::as_str) else {
             return Ok((409, json!({"error": "'purpose' (string) is required"})));
         };
@@ -594,6 +595,7 @@ fn handle_post(service: &Service, request: &mut Request, url: &str) -> OpResult<
             body.get("source").and_then(Value::as_str).unwrap_or("base"),
             body.get("expected_source_fingerprint"),
             body.get("vnc").and_then(Value::as_bool).unwrap_or(false),
+            egress,
         )?;
         return Ok((200, record));
     }
