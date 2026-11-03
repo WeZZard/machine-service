@@ -52,6 +52,8 @@ release() {
         -d '{"reason":"relay acceptance client done"}' >/dev/null && echo "released $vm"
 }
 trap release EXIT
+# A signal ends the script through its EXIT trap, so the client VM is released.
+trap 'exit 143' INT TERM HUP
 
 sha=$(shasum -a 256 "$binary" | cut -d' ' -f1)
 curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=relay-acceptance" \

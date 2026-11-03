@@ -172,8 +172,25 @@ clean() {
     [ -f "$dir/plan.env" ] || { echo "relay-lab: no plan, so nothing was deployed"; return 0; }
     load_plan "$dir"
     for target in "$VM_HOST" "$DURABLE"; do
+        release_all "http://$target.local:6272"
         $(host_shell "$target") clean || echo "relay-lab: clean of a target failed" >&2
     done
+}
+
+# Release every lease the lab instance still holds, so that a cancelled run
+# leaves no VM running and no durable lease behind its removed state.
+release_all() {
+    curl -fsS -m 20 "$1/machines" 2>/dev/null | python3 -I -c '
+import json, sys
+for record in json.load(sys.stdin).get("machines") or []:
+    if record.get("lease_id") and record.get("state") in ("pending", "provisioning", "running", "leased"):
+        print(record["name"], record["lease_id"])' 2>/dev/null |
+        while read -r name lease; do
+            curl -fsS -m 600 -X POST "$1/machines/$name/release" -H 'content-type: application/json' \
+                -d "{\"lease_id\":\"$lease\",\"reason\":\"relay lab cleanup\"}" >/dev/null &&
+                echo "relay-lab: released a lease the lab instance still held"
+        done
+    return 0
 }
 
 # One cell under one profile; its report lands in <evidence>/<cell>/<profile>/.
@@ -267,10 +284,25 @@ run() {
         esac
     done
     status=0
+    # Each lane is a process group of its own. A cancelled step signals the
+    # step's shell, or only ends it, so this script stops both lanes and all
+    # they started when it is signalled or orphaned, and nothing goes on
+    # leasing after the job.
+    set -m
     lane "$dir" "$vm_cells" "$profiles" &
     vm_lane=$!
     lane "$dir" "$durable_cells" "$profiles" &
     durable_lane=$!
+    set +m
+    trap 'trap - INT TERM HUP PIPE; kill -TERM -"$vm_lane" -"$durable_lane" 2>/dev/null; wait; exit 143' INT TERM HUP PIPE
+    while kill -0 "$vm_lane" 2>/dev/null || kill -0 "$durable_lane" 2>/dev/null; do
+        if [ "$(ps -o ppid= -p $$ | tr -d ' ')" = 1 ]; then
+            kill -TERM -"$vm_lane" -"$durable_lane" 2>/dev/null || true
+            wait
+            exit 143
+        fi
+        sleep 5
+    done
     wait "$vm_lane" || status=1
     wait "$durable_lane" || status=1
     "$dir/bin/relay-acceptance" summary "$dir/evidence" | tee "$dir/evidence/summary.txt"
