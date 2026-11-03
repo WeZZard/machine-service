@@ -1,6 +1,6 @@
 //! A durable lease's command through the relay agent (DM-4, RA-2, RA-8),
 //! whatever its entry: machine-service's own HTTP exec, or a relay client's
-//! exec or script that the broker hands to this launcher (DC-1xx-LAUNCH-1).
+//! exec or script that the broker hands to this launcher (DC-219).
 //!
 //! The relay agent runs a command line in the desktop session as its own
 //! child, in a new process group, with the agent's environment and home.
@@ -16,14 +16,14 @@
 //! group with the leader's start time, and only then claims the request by
 //! removing it. A release withdraws every request first and reads the
 //! recorded groups after, so a command either is recorded before release
-//! stops the lease's groups or never starts (DC-1xx-LAUNCH-2). The launcher
+//! stops the lease's groups or never starts (DC-220). The launcher
 //! then replaces itself with the lease's shell, so the command keeps the
 //! relay agent as its parent and the agent's responsibility for privacy
 //! permissions, and the agent sees its exit status and output as its own
 //! command's. When the lease has loaded agent keys, it runs the shell as its
 //! child instead and passes the output on with every key redacted, so no
 //! relay message and no record of the relay agent carries one
-//! (DC-1xx-LAUNCH-3). The keys reach the command through its environment
+//! (DC-221). The keys reach the command through its environment
 //! only, never through the relay protocol or a process's arguments (AK-5).
 
 use std::collections::BTreeMap;
@@ -249,7 +249,7 @@ fn launch(path: &Path) -> Result<Never, String> {
     private_file(&request.group, &bytes)?;
     // The claim: the request holds the session's keys and is removed before
     // anything runs. A release that withdrew it first has the command start
-    // nothing (DC-1xx-LAUNCH-2).
+    // nothing (DC-220).
     if let Err(error) = std::fs::remove_file(path) {
         let _ = std::fs::remove_file(&request.group);
         return Err(format!(
@@ -386,7 +386,7 @@ mod tests {
         assert!(!files.request.exists());
     }
 
-    /// DC-1xx-LAUNCH-1: a client's script names no file; the launcher's
+    /// DC-219: a client's script names no file; the launcher's
     /// shell reads it on standard input. One execution's leftovers are
     /// withdrawn alone, and its group's record stays for release.
     #[test]

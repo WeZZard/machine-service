@@ -588,7 +588,7 @@ done
 env | LC_ALL=C sort | grep -v '^_='
 "#;
 
-/// AC-56 on a durable Mac (DC-1xx-LAUNCH-1): a command that a relay client
+/// AC-56 on a durable Mac (DC-219): a command that a relay client
 /// sends runs as the lease's own, through the launcher that machine-service's
 /// HTTP exec uses, so it sees exactly what an HTTP exec of the lease sees,
 /// and no loaded agent key reaches the client unredacted.

@@ -318,7 +318,7 @@ pub(crate) struct JobSpec {
     pub offset: u64,
     pub transient: bool,
     /// Whether a client sent the call, so that the target's launcher, when
-    /// it has one, starts its command (DC-1xx-LAUNCH-1).
+    /// it has one, starts its command (DC-219).
     pub launch: bool,
 }
 

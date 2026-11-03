@@ -1,5 +1,5 @@
 //! TL-2: a target's launcher starts every command its clients send
-//! (DC-1xx-LAUNCH-1), with the broker, real remote sessions on loopback, a
+//! (DC-219), with the broker, real remote sessions on loopback, a
 //! real relay agent core and a test client of the relay protocol.
 
 mod common;

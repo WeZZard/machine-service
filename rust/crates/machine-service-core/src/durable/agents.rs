@@ -336,7 +336,7 @@ pub fn redact(text: &str, secrets: &[Secret]) -> String {
     out
 }
 
-/// [`redact`] over a stream that arrives in pieces (DC-1xx-LAUNCH-3): every
+/// [`redact`] over a stream that arrives in pieces (DC-221): every
 /// occurrence of a value becomes [`REDACTED`], also one split between two
 /// pieces. It holds back only the end of a piece that could begin a value,
 /// so output that cannot hold one passes at once.
@@ -591,7 +591,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// DC-1xx-LAUNCH-3: a stream is redacted as a whole would be, however
+    /// DC-221: a stream is redacted as a whole would be, however
     /// it is split, and only a possible beginning of a value is held back.
     #[test]
     fn a_stream_is_redacted_however_it_is_split() {

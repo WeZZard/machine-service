@@ -586,7 +586,7 @@ fn m4_exec_push_and_pull_run_through_the_relay_agent() {
     assert_eq!(
         lines[0],
         agent.to_string(),
-        "with keys loaded the command is the child of the launcher, the agent's child (DC-1xx-LAUNCH-3)"
+        "with keys loaded the command is the child of the launcher, the agent's child (DC-221)"
     );
     assert_eq!(lines[1], lease);
     assert!(
@@ -775,7 +775,7 @@ fn relay_records_failure(hygiene: &Value) -> Option<String> {
 }
 
 /// DC-173, AK-5: the relay agent's records keep a command's output as the
-/// agent saw it, which the launcher redacted (DC-1xx-LAUNCH-3); release has
+/// agent saw it, which the launcher redacted (DC-221); release has
 /// the agent purge the lease's records, and completes only after the agent
 /// confirms.
 #[test]
@@ -995,7 +995,7 @@ echo "owner=${ANTHROPIC_AUTH_TOKEN:-none}"
 env | LC_ALL=C sort | grep -v '^_='
 "#;
 
-/// DC-1xx-LAUNCH-1, DM-4, AK-5: a relay client's exec and script on a
+/// DC-219, DM-4, AK-5: a relay client's exec and script on a
 /// durable lease start through the lease's launcher, as machine-service's own
 /// exec does: they see the lease's working directory, variables and agent
 /// keys exactly as an HTTP exec sees them, standard input included, and a

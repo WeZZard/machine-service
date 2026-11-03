@@ -14,7 +14,7 @@
 //! launcher: the broker hands each to [`LeaseLauncher`], which writes the
 //! lease's request as machine-service's own exec does, so a command sees the
 //! lease's working directory, variables and agent keys whatever its entry,
-//! and none of them travels in the relay protocol (DC-1xx-LAUNCH-1).
+//! and none of them travels in the relay protocol (DC-219).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -139,7 +139,7 @@ pub(super) struct Started {
 }
 
 /// The broker's launcher of this Mac's relay clients' commands
-/// (DC-1xx-LAUNCH-1).
+/// (DC-219).
 struct LeaseLauncher(Weak<DurableMachine>);
 
 impl relay_broker::Launcher for LeaseLauncher {
@@ -475,7 +475,7 @@ impl DurableMachine {
     }
 
     /// The launched form of a relay client's `exec` or `script` on
-    /// `lease` (DC-1xx-LAUNCH-1): the request of machine-service's own exec,
+    /// `lease` (DC-219): the request of machine-service's own exec,
     /// with the lease's session environment, its keys and its workspace's
     /// `work/` as the working directory, run by the launcher. A script
     /// reaches the launcher's shell on standard input, as the relay agent

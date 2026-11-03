@@ -9,7 +9,7 @@
 //! - [`Broker::run`] and [`Broker::query`] are the same calls for a caller in
 //!   the same process, such as machine-service's HTTP exec, push and pull.
 //! - [`Launcher`] lets the owner of a target start every command a client
-//!   sends it, as machine-service starts a durable lease's (DC-1xx-LAUNCH-1).
+//!   sends it, as machine-service starts a durable lease's (DC-219).
 //! - [`tls`] makes the broker's authority and certificates; [`net`] reads the
 //!   host's names and addresses.
 
@@ -99,7 +99,7 @@ struct Binding {
 /// Called with every relay agent that registers.
 type AgentWatcher = dyn Fn(&Target, &AgentInfo) + Send + Sync;
 
-/// Starts the commands that clients send to one target (DC-1xx-LAUNCH-1).
+/// Starts the commands that clients send to one target (DC-219).
 ///
 /// The broker hands a client's `exec` or `script` to the target's relay
 /// agent as the operation [`Launcher::launch`] answers, once per execution

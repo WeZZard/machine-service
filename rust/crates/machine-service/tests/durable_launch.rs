@@ -1,6 +1,6 @@
 //! TL-2: the durable launcher, `machine-service --durable-launch`, as the
 //! relay agent runs it: in a process group of its own, with standard output
-//! and standard error on one pipe (DM-4, DC-1xx-LAUNCH-2, DC-1xx-LAUNCH-3).
+//! and standard error on one pipe (DM-4, DC-220, DC-221).
 
 mod common;
 
@@ -79,7 +79,7 @@ fn prepared(
     (files, command)
 }
 
-/// DC-1xx-LAUNCH-3: with loaded keys the launcher runs the shell as its
+/// DC-221: with loaded keys the launcher runs the shell as its
 /// child and passes the output on with every key redacted, also a key that
 /// the command writes in pieces; it ends with the command's exit status,
 /// or with its signal. Without keys it becomes the shell itself.
@@ -124,7 +124,7 @@ fn the_launcher_redacts_keys_and_ends_as_the_command_ended() {
     assert_eq!(String::from_utf8(bytes).unwrap().trim(), group.to_string());
 }
 
-/// DC-1xx-LAUNCH-2: a request a release withdrew before the launcher took
+/// DC-220: a request a release withdrew before the launcher took
 /// it starts nothing, and leaves no process group's record behind.
 #[test]
 fn a_withdrawn_request_starts_nothing() {
