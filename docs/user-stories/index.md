@@ -42,7 +42,7 @@ Consolidated, test-linked user stories for the lease-based VM service. Each stor
 | US26 | Agent | Claude Code and Codex reach the gateway with the machine's keys | AC-24 to AC-27, AC-44; [agent keys](../arch/agent-keys.md) |
 | US27 | Agent | Work on a machine on another Mac | AC-28; [federation](../arch/federation.md#fd-4-working-on-a-remote-instance) |
 | US28 | Orchestrator | Every durable lease leaves a hygiene record | AC-30, AC-31, AC-33; [hygiene](../arch/hygiene.md) |
-| US29 | Orchestrator | Leases coexist with the CI runner | AC-32; [hygiene](../arch/hygiene.md#hy-5-coexistence-with-the-ci-runner) |
+| US29 | Orchestrator | Leases coexist with the CI runner | AC-32; [hygiene](../arch/hygiene.md#hy-5-the-lab-runners-hold-the-lease) |
 | US30 | Operator | Rename in one coordinated switch | AC-35, AC-36, AC-45; [rename](../arch/rename.md) |
 | US31 | Operator | Install on a Mac without Tart | AC-38; [rename](../arch/rename.md#mg-4-order-of-migration) |
 | US32 | Operator | The image list follows the images without a restart | AC-39 to AC-42; [image catalog](../arch/image-catalog.md) |

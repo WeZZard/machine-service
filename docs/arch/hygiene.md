@@ -1,4 +1,4 @@
-# Hygiene and CI coexistence (HY)
+# Hygiene and the lab runners (HY)
 
 ## Why
 
@@ -29,7 +29,7 @@
 - A leftover application is first asked to quit with an Apple event (`NSRunningApplication.terminate`, sent through `osascript`) and is given 10 seconds. A leftover process then receives `SIGTERM`, and after 10 more seconds `SIGKILL`. The hygiene record names the last signal: `QUIT`, `TERM` or `KILL`.
 - An application that another program launches for the lease, such as CuaDriver's own `launch_app`, carries that program's environment and is not attributed to the lease.
 - The sweep never ends these processes, whatever the rules above say:
-  - The CI runner and every process that descends from it ([HY-5](#hy-5-coexistence-with-the-ci-runner)).
+  - The CI runners and every process that descends from them ([HY-5](#hy-5-the-lab-runners-hold-the-lease)).
   - Any launchd job's own process that the lease did not start, such as Consul, the service-catalog registrar and machine-service itself.
   - Finder, the Dock, SystemUIServer and the other processes of the login session.
 - The rules are applied to one snapshot of the processes taken before any signal, so stopping a session never hides a descendant that left it.
@@ -48,17 +48,21 @@
   - The free disk space and the `software` section of the capability report ([MM-3](machines.md#mm-3-capability-report)).
 - Each part of the inventory has its own timeout of 60 seconds. A part that fails or times out is recorded as missing, and the others are kept.
 - The global npm packages are recorded as `{name: version}` from the session's `npm ls --global --depth=0 --json`. A crontab entry is recorded as its schedule and its program, keyed by the SHA-256 of its whole line: a change shows, and an argument, such as a token written into a crontab line, never reaches the hygiene record that any LAN client can read (DC-74).
-- The service compares the two inventories and records what was added, removed and changed. The CI runner's processes and files are marked with their origin, so a client does not attribute a CI job's work to the lease.
+- The service compares the two inventories and records what was added, removed and changed. The CI runners' processes and files are marked with their origin, so a client does not attribute a CI job's work to the lease.
 - The lease record keeps `inventory-before.json`, `inventory-after.json` and `changes.json` under the lease's state folder. The release response carries `changes.json` and the paths of the full inventories.
 - `GET /machines/<name>/leases/<lease_id>/hygiene` returns the hygiene record of a current or recent lease for 30 days. Its `relay_records` changes once after release, when a pending purge is confirmed (DC-177).
 
-## HY-5: Coexistence with the CI runner
+## HY-5: The lab runners hold the lease
 
-- The readycheck-dev GitHub Actions runner on 192.0.2.4 and 192.0.2.5 runs as the operator's account, as the LaunchAgent `com.github.actions.runner`, from `~/actions-runner`. machine-service never pauses, stops or reconfigures it (DC-25).
-- A lease may start while a CI job runs, and a CI job may start during a lease. They share the CPU, the memory, the GPU, the disk and the desktop.
-- `ci_runner.busy` in the capability report says whether a job is running when the client asks ([MM-3](machines.md#mm-3-capability-report)). A client that measures performance, or that drives the desktop, can prefer an idle machine. A client that must wait for an idle machine does so itself; the service never makes a busy runner a refusal.
-- During a lease, the service samples whether a CI job runs once a minute, with every GC pass, and also at acquisition, on `POST /gc` and at release. The hygiene record's `ci_busy_intervals` lists `{from, to}` for each stretch a job was seen running, an interval still open at release closing there, and `ci_sampling` gives the interval and the number of samples. A job that starts and ends between two samples is not seen (DC-75). A client can then judge a measurement taken while a job ran.
-- The sweep, the workspace and the inventory never touch `~/actions-runner`. The runner's nightly `com.wezzard.cleanup-runner` job, which removes `~/actions-runner/_work/*/*/target`, is likewise left alone.
+- The durable Macs at 192.0.2.4 and 192.0.2.5 are the lab runners of this repository's lab workflows, and no longer readycheck-dev runners (DC-1xx-LAB-1). Each runs a GitHub Actions runner as the operator's account, as the LaunchAgent `com.github.actions.runner.lab` in the desktop session, from `~/actions-runner-lab`, registered with the labels `self-hosted`, `macOS`, `ARM64` and `lab`. Only lab jobs ask for `lab`; every other job runs on GitHub-hosted runners.
+- **A lab job is a client of machine-service.** The runner's job-started hook (`ACTIONS_RUNNER_HOOK_JOB_STARTED`) acquires its own Mac's durable lease through `machctl acquire --machine <the Mac> --purpose ci-<run id> --env none`, with the Mac's name read from the local instance at run time, and its job-completed hook releases it, with the sweep, the inventory and the relay agent's purge of a release ([DM-7](durable-machine.md#dm-7-release)). When the Mac is leased, the hook fails the job at once with the lease's purpose and end, and the job never starts its steps: a lab job never shares the desktop with a lease, and a lease never starts while a lab job runs, because the job holds the lease (DC-1xx-LAB-2). This supersedes DC-25's coexistence for these Macs.
+- The lease has a TTL of 2 hours and is renewed every 10 minutes for as long as the job's `Runner.Worker` runs, so a job of any length keeps it, and a runner that dies leaves a lease that ends at its TTL. A lease that a job left, because its completed hook never ran, is released by the runner's next job-started hook. The hooks keep the current lease in `~/actions-runner-lab/_lab/lease.json` and each released lease's hygiene record in `_lab/hygiene/<lease_id>.json`, and print nothing that names the Mac, because a hook's output is part of the job's public log (`rust/scripts/lab-runner-hook.sh`).
+- The sweep never ends a runner's processes ([HY-3](#hy-3-leftover-process-sweep)). A runner is any folder `~/actions-runner` or `~/actions-runner-<name>`: its executables, a script there run by an interpreter, and their descendants. The workspace and the inventory never touch those folders, and the inventory marks their processes with the origin `ci`.
+- `ci_runner` in the capability report ([MM-3](machines.md#mm-3-capability-report)) says whether a runner is configured in any of those folders (`present`, `name`, the first configured runner's) and whether a job is running (`busy`). On a lab runner, a running job holds the lease, so a busy runner shows as the lease of purpose `ci-<run id>`; `busy` stays for a runner without the hooks. A client never needs to wait for an idle runner: it waits for the lease, as for any lease ([DM-2](durable-machine.md#dm-2-one-lease-at-a-time)).
+- During a lease, the service still samples whether a CI job runs once a minute, with every GC pass, and also at acquisition, on `POST /gc` and at release. The hygiene record's `ci_busy_intervals` lists `{from, to}` for each stretch a job was seen running, an interval still open at release closing there, and `ci_sampling` gives the interval and the number of samples. A job that starts and ends between two samples is not seen (DC-75). On a lab job's own lease the interval is the job itself; on any other lease it stays empty unless a runner without the hooks ran a job.
+- The old readycheck-dev runner's folder `~/actions-runner` and its LaunchAgent `com.github.actions.runner` are left as they are; the runner is no longer configured there. Its nightly `com.wezzard.cleanup-runner` job, which removes `~/actions-runner/_work/*/*/target`, is likewise left alone.
+- **Only the owner's changes run on the lab runners** (DC-1xx-LAB-3). A lab job runs on a push to a branch of this repository, on a dispatch, and on a pull request only when its head is a branch of this repository. The repository requires approval before a workflow of a pull request from a fork runs, for every outside contributor. A lab workflow's token is limited to `contents: read`, and the workflow uses no secret.
+- One lab job runs at a time, in the concurrency group `lab`. A job holds its own Mac's lease, so the relay acceptance's durable cells target the other durable Mac and its virtual machine cells the VM hosts, all found from `machctl list` at run time, and a job never waits on its own lease ([TL-7](test-layers.md#tl-7-relay-acceptance)).
 
 ## HY-6: Free disk
 

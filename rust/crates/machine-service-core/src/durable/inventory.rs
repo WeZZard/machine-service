@@ -315,7 +315,7 @@ fn launchd_jobs(home: &Path) -> Value {
 }
 
 fn folders(context: &Context) -> Value {
-    // The CI runner's folder is never touched (HY-5), and the workspace
+    // The CI runners' folders are never touched (HY-5), and the workspace
     // root changes with every lease by design.
     let workspace_top = context
         .workspace_root
@@ -323,7 +323,12 @@ fn folders(context: &Context) -> Value {
         .find(|path| path.parent() == Some(context.home.as_path()))
         .map(Path::to_path_buf)
         .unwrap_or_else(|| context.workspace_root.clone());
-    let skip = [context.ci_root.as_path(), workspace_top.as_path()];
+    let runners = super::capabilities::runner_folders(&context.ci_root);
+    let skip: Vec<&Path> = runners
+        .iter()
+        .map(PathBuf::as_path)
+        .chain([workspace_top.as_path()])
+        .collect();
     let mut out = Map::new();
     for folder in [
         context.home.clone(),

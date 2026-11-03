@@ -1,0 +1,121 @@
+name: Lab
+
+# The relay acceptance (docs/arch/test-layers.md, TL-7) on the lab runners:
+# the two durable Macs, each a self-hosted runner labelled `lab` whose job
+# holds its Mac's durable lease while it runs (docs/arch/hygiene.md, HY-5).
+# Only the owner's changes run here: a push to a branch of this repository,
+# a dispatch, and never a pull request from a fork.
+
+on:
+  push:
+    branches: [claude/relay-agent]
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: "Cells: all, or comma-separated IDs such as macos-client.durable-mac"
+        default: all
+      profiles:
+        description: "Network profiles, comma-separated: N0, N1, N2, N3"
+        default: N0,N1,N2,N3
+
+permissions:
+  contents: read
+
+# One acceptance at a time: a job holds its own Mac's lease, and its durable
+# cells lease the other Mac.
+concurrency:
+  group: lab
+  cancel-in-progress: false
+
+jobs:
+  relay-acceptance:
+    name: Relay acceptance (${{ inputs.profiles || 'N0' }})
+    if: >-
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, macOS, ARM64, lab]
+    timeout-minutes: 4320
+    permissions:
+      contents: read
+    env:
+      LAB_CELLS: ${{ inputs.cells || 'all' }}
+      LAB_PROFILES: ${{ inputs.profiles || 'N0' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Before anything prints a path or a name: mask the home folder, the
+      # login, every lab name and address the instances answer and the DNS
+      # search domains, and keep them for the redaction of later output and
+      # of the evidence.
+      - name: Mask the lab's names
+        run: |
+          names="$RUNNER_TEMP/lab-names"
+          {
+            echo "$HOME"
+            id -un
+            machctl list --json | python3 -I -c '
+          import json, sys
+          for instance in json.load(sys.stdin):
+              print(instance["instance"])
+              print(instance.get("address", "").split("//")[-1].rsplit(":", 1)[0])
+              for machine in instance.get("machines") or []:
+                  if machine.get("kind") == "durable":
+                      print(machine["name"])'
+          } | grep -v -x -e '' -e '127.0.0.1' -e localhost | sort -u >"$names.base"
+          domains="$(scutil --dns | awk '/search domain/ {print $4}' | sort -u)"
+          while IFS= read -r value; do
+            printf '%s\n' "$value" "$value.local"
+            printf '%s\n' "$value" "$value.local" | tr 'A-Z' 'a-z'
+            dscacheutil -q host -a name "$value.local" | awk '/address:/ {print $2}'
+          done <"$names.base" >"$names.all"
+          { cat "$names.all"; printf '%s\n' $domains; } | grep -v -x -e '' -e local | sort -u >"$names"
+          rm -f "$names.all"
+          rm -f "$names.base"
+          while IFS= read -r value; do echo "::add-mask::$value"; done <"$names"
+          echo "masked $(wc -l <"$names" | tr -d ' ') values"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Plan the targets
+        run: rust/scripts/relay-lab.sh plan "$RUNNER_TEMP/lab" 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
+
+      - name: Build
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          rustup component add llvm-tools
+          rust/scripts/relay-lab.sh build "$RUNNER_TEMP/lab" 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
+
+      - name: Start the lab instances on the targets
+        run: rust/scripts/relay-lab.sh deploy "$RUNNER_TEMP/lab" 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
+
+      - name: Run the cells
+        run: |
+          rust/scripts/relay-lab.sh run "$RUNNER_TEMP/lab" "$LAB_CELLS" "$LAB_PROFILES" 2>&1 \
+            | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
+
+      - name: Stop the lab instances
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/lab/plan.env" ]; then
+            rust/scripts/relay-lab.sh clean "$RUNNER_TEMP/lab" 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
+          fi
+
+      - name: Redact the evidence
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/lab-evidence"
+          if [ -d "$RUNNER_TEMP/lab/evidence" ]; then
+            rust/scripts/relay-lab.sh scrub "$RUNNER_TEMP/lab-names" "$RUNNER_TEMP/lab/evidence" "$RUNNER_TEMP/lab-evidence"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relay-acceptance-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lab-evidence
+          if-no-files-found: warn
+          retention-days: 30

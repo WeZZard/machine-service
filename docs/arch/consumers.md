@@ -18,7 +18,7 @@
 - **Snapshots.** On a durable machine the relay takes snapshots when the capability report lists `software.cua_driver` and `cua-driver permissions status --json`, run in the lease, answers `source.attribution: "driver-daemon"` with `screen_recording: true`, instead of reading an image catalog. It reads no `permissions` of machine-service, because the `cua-driver serve` LaunchAgent, not machine-service, captures the screen (DC-82, DC-83).
 - **Finish and release.** On a durable machine, `relay_finish` and `relay_release` end the session ([DM-7](durable-machine.md#dm-7-release)) instead of destroying a VM. The relay keeps the release report's hygiene record in the evidence package.
 - **Capacity.** The relay treats `durable machine leased` like the macOS VM limit: it waits, up to `MCP_RELAY_CAPACITY_WAIT`.
-- **Instructions.** The relay's instructions say that a durable machine is a real Mac on the home network, that it is not isolated from the home network ([DM-9](durable-machine.md#dm-9-what-a-durable-lease-does-not-offer)), and that its desktop may be shared with CI jobs ([HY-5](hygiene.md#hy-5-coexistence-with-the-ci-runner)).
+- **Instructions.** The relay's instructions say that a durable machine is a real Mac on the home network, that it is not isolated from the home network ([DM-9](durable-machine.md#dm-9-what-a-durable-lease-does-not-offer)), and that a lab job holds the Mac's lease while it runs, so a lease never shares the desktop with one ([HY-5](hygiene.md#hy-5-the-lab-runners-hold-the-lease)); the relay's instruction text that a CI job may share the desktop predates DC-1xx-LAB-2.
 - **Selected environments.** The selected-environment profile keeps naming a loopback instance, and its fingerprint check keeps applying to the local instance.
 
 ## CN-2: The evaluation runner
@@ -29,7 +29,7 @@
 - **Credentials.** `guest-row.zsh` already accepts `ANTHROPIC_API_KEY` for Claude Code. For Codex it accepts `LITELLM_CODEX_KEY` with the session's `CODEX_HOME` provider ([AK-4](agent-keys.md#ak-4-codex)), so Codex rows, which are refused in clones today for lack of credentials, can run on durable machines.
 - **Permissions.** On a durable machine, SIP is on, so `guest-row.zsh prepare` never writes the permission store. It checks the grants a row needs and refuses the row when one is missing, as it already does in the persistent VM. Screen capture and input go through the cua-driver daemon, whose own grants apply, so the runner reads them with `cua-driver permissions status --json`, as the relay does (CN-1, DC-82). machine-service's `permissions` describe only its own executable ([DM-4](durable-machine.md#dm-4-exec)).
 - **Unreal first.** The Unreal post-process row needs Metal 3, which no Tart VM offers (DC-27). Unreal Engine and its Epic sign-in can be installed once on a durable machine and stay there, which a disposable clone cannot keep.
-- **Recording.** A recorded walkthrough captures the Mac's whole screen. The runner checks `ci_runner.busy` before a row and records the CI busy intervals from the hygiene record, because a CI job may share the desktop during the row.
+- **Recording.** A recorded walkthrough captures the Mac's whole screen. The runner records the CI busy intervals from the hygiene record; on the lab runners a CI job cannot share the desktop during the row, because a lab job holds the lease (DC-1xx-LAB-2), so the intervals stay empty unless a runner without the lease hooks ran a job.
 
 ## CN-3: What a durable machine needs installed
 

@@ -593,11 +593,53 @@ fn software_facts(login_env: &[(String, String)], timeout: Duration) -> Value {
     })
 }
 
-/// The CI runner's presence, name and whether a job runs now (MM-3, HY-5).
+/// The CI runners' presence, name and whether a job runs now (MM-3, HY-5).
+/// A runner is configured when its folder, `ci_root` or a sibling
+/// `<ci_root>-<name>`, holds `.runner`; the name is the first configured
+/// runner's, in the folders' order.
 pub fn ci_runner(ci_root: &Path, uid: u32) -> Value {
-    let runner_file = ci_root.join(".runner");
-    let present = runner_file.is_file();
-    let name = std::fs::read(&runner_file)
+    let names: Vec<Option<String>> = runner_folders(ci_root)
+        .iter()
+        .map(|folder| folder.join(".runner"))
+        .filter(|file| file.is_file())
+        .map(|file| runner_name(&file))
+        .collect();
+    let present = !names.is_empty();
+    let name = names.into_iter().flatten().next();
+    let busy = process::process_table(Some(uid))
+        .iter()
+        .any(|info| info.runs("Runner.Worker") && !info.zombie);
+    json!({"present": present, "busy": busy, "name": name})
+}
+
+/// The runner folders: `ci_root`, then its siblings named
+/// `<ci_root>-<name>` that are folders, sorted (HY-5).
+pub fn runner_folders(ci_root: &Path) -> Vec<PathBuf> {
+    let prefix = ci_root
+        .file_name()
+        .map(|name| format!("{}-", name.to_string_lossy()));
+    let mut siblings: Vec<PathBuf> = match (ci_root.parent(), prefix) {
+        (Some(parent), Some(prefix)) => std::fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.len() > prefix.len() && name.starts_with(&prefix)
+            })
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect(),
+        _ => Vec::new(),
+    };
+    siblings.sort();
+    std::iter::once(ci_root.to_path_buf())
+        .chain(siblings)
+        .collect()
+}
+
+fn runner_name(runner_file: &Path) -> Option<String> {
+    std::fs::read(runner_file)
         .ok()
         .and_then(|bytes| {
             let text = String::from_utf8_lossy(&bytes);
@@ -609,11 +651,7 @@ pub fn ci_runner(ci_root: &Path, uid: u32) -> Value {
                 .get("agentName")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-        });
-    let busy = process::process_table(Some(uid))
-        .iter()
-        .any(|info| info.runs("Runner.Worker") && !info.zombie);
-    json!({"present": present, "busy": busy, "name": name})
+        })
 }
 
 #[cfg(test)]
@@ -795,6 +833,32 @@ mod tests {
         assert_eq!(
             report,
             json!({"present": true, "busy": false, "name": "mini-1"})
+        );
+    }
+
+    /// HY-5 (TL-1): a lab runner beside the old folder, `actions-runner-lab`,
+    /// is found by its folder's name; an unconfigured `actions-runner` and a
+    /// file or a bare `actions-runner-` beside it are not runners.
+    #[test]
+    fn hy5_lab_runner_beside_the_old_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let ci_root = home.path().join("actions-runner");
+        std::fs::create_dir_all(ci_root.join("bin")).unwrap();
+        let lab = home.path().join("actions-runner-lab");
+        std::fs::create_dir_all(&lab).unwrap();
+        std::fs::write(lab.join(".runner"), "{\"agentName\": \"lab-1\"}").unwrap();
+        std::fs::write(home.path().join("actions-runner-notes"), "a file").unwrap();
+        std::fs::create_dir_all(home.path().join("actions-runner-")).unwrap();
+        std::fs::create_dir_all(home.path().join("actions-runnerx")).unwrap();
+        assert_eq!(runner_folders(&ci_root), vec![ci_root.clone(), lab]);
+        assert_eq!(
+            ci_runner(&ci_root, u32::MAX),
+            json!({"present": true, "busy": false, "name": "lab-1"})
+        );
+        std::fs::remove_dir_all(home.path().join("actions-runner-lab")).unwrap();
+        assert_eq!(
+            ci_runner(&ci_root, u32::MAX),
+            json!({"present": false, "busy": false, "name": null})
         );
     }
 }

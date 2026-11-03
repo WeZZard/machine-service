@@ -588,15 +588,10 @@ fn ci_process(
     if CI_EXECUTABLES.iter().any(|name| candidate.runs(name)) {
         return true;
     }
-    let ci_root = ci_root.trim_end_matches('/');
-    if ci_root.is_empty() {
-        return false;
-    }
-    let ci_prefix = format!("{ci_root}/");
     if candidate
         .path
         .as_deref()
-        .is_some_and(|path| path.starts_with(&ci_prefix))
+        .is_some_and(|path| in_runner_folder(path, ci_root))
     {
         return true;
     }
@@ -606,7 +601,24 @@ fn ci_process(
         args.argv
             .iter()
             .take(3)
-            .any(|arg| arg.starts_with(&ci_prefix))
+            .any(|arg| in_runner_folder(arg, ci_root))
+    })
+}
+
+/// Whether `path` lies in a runner folder: `ci_root` itself, or a sibling
+/// named `<ci_root>-<name>`, such as `~/actions-runner-lab`, the lab
+/// runner's (HY-5).
+pub fn in_runner_folder(path: &str, ci_root: &str) -> bool {
+    let ci_root = ci_root.trim_end_matches('/');
+    if ci_root.is_empty() {
+        return false;
+    }
+    path.strip_prefix(ci_root).is_some_and(|rest| {
+        rest.starts_with('/')
+            || rest
+                .strip_prefix('-')
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(name, _)| !name.is_empty())
     })
 }
 
@@ -901,6 +913,44 @@ mod tests {
             ]
         );
         assert!(verdict.spared.is_empty());
+    }
+
+    /// HY-5 (TL-1): a runner folder is the CI root or a sibling named
+    /// `<root>-<name>`, such as the lab runner's; nothing else that shares
+    /// the prefix is.
+    #[test]
+    fn hy5_runner_folders_by_name() {
+        let root = "/home/u/actions-runner";
+        for path in [
+            "/home/u/actions-runner/run.sh",
+            "/home/u/actions-runner-lab/run.sh",
+            "/home/u/actions-runner-lab/bin/Runner.Listener",
+        ] {
+            assert!(in_runner_folder(path, root), "{path}");
+        }
+        for path in [
+            "/home/u/actions-runner",
+            "/home/u/actions-runner-lab",
+            "/home/u/actions-runner-/run.sh",
+            "/home/u/actions-runnerx/run.sh",
+            "/home/u/work/actions-runner-lab/run.sh",
+        ] {
+            assert!(!in_runner_folder(path, root), "{path}");
+        }
+        assert!(!in_runner_folder("/run.sh", ""));
+        let mut lab_script = row(212, 200, 200, 1102, "sh");
+        lab_script.path = Some("/bin/sh".to_string());
+        let arguments = |_pid: i32| -> Option<Arguments> {
+            Some(Arguments {
+                exec_path: "/bin/sh".to_string(),
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "/home/u/actions-runner-lab/run.sh".to_string(),
+                ],
+                env: vec![],
+            })
+        };
+        assert!(ci_process(&lab_script, root, &arguments));
     }
 
     /// AC-30 (TL-1): the CI runner and its descendants, the service, its

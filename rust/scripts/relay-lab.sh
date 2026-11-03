@@ -1,0 +1,316 @@
+#!/bin/sh
+# The relay acceptance (TL-7) on the lab runners: what .github/workflows/lab.yml
+# runs on a durable Mac whose lease its job holds (docs/arch/hygiene.md HY-5,
+# docs/arch/test-layers.md TL-7).
+#
+# The job's own Mac is the macOS client. Every target is found at run time
+# from `machctl list`, never written down:
+#   - the durable cells target the OTHER durable Mac, because this Mac's lease
+#     is the job's own and a job never waits on it;
+#   - the virtual machine cells target the VM host with the fewest running
+#     macOS VMs, and the Ubuntu client VMs are leased from its installed
+#     instance.
+# On each target host the lab's own second instance runs from the folder the
+# lab key's gate keeps (scripts/relay-lab-gate.py), on the lab's ports, beside
+# the installed instance and any other agent's second instance.
+#
+# Usage: relay-lab.sh plan <dir>                write <dir>/plan.env, or fail fast
+#        relay-lab.sh build <dir>               build the host bundle and the clients
+#        relay-lab.sh deploy <dir>              start the lab instances on the targets
+#        relay-lab.sh run <dir> <cells> <profiles>
+#                                               run the cells, each target's in turn,
+#                                               the two targets at once
+#        relay-lab.sh clean <dir>               stop and remove the lab instances
+#        relay-lab.sh redact <names>            filter standard input for a public log
+#        relay-lab.sh scrub <names> <from> <to> copy the evidence's text, redacted
+#
+# <cells> is `all` or a comma-separated list of cell IDs; <profiles> a
+# comma-separated list of N0..N3. The SSH key is ~/.ssh/relay-lab_ed25519.
+set -eu
+
+here="$(cd "$(dirname "$0")" && pwd)"
+rust="$(cd "$here/.." && pwd)"
+key="$HOME/.ssh/relay-lab_ed25519"
+# The lab instance's HTTP, broker and agent-chain ports on every target.
+lab_ports="RELAY_HOST_PORT=6272 RELAY_HOST_SESSION_PORT=6273 RELAY_HOST_AGENT_PORT=6274"
+all_cells="macos-client.macos-vm macos-client.ubuntu-vm ubuntu-client.macos-vm ubuntu-client.ubuntu-vm macos-client.durable-mac ubuntu-client.durable-mac"
+
+die() {
+    echo "relay-lab: $*" >&2
+    exit 1
+}
+
+host_shell() {
+    echo "ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 $1.local"
+}
+
+# plan <dir>: this Mac, the other durable Mac and the VM host, from every
+# instance's listing; refuse when a target is leased or has no room.
+plan() {
+    dir="$1"
+    mkdir -p "$dir"
+    machctl list --json >"$dir/list.json" || die "machctl list failed"
+    python3 -I - "$dir/list.json" >"$dir/plan.env" <<'EOF'
+import json, shlex, sys
+
+instances = json.load(open(sys.argv[1]))
+def fail(message):
+    print(f"relay-lab: {message}", file=sys.stderr)
+    sys.exit(1)
+
+durables = [(i, m) for i in instances for m in i.get("machines") or [] if m.get("kind") == "durable"]
+own = [(i, m) for i, m in durables if i.get("local")]
+if len(own) != 1:
+    fail("this Mac's instance exposes no durable machine; a lab job runs on a durable Mac")
+own_name = own[0][1]["name"]
+if own[0][1].get("purpose", "") and not str(own[0][1].get("purpose")).startswith("ci-"):
+    fail("this Mac is leased to another client")
+others = [(i, m) for i, m in durables if m["name"] != own_name]
+if not others:
+    fail("no other durable Mac answered; the durable cells need one")
+free = [(i, m) for i, m in others if m.get("state") == "available" and not m.get("lease_id")]
+if not free:
+    i, m = others[0]
+    fail(f"the other durable Mac is leased (purpose {m.get('purpose')}, until {m.get('ttl_expires_at')}); "
+         "the lab backs off and runs when the lease ends")
+durable = free[0][1]["name"]
+
+hosts = []
+for i in instances:
+    offers = {m["name"]: m for m in i.get("machines") or [] if m.get("kind") == "virtual"}
+    if not {"macos26", "ubuntu2404"} <= set(offers):
+        continue
+    macos = [m for m in offers.values() if (m.get("concurrency") or {}).get("limit")]
+    running = sum((m.get("concurrency") or {}).get("running") or 0 for m in macos)
+    acquirable = all((offers[n].get("concurrency") or {}).get("acquirable") for n in ("macos26", "ubuntu2404"))
+    if acquirable and i.get("reachable", True):
+        port = i["address"].rsplit(":", 1)[-1].strip("/")
+        hosts.append((running, i["instance"], port))
+if not hosts:
+    fail("no VM host has room for a macOS VM and an Ubuntu VM; the lab backs off")
+hosts.sort(key=lambda h: (h[0], h[1]))
+_, vm_host, vm_port = hosts[0]
+for key, value in (("OWN", own_name), ("DURABLE", durable), ("VM_HOST", vm_host),
+                   ("CLIENT_INSTANCE", f"http://{vm_host}.local:{vm_port}")):
+    print(f"{key}={shlex.quote(value)}")
+EOF
+    echo "plan: this Mac is the macOS client; the durable cells target the other durable Mac; the VM cells one VM host"
+}
+
+load_plan() {
+    [ -f "$1/plan.env" ] || die "no plan in $1; run plan first"
+    # shellcheck disable=SC1091
+    . "$1/plan.env"
+}
+
+musl_env() {
+    llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+    export CC_aarch64_unknown_linux_musl=clang
+    export CFLAGS_aarch64_unknown_linux_musl="--target=aarch64-unknown-linux-gnu"
+    export AR_aarch64_unknown_linux_musl="$llvm_bin/llvm-ar"
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+}
+
+# build <dir>: <dir>/host, the bundle every target runs (the installation's
+# executables, the relay agent's release, network-rig and the host script),
+# and <dir>/bin, the suite for this Mac and for an Ubuntu client.
+build() {
+    dir="$1"
+    cd "$rust"
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    rm -rf "$dir/host" "$dir/bin"
+    mkdir -p "$dir/host" "$dir/bin"
+    scripts/build-release.sh "$dir/host"
+    cargo build --release -p network-rig -p relay-acceptance
+    cp "$target_dir/release/network-rig" "$dir/host/network-rig"
+    cp scripts/relay-acceptance-host.sh "$dir/host/relay-acceptance-host.sh"
+    cp "$target_dir/release/relay-acceptance" "$dir/bin/relay-acceptance"
+    (musl_env && cargo build --release -p relay-acceptance --target aarch64-unknown-linux-musl)
+    cp "$target_dir/aarch64-unknown-linux-musl/release/relay-acceptance" "$dir/bin/relay-acceptance-linux"
+    echo "built: $(du -sh "$dir/host" | cut -f1) for each target"
+}
+
+# deploy <dir>: the bundle to both targets through their gates, and the lab
+# instance started on each, the durable Mac's with exposure on.
+deploy() {
+    dir="$1"
+    load_plan "$dir"
+    for target in "$VM_HOST" "$DURABLE"; do
+        stage="$dir/stage-$(printf %s "$target" | shasum | cut -c1-8)"
+        rm -rf "$stage"
+        cp -R "$dir/host" "$stage"
+        {
+            for port in $lab_ports; do echo "$port"; done
+            [ "$target" = "$DURABLE" ] && echo "RELAY_HOST_DURABLE=1"
+            true
+        } >"$stage/host.env"
+        tar -czf - -C "$stage" . | $(host_shell "$target") deploy
+        rm -rf "$stage"
+        $(host_shell "$target") relay-acceptance-host.sh start
+    done
+}
+
+clean() {
+    dir="$1"
+    load_plan "$dir"
+    for target in "$VM_HOST" "$DURABLE"; do
+        $(host_shell "$target") clean || echo "relay-lab: clean of a target failed" >&2
+    done
+}
+
+# One cell under one profile; its report lands in <evidence>/<cell>/<profile>/.
+cell() {
+    dir="$1" cell="$2" profile="$3"
+    evidence="$dir/evidence"
+    logs="$evidence/logs"
+    mkdir -p "$logs"
+    case "$cell" in
+    *.durable-mac) target="$DURABLE" image="" ;;
+    *.macos-vm) target="$VM_HOST" image=macos26 ;;
+    *.ubuntu-vm) target="$VM_HOST" image=ubuntu2404 ;;
+    esac
+    set -- --cell "$cell" --profile "$profile" --instance "http://$target.local:6272" \
+        --host-shell "$(host_shell "$target")" --host-script relay-acceptance-host.sh \
+        --purpose "lab-$(printf %s "$cell-$profile" | tr 'A-Z.' 'a-z-')"
+    [ -n "$image" ] && set -- "$@" --image "$image"
+    log="$logs/$cell-$profile.log"
+    echo "[$cell $profile] started"
+    status=0
+    case "$cell" in
+    macos-client.*)
+        "$dir/bin/relay-acceptance" run "$@" --evidence "$evidence" >"$log" 2>&1 || status=$?
+        ;;
+    ubuntu-client.*)
+        stage="$dir/uc-$cell-$profile"
+        rm -rf "$stage"
+        sh "$here/relay-acceptance-ubuntu-client.sh" "$CLIENT_INSTANCE" "$dir/bin/relay-acceptance-linux" \
+            "$stage" "$@" >"$log" 2>&1 || status=$?
+        if [ -d "$stage/$cell/$profile" ]; then
+            mkdir -p "$evidence/$cell"
+            rm -rf "${evidence:?}/$cell/$profile"
+            mv "$stage/$cell/$profile" "$evidence/$cell/$profile"
+        fi
+        [ -f "$stage/run.log" ] && mv "$stage/run.log" "$logs/$cell-$profile.client.log"
+        rm -rf "$stage"
+        [ -f "$evidence/$cell/$profile/report.json" ] || status=1
+        ;;
+    esac
+    grep -E "^$cell AC-[0-9]+: " "$log" "$logs/$cell-$profile.client.log" 2>/dev/null | sed 's/^[^:]*://' | sort -u || true
+    echo "[$cell $profile] ended with status $status"
+    return "$status"
+}
+
+# A lane runs its cells in turn, profile by profile.
+lane() {
+    dir="$1" cells="$2" profiles="$3"
+    failed=0
+    for profile in $profiles; do
+        for c in $cells; do
+            cell "$dir" "$c" "$profile" || failed=1
+        done
+    done
+    return "$failed"
+}
+
+run() {
+    dir="$1"
+    load_plan "$dir"
+    wanted="$(printf %s "$2" | tr ',' ' ')"
+    [ "$wanted" = all ] && wanted="$all_cells"
+    profiles="$(printf %s "$3" | tr ',' ' ')"
+    for c in $wanted; do
+        case " $all_cells " in *" $c "*) ;; *) die "unknown cell $c" ;; esac
+    done
+    for p in $profiles; do
+        case "$p" in N0 | N1 | N2 | N3) ;; *) die "unknown profile $p" ;; esac
+    done
+    vm_cells="" durable_cells=""
+    for c in $all_cells; do
+        case " $wanted " in *" $c "*) ;; *) continue ;; esac
+        case "$c" in
+        *.durable-mac) durable_cells="$durable_cells $c" ;;
+        *) vm_cells="$vm_cells $c" ;;
+        esac
+    done
+    status=0
+    lane "$dir" "$vm_cells" "$profiles" &
+    vm_lane=$!
+    lane "$dir" "$durable_cells" "$profiles" &
+    durable_lane=$!
+    wait "$vm_lane" || status=1
+    wait "$durable_lane" || status=1
+    "$dir/bin/relay-acceptance" summary "$dir/evidence" | tee "$dir/evidence/summary.txt"
+    return "$status"
+}
+
+# The redaction every public output passes through: the names and addresses
+# the runner discovered (one per line in <names>: names, addresses and DNS
+# search domains), the lab's private range, home folders and the login.
+redactor() {
+    cat <<'EOF'
+import os, re, sys
+
+def redactor(names_file):
+    values = sorted({line.strip() for line in open(names_file) if line.strip()}, key=len, reverse=True)
+    login = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
+    rules = [(re.compile(re.escape(v), re.IGNORECASE), f"<lab-{i}>") for i, v in enumerate(values)]
+    rules += [
+        (re.compile(re.escape(os.path.dirname(os.path.expanduser("~"))) + r"/[^/\s\"']+"), "~"),
+        (re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"), "<lan-address>"),
+        (re.compile(re.escape(login) + "@"), "<user>@"),
+    ]
+    def apply(text):
+        for pattern, replacement in rules:
+            text = pattern.sub(replacement, text)
+        return text
+    return apply
+EOF
+}
+
+redact() {
+    python3 -I -c "$(redactor)
+import sys
+apply = redactor(sys.argv[1])
+for line in sys.stdin:
+    sys.stdout.write(apply(line))
+    sys.stdout.flush()" "$1"
+}
+
+# scrub <names> <from> <to>: the evidence's text files, redacted; no
+# certificate, key, image or copied tool goes public.
+scrub() {
+    python3 -I -c "$(redactor)
+import os, shutil, sys
+apply = redactor(sys.argv[1])
+src, dst = sys.argv[2], sys.argv[3]
+kept = skipped = 0
+for root, dirs, files in os.walk(src):
+    dirs[:] = [d for d in dirs if d not in ('mitmproxy', 'cache')]
+    for name in files:
+        path = os.path.join(root, name)
+        if not name.endswith(('.json', '.jsonl', '.log', '.txt', '.out', '.err')):
+            skipped += 1
+            continue
+        out = os.path.join(dst, apply(os.path.relpath(path, src)))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(path, errors='replace') as reader, open(out, 'w') as writer:
+            for line in reader:
+                writer.write(apply(line))
+        kept += 1
+print(f'scrubbed {kept} text files; left out {skipped} others (images, certificates, keys, copied tools)')
+" "$1" "$2" "$3"
+}
+
+case "${1:-}" in
+plan) plan "${2:?dir}" ;;
+build) build "${2:?dir}" ;;
+deploy) deploy "${2:?dir}" ;;
+run) run "${2:?dir}" "${3:-all}" "${4:-N0}" ;;
+clean) clean "${2:?dir}" ;;
+redact) redact "${2:?names}" ;;
+scrub) scrub "${2:?names}" "${3:?from}" "${4:?to}" ;;
+*)
+    sed -n '/^# Usage:/,/^# <cells>/p' "$0" >&2
+    exit 2
+    ;;
+esac
