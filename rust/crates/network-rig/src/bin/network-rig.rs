@@ -49,7 +49,8 @@ fn usage() -> ! {
 --upstream <addr:port> --upstream-ca <pem> --broker-name <name> [--listen <addr:port> [--admit any|guests]] \
 [--edge-ca-key <pem> --edge-ca-cert <pem> [--edge-ca-name <file>]] [--edge-host-addresses] \
 --run-dir <dir> [--no-play]\n       \
-network-rig ctl --run-dir <dir> <json request>"
+network-rig ctl --run-dir <dir> <json request>\n       \
+network-rig fetch   (into NETWORK_RIG_CACHE)"
     );
     std::process::exit(2)
 }
@@ -115,6 +116,20 @@ fn main() {
     let args = Args::parse(args);
     match command.as_str() {
         "serve" => serve(&args),
+        // Fill NETWORK_RIG_CACHE with this platform's pinned tools, checked
+        // by their hashes, so a lab runner VM that reaches only GitHub
+        // finds them there (docs/arch/lab-runners.md, LR-9).
+        "fetch" => {
+            for tool in [
+                network_rig::tools::Tool::Toxiproxy,
+                network_rig::tools::Tool::Mitmdump,
+            ] {
+                match network_rig::tools::ensure(tool) {
+                    Ok(path) => println!("{}", path.display()),
+                    Err(error) => fail(error),
+                }
+            }
+        }
         "ctl" => {
             let dir = PathBuf::from(args.need("run-dir"));
             let request = args.rest.first().unwrap_or_else(|| usage());

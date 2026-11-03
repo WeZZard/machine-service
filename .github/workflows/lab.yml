@@ -1,0 +1,227 @@
+name: Lab
+
+# The relay acceptance (docs/arch/test-layers.md, TL-7) on the lab's
+# ephemeral runners (docs/arch/lab-runners.md): every lab job runs in a fresh
+# VM that a VM host's dispatcher leases for it from the host's lab instance,
+# with a one-job runner and a network limited to GitHub and the lab
+# instances, and the VM is deleted afterwards. No step builds or fetches
+# anything in a runner VM: the build job runs on GitHub-hosted runners.
+# VM cells run on a push to claude/relay-agent of this repository and on a
+# dispatch; durable cells run only on the owner's dispatch, because they run
+# commands on a real Mac as the owner (DC-1xx-EPH-5). No pull request runs
+# here, and no secret is used.
+
+on:
+  push:
+    branches: [claude/relay-agent]
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: "VM cells: all, or comma-separated IDs such as macos-client.macos-vm"
+        default: all
+      profiles:
+        description: "Network profiles, comma-separated: N0, N1, N2, N3"
+        default: N0
+      durable:
+        description: "Also run the durable cells (the owner's dispatch only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One run per ref at a time; a newer run waits rather than cancel one that
+# holds VMs. Per host, the dispatcher's capacity rule is the limit (LR-7).
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the cells
+    if: >-
+      github.repository == 'WeZZard/vm-service' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/claude/relay-agent') ||
+       github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    outputs:
+      vm: ${{ steps.plan.outputs.vm }}
+      durable: ${{ steps.plan.outputs.durable }}
+      profiles: ${{ steps.plan.outputs.profiles }}
+    steps:
+      - id: plan
+        env:
+          CELLS: ${{ inputs.cells || 'all' }}
+          PROFILES: ${{ inputs.profiles || 'N0' }}
+          DURABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.durable && github.actor == github.repository_owner }}
+        run: |
+          python3 -I - <<'EOF' >>"$GITHUB_OUTPUT"
+          import json, os, re
+          labels = {
+              "macos-client.macos-vm": ["self-hosted", "lab-macos", "lab-macos-target"],
+              "macos-client.ubuntu-vm": ["self-hosted", "lab-macos"],
+              "ubuntu-client.macos-vm": ["self-hosted", "lab-ubuntu", "lab-macos-target"],
+              "ubuntu-client.ubuntu-vm": ["self-hosted", "lab-ubuntu"],
+          }
+          durable = {
+              "macos-client.durable-mac": ["self-hosted", "lab-macos"],
+              "ubuntu-client.durable-mac": ["self-hosted", "lab-ubuntu"],
+          }
+          asked = [c.strip() for c in os.environ["CELLS"].split(",") if c.strip()]
+          vm = [c for c in labels if "all" in asked or c in asked]
+          unknown = [c for c in asked if c != "all" and c not in labels]
+          if unknown:
+              raise SystemExit("unknown VM cells: %s" % ", ".join(unknown))
+          profiles = [p.strip() for p in os.environ["PROFILES"].split(",") if p.strip()]
+          if not profiles or any(not re.fullmatch(r"N[0-3]", p) for p in profiles):
+              raise SystemExit("profiles must be N0 to N3")
+          def matrix(cells, table):
+              return json.dumps({"include": [
+                  {"cell": c, "client": c.split("-client")[0], "labels": table[c]} for c in cells]})
+          print("vm=" + matrix(vm, labels))
+          take = os.environ["DURABLE"] == "true"
+          print("durable=" + matrix(list(durable) if take else [], durable))
+          print("profiles=" + ",".join(profiles))
+          EOF
+
+  build:
+    name: Build the client (${{ matrix.client }})
+    needs: plan
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - client: macos
+            runner: macos-15
+            target: ""
+          - client: ubuntu
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: musl-gcc
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
+      - name: Build relay-acceptance and fetch the rig's pinned tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          out="$RUNNER_TEMP/client"
+          mkdir -p "$out"
+          if [ -n "$TARGET" ]; then
+            cargo build --release --target "$TARGET" -p relay-acceptance -p network-rig
+            bin="target/$TARGET/release"
+          else
+            cargo build --release -p relay-acceptance -p network-rig
+            bin="target/release"
+          fi
+          cp "$bin/relay-acceptance" "$out/"
+          NETWORK_RIG_CACHE="$out/rig-cache" "$bin/network-rig" fetch
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-client-${{ matrix.client }}
+          path: ${{ runner.temp }}/client
+          if-no-files-found: error
+          retention-days: 3
+
+  vm-cells:
+    name: ${{ matrix.cell }}
+    needs: [plan, build]
+    if: needs.plan.outputs.vm != '' && fromJSON(needs.plan.outputs.vm).include[0] != null
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.vm) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      CELL: ${{ matrix.cell }}
+      PROFILES: ${{ needs.plan.outputs.profiles }}
+    defaults:
+      run:
+        shell: bash
+    steps: &cell-steps
+      # Before anything prints a name: mask every lab name and address the
+      # dispatcher's plan holds.
+      - name: Mask the lab's names
+        run: |
+          python3 -I -c '
+          import json, os
+          plan = json.load(open(os.environ["LAB_PLAN"]))
+          for item in plan.get("instances", []):
+              for value in (item["name"], item["name"] + ".local", item["name"].lower(), item["address"]):
+                  print("::add-mask::" + value)'
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lab-client-${{ matrix.client }}
+          path: ${{ runner.temp }}/client
+
+      - name: Run the cell
+        run: |
+          set -o pipefail
+          rust/scripts/lab-cell.sh run "$CELL" "$PROFILES" "$RUNNER_TEMP/client" "$RUNNER_TEMP/evidence" 2>&1 \
+            | rust/scripts/lab-cell.sh redact
+
+      - name: Release this run's leases
+        if: always()
+        run: rust/scripts/lab-cell.sh clean 2>&1 | rust/scripts/lab-cell.sh redact
+
+      - name: Redact the evidence
+        if: always()
+        run: rust/scripts/lab-cell.sh scrub "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/lab-evidence"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: lab-evidence-${{ matrix.cell }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lab-evidence
+          if-no-files-found: warn
+          retention-days: 30
+
+  durable-cells:
+    name: ${{ matrix.cell }}
+    needs: [plan, build]
+    # The owner's dispatch only (DC-1xx-EPH-5); the plan names no durable
+    # cell otherwise.
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.durable &&
+      github.actor == github.repository_owner &&
+      fromJSON(needs.plan.outputs.durable).include[0] != null
+    concurrency:
+      group: lab-durable
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.durable) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      CELL: ${{ matrix.cell }}
+      PROFILES: ${{ needs.plan.outputs.profiles }}
+    defaults:
+      run:
+        shell: bash
+    steps: *cell-steps
