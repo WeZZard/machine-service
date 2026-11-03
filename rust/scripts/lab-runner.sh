@@ -164,6 +164,10 @@ heartbeat() {
 # LaunchAgent never finds an earlier runner still listening.
 session() {
     cd "$runner"
+    # sshd's PATH is the system's; the runner's own, which config.sh wrote,
+    # is what its hooks and jobs need (machctl, cargo, Homebrew).
+    PATH="$(cat .path)"
+    export PATH
     # Its own process group, which run.sh, its helper and the listener share.
     set -m
     ACTIONS_RUNNER_SVC=1 ./run.sh &
