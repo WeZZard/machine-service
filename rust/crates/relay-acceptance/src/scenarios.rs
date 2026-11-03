@@ -1285,7 +1285,7 @@ fn ac61(ctx: &mut Ctx<'_>) -> Verdict {
             answer.text()
         }),
     );
-    let lines = client.run("wc -l < ~/acc61.txt")?;
+    let lines = client.run("wc -l < ~/acc61.txt; rm -f ~/acc61.txt")?;
     ctx.check(
         "the file holds one line",
         expect(lines.trim() == "1", || format!("{} lines", lines.trim())),
@@ -1453,7 +1453,7 @@ fn restart_case(
     let again = client.call(&execution, op, b"", true)?;
     let again = client.wait(again, Duration::from_secs(900))?;
     std::thread::sleep(Duration::from_secs(25));
-    let lines = client.run(&format!("cat {file} 2>/dev/null | wc -l"))?;
+    let lines = client.run(&format!("cat {file} 2>/dev/null | wc -l; rm -f {file}"))?;
     let lines: u32 = lines.trim().parse().unwrap_or(99);
     ctx.record(&format!("{what}_lines"), json!(lines));
     ctx.check(
