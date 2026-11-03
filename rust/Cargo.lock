@@ -652,6 +652,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lab-runners"
+version = "0.2.0-rc.3"
+dependencies = [
+ "guest-dot-forwarder",
+ "guest-firewall",
+ "libc",
+ "machine-service-core",
+ "rand",
+ "second-instance",
+ "serde_json",
+ "service-layout",
+ "sha2",
+ "tempfile",
+ "tiny_http",
+ "ureq",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1064,6 +1082,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1381,8 +1400,11 @@ dependencies = [
  "base64 0.23.1",
  "log",
  "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
+ "webpki-roots",
 ]
 
 [[package]]

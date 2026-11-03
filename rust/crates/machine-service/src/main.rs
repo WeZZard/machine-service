@@ -444,6 +444,9 @@ fn handle_get(service: &Service, request: &mut Request, url: &str) -> OpResult<(
         durable_routes::health(&mut body, offers_virtual(service));
         if let Some(marker) = machine_service_core::second::get() {
             body["second_instance"] = json!({"id": marker.id});
+            if let Some(cell) = &marker.durable_cell {
+                body["second_instance"]["durable_cell"] = json!(cell);
+            }
         }
         if let Some(relay) = service.relay() {
             for (key, value) in relay.discovery() {

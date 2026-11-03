@@ -516,11 +516,26 @@ impl RealTarget {
     /// durable exposure off loopback must name this cell (DC-243),
     /// and the run's evidence keeps it as `host-exposure.json`.
     fn record_exposure(&mut self, cell: Cell, run_dir: &Path) -> Result<(), String> {
-        let control = self
-            .settings
-            .host
-            .as_ref()
-            .ok_or("a durable cell needs --host-shell, to record what its instance exposes")?;
+        let Some(control) = self.settings.host.as_ref() else {
+            // A lab instance, which a job reaches without host control,
+            // says the same in its `/health` (DC-1xx-EPH-2).
+            let health = self
+                .discovery
+                .as_ref()
+                .map(|discovery| discovery.health.clone())
+                .or_else(|| {
+                    self.instance
+                        .discover()
+                        .ok()
+                        .map(|discovery| discovery.health)
+                })
+                .ok_or("a durable cell needs --host-shell or the instance's /health")?;
+            let exposure = exposure_of_health(&health, self.instance.base());
+            let text = serde_json::to_string_pretty(&exposure).map_err(|e| e.to_string())?;
+            std::fs::write(run_dir.join("host-exposure.json"), &text).map_err(|e| e.to_string())?;
+            self.note("host exposure", exposure.clone());
+            return exposure_admits(&exposure, &cell.id());
+        };
         let text = control.run(&["exposure"])?;
         let exposure: Value = serde_json::from_str(text.trim())
             .map_err(|e| format!("the host's exposure is not JSON ({e}): {}", text.trim()))?;
@@ -545,13 +560,41 @@ never restarts the installed instance's agent",
     }
 }
 
+/// What an instance exposes, from its `/health` and the URL it was reached
+/// at: durable exposure when it offers a durable machine, and the cells its
+/// launcher named.
+pub fn exposure_of_health(health: &Value, base: &str) -> Value {
+    let durable = health["kinds"]
+        .as_array()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "durable"));
+    let host = base
+        .split_once("://")
+        .map_or(base, |(_, rest)| rest)
+        .rsplit_once(':')
+        .map_or(base, |(host, _)| host);
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    json!({
+        "source": "health",
+        "durable": durable,
+        "loopback": loopback,
+        "durable_cell": health["second_instance"]["durable_cell"],
+    })
+}
+
 /// Whether a durable cell may run against an instance exposing `exposure`:
 /// durable exposure on, and, off loopback, for this cell.
 fn exposure_admits(exposure: &Value, cell: &str) -> Result<(), String> {
     if exposure["durable"] != true {
         return Err("the instance has durable exposure off".into());
     }
-    if exposure["loopback"] != true && exposure["durable_cell"] != cell {
+    let named = exposure["durable_cell"]
+        .as_str()
+        .is_some_and(|cells| second_instance::names_cell(cells, cell));
+    if exposure["loopback"] != true && !named {
         return Err(format!(
             "the instance exposes its Mac on {} for cell {}, not for {cell}",
             exposure["bind"], exposure["durable_cell"]
@@ -727,6 +770,29 @@ mod tests {
         let local = json!({"durable": true, "loopback": true, "durable_cell": null});
         assert!(exposure_admits(&local, "macos-client.durable-mac").is_ok());
         assert!(exposure_admits(&json!({"durable": false, "loopback": true}), "x").is_err());
+        // A lab instance serves both durable cells (DC-1xx-EPH-2).
+        let lab = json!({"durable": true, "loopback": false,
+            "durable_cell": "macos-client.durable-mac,ubuntu-client.durable-mac"});
+        assert!(exposure_admits(&lab, "ubuntu-client.durable-mac").is_ok());
+        assert!(exposure_admits(&lab, "macos-client.macos-vm").is_err());
+    }
+
+    #[test]
+    fn a_lab_instances_exposure_comes_from_its_health() {
+        let health = json!({"kinds": ["durable", "virtual"],
+            "second_instance": {"id": "lab", "durable_cell": "macos-client.durable-mac"}});
+        let exposure = exposure_of_health(&health, "http://mac-b:6272");
+        assert_eq!(exposure["durable"], true);
+        assert_eq!(exposure["loopback"], false);
+        assert!(exposure_admits(&exposure, "macos-client.durable-mac").is_ok());
+        assert!(exposure_admits(&exposure, "ubuntu-client.durable-mac").is_err());
+        let local = exposure_of_health(
+            &json!({"kinds": ["durable"], "second_instance": {"id": "x"}}),
+            "http://127.0.0.1:6250",
+        );
+        assert_eq!(local["loopback"], true);
+        let off = exposure_of_health(&json!({"kinds": ["virtual"]}), "http://mac-a:6272");
+        assert!(exposure_admits(&off, "macos-client.durable-mac").is_err());
     }
 
     #[test]

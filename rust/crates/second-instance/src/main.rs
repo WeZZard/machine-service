@@ -5,7 +5,7 @@
 //! ```text
 //! second-instance start --root DIR --port N --session-port N --tart-home DIR
 //!     [--bind ADDR] [--guest-link ssh|ssh-session|relay] [--executable PATH]
-//!     [--durable [--durable-cell CELL]] [--env NAME=VALUE]...
+//!     [--durable [--durable-cell CELL[,CELL]]] [--id ID] [--env NAME=VALUE]...
 //! second-instance restart --root DIR     # the daemon only; leases live on
 //! second-instance stop --root DIR        # releases, deletes and removes everything
 //! second-instance status --root DIR
@@ -31,8 +31,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use second_instance::{
-    is_loopback, is_wildcard, overlaps, owned_agent_label, Manifest, INSTALLED_CONFIG,
-    INSTALLED_PORT, INSTALLED_SESSION_PORT, INSTALLED_STATE, MARKER_VARIABLE,
+    is_loopback, is_wildcard, overlaps, owned_agent_label, Manifest, DURABLE_CELL_VARIABLE,
+    INSTALLED_CONFIG, INSTALLED_PORT, INSTALLED_SESSION_PORT, INSTALLED_STATE, MARKER_VARIABLE,
     SESSION_HOST_VARIABLE,
 };
 use serde_json::{json, Value};
@@ -43,8 +43,9 @@ const PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sb
 /// The caller's variables the daemon keeps.
 const INHERITED: [&str; 5] = ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG"];
 /// The variables the launcher sets itself, which `--env` may not.
-const OWNED: [&str; 12] = [
+const OWNED: [&str; 13] = [
     MARKER_VARIABLE,
+    DURABLE_CELL_VARIABLE,
     SESSION_HOST_VARIABLE,
     "MACHINE_SERVICE_PORT",
     "MACHINE_SERVICE_HOST",
@@ -79,7 +80,7 @@ fn main() {
 
 fn usage() -> String {
     "usage: second-instance start --root DIR --port N --session-port N --tart-home DIR \
-[--bind ADDR] [--guest-link LINK] [--executable PATH] [--durable [--durable-cell CELL]] \
+[--bind ADDR] [--guest-link LINK] [--executable PATH] [--durable [--durable-cell CELL[,CELL]]] [--id ID] \
 [--env NAME=VALUE]... | restart|stop|status|exposure --root DIR"
         .into()
 }
@@ -286,6 +287,7 @@ name it with --durable-cell"
             "tart-home",
             "executable",
             "guest-link",
+            "id",
         ]
         .contains(&key.as_str())
         {
@@ -345,6 +347,9 @@ fn environment(m: &Manifest, extra: &[String]) -> Result<BTreeMap<String, String
     env.extend(owned.into_iter().map(|(k, v)| (k.to_string(), v)));
     if m.durable {
         env.insert("MACHINE_SERVICE_EXPOSE_DURABLE".into(), "on".into());
+    }
+    if let Some(cell) = &m.durable_cell {
+        env.insert(DURABLE_CELL_VARIABLE.into(), cell.clone());
     }
     if is_loopback(&m.bind) {
         env.insert("MACHINE_SERVICE_RELAY_URL".into(), relay_url);
@@ -415,9 +420,31 @@ fn mkdir(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The ID `--id` asks for: 1 to 16 lower-case letters and digits, so a
+/// long-lived instance, such as the lab's (DC-1xx-EPH-2), has a stable ID
+/// and clone prefix.
+fn requested_id(args: &[String]) -> Result<Option<String>, String> {
+    match flags(args)?.values.get("id") {
+        None => Ok(None),
+        Some(id) if second_instance::valid_id(id) => Ok(Some(id.clone())),
+        Some(id) => Err(format!(
+            "--id {id:?} must be 1 to 16 lower-case letters and digits"
+        )),
+    }
+}
+
 fn start(args: &[String]) -> Result<(), String> {
     let root = root_of(args)?;
+    let requested = requested_id(args)?;
     if let Some(existing) = Manifest::read(&root)? {
+        if requested.as_ref().is_some_and(|id| id != &existing.id) {
+            return Err(format!(
+                "{} holds the second instance {}, not {}; stop it first",
+                root.display(),
+                existing.id,
+                requested.unwrap_or_default()
+            ));
+        }
         let wanted = plan(args, &existing.id, existing.created_root)?;
         if !same(&existing, &wanted) {
             return Err(format!(
@@ -440,7 +467,8 @@ fn start(args: &[String]) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(format!("{}: {e}", root.display())),
     };
-    let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let id =
+        requested.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..8].to_string());
     let manifest = plan(args, &id, created_root)?;
     for port in [manifest.port, manifest.session_port] {
         TcpListener::bind((manifest.bind.as_str(), port)).map_err(|e| {
@@ -923,6 +951,47 @@ mod tests {
                 || n.as_str() == "PATH"),
             "{names:?}"
         );
+    }
+
+    /// DC-1xx-EPH-2: a long-lived instance asks for its ID, and the cells
+    /// its durable exposure is for reach the daemon.
+    #[test]
+    fn a_requested_id_and_durable_cells_reach_the_daemon() {
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["--root", "/owned/root"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(requested_id(&args(&[])).unwrap(), None);
+        assert_eq!(
+            requested_id(&args(&["--id", "lab"])).unwrap().as_deref(),
+            Some("lab")
+        );
+        for bad in ["Lab", "lab-1", "", "abcdefghijklmnopq"] {
+            assert!(requested_id(&args(&["--id", bad])).is_err(), "{bad}");
+        }
+        let mut m = manifest("192.0.2.4");
+        m.durable = true;
+        m.durable_cell = Some("macos-client.durable-mac,ubuntu-client.durable-mac".into());
+        let env = environment(&m, &[]).unwrap();
+        assert_eq!(
+            env[DURABLE_CELL_VARIABLE],
+            "macos-client.durable-mac,ubuntu-client.durable-mac"
+        );
+        assert!(environment(&m, &[format!("{DURABLE_CELL_VARIABLE}=x")]).is_err());
+        assert!(!environment(&manifest("127.0.0.1"), &[])
+            .unwrap()
+            .contains_key(DURABLE_CELL_VARIABLE));
+        assert!(second_instance::names_cell(
+            "macos-client.durable-mac, ubuntu-client.durable-mac",
+            "ubuntu-client.durable-mac"
+        ));
+        assert!(!second_instance::names_cell(
+            "macos-client.durable-mac",
+            "ubuntu-client.durable-mac"
+        ));
     }
 
     #[test]

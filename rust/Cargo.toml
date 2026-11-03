@@ -27,6 +27,7 @@ members = [
   "crates/network-rig",
   "crates/relay-broker",
   "crates/relay-acceptance",
+  "crates/lab-runners",
 ]
 
 [workspace.package]

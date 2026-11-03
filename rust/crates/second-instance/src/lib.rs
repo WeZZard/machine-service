@@ -39,6 +39,18 @@ pub const MARKER_VARIABLE: &str = "MACHINE_SERVICE_SECOND_INSTANCE";
 /// instance keeps so that its guests reach the broker (BK-5); a second
 /// instance must name one address.
 pub const SESSION_HOST_VARIABLE: &str = "MACHINE_SERVICE_SESSION_HOST";
+
+/// The variable by which the launcher tells the daemon the durable cells
+/// its durable exposure off loopback is for, which `/health` then reports,
+/// so a durable cell without host control can still check it
+/// (DC-1xx-EPH-2).
+pub const DURABLE_CELL_VARIABLE: &str = "MACHINE_SERVICE_SECOND_INSTANCE_DURABLE_CELL";
+
+/// Whether an exposure's `durable_cell`, one cell or a comma-separated
+/// list of cells, names `cell`.
+pub fn names_cell(durable_cell: &str, cell: &str) -> bool {
+    durable_cell.split(',').any(|item| item.trim() == cell)
+}
 /// The installed instance's state folder, under the operator's home.
 pub const INSTALLED_STATE: &str = ".local/state/machine-service";
 /// The installed instance's configuration folder, under the operator's home.
@@ -89,6 +101,9 @@ pub struct Marker {
     pub id: String,
     /// Its own credential packs ([`packs_dir`]).
     pub packs_dir: PathBuf,
+    /// The durable cells its durable exposure is for, as the launcher gave
+    /// them ([`DURABLE_CELL_VARIABLE`]).
+    pub durable_cell: Option<String>,
 }
 
 impl Marker {
@@ -182,6 +197,7 @@ pub fn from_env(
     need("TART_HOME")?;
     Ok(Some(Marker {
         packs_dir: packs_dir(&config),
+        durable_cell: get(DURABLE_CELL_VARIABLE).filter(|cell| !cell.trim().is_empty()),
         id,
     }))
 }
