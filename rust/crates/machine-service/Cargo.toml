@@ -19,6 +19,9 @@ serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# The daemon and installer a test runs take the test's own launchctl
+# (DC-1xx-LCTL-1); `cargo build` never enables this.
+machine-service-core = { path = "../machine-service-core", features = ["test-launchd"] }
 machine-service-install = { path = "../machine-service-install" }
 byte-transfer = { path = "../byte-transfer" }
 serde_json.workspace = true

@@ -67,6 +67,25 @@ fn default_install_and_remove() {
     assert!(fs::read_to_string(&harness.log).unwrap().contains("load "));
 }
 
+/// DC-1xx-LCTL-1, keeping DC-241's guarantee: a test build of the
+/// installer runs only the `launchctl` its test names through the seam. Named
+/// none, with the stub first on its `PATH`, it refuses before it runs any:
+/// neither the one `PATH` finds nor `/bin/launchctl`.
+#[test]
+fn a_test_installer_never_runs_a_launchctl_it_is_not_given() {
+    assert!(machine_service_core::launchd::is_test_build());
+    let harness = Harness::new();
+    fs::copy(&harness.launchctl, harness.bin.join("launchctl")).unwrap();
+    let output = harness.run_without_launchctl(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(machine_service_core::launchd::TEST_VARIABLE),
+        "{stderr}"
+    );
+    assert!(!harness.log.exists(), "a launchctl on PATH ran");
+}
+
 #[test]
 fn check_and_dry_run_do_not_write_or_launch() {
     let harness = Harness::new();

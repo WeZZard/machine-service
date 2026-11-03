@@ -2,7 +2,10 @@
 //!
 //! The port of `tests/unit/test_console_install.py` runs the built
 //! `machine-service-install` binary against an isolated `HOME`, a fake Tart, and a
-//! `launchctl` stub, exactly as the Python test runs the shell script.
+//! `launchctl` stub, exactly as the Python test runs the shell script. The
+//! stub reaches the installer through the test build's seam
+//! (`machine_service_core::launchd`), never `PATH`, and a test build without
+//! it refuses to run any `launchctl` (DC-1xx-LCTL-1).
 
 #![allow(dead_code)]
 
@@ -154,6 +157,9 @@ pub struct Harness {
     pub config: PathBuf,
     pub viewer: PathBuf,
     pub installer: PathBuf,
+    /// The `launchctl` stub, which the installer is given through the test
+    /// build's seam and never finds on `PATH`.
+    pub launchctl: PathBuf,
     pub extra_env: Vec<(String, String)>,
     /// The fake Tart is neither on `PATH` nor named by `TART` (AC-38).
     pub no_tart: bool,
@@ -177,7 +183,11 @@ impl Harness {
             &tart,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tart.log\"\n[ \"$1\" = --version ] || exit 99\nprintf '2.32.1\\n'\n",
         );
-        write_exec(&bin.join("launchctl"), LAUNCHCTL_STUB);
+        // The stub lies off `PATH`: the installer is given it through the
+        // test build's seam only (DC-1xx-LCTL-1).
+        let launchctl = home.join("launchd/launchctl");
+        fs::create_dir_all(launchctl.parent().unwrap()).unwrap();
+        write_exec(&launchctl, LAUNCHCTL_STUB);
 
         let installer = bin.join("machine-service-install");
         fs::copy(env!("CARGO_BIN_EXE_machine-service-install"), &installer).unwrap();
@@ -216,6 +226,7 @@ impl Harness {
             config,
             viewer,
             installer,
+            launchctl,
             extra_env: Vec::new(),
             no_tart: false,
         }
@@ -254,6 +265,16 @@ impl Harness {
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
+        self.run_given(args, true)
+    }
+
+    /// Run the installer named no `launchctl` through the test build's seam
+    /// (DC-1xx-LCTL-1).
+    pub fn run_without_launchctl(&self, args: &[&str]) -> Output {
+        self.run_given(args, false)
+    }
+
+    fn run_given(&self, args: &[&str], named: bool) -> Output {
         let mut command = Command::new(&self.installer);
         command.args(args);
         command.env_clear();
@@ -263,6 +284,12 @@ impl Harness {
             command.env("TART", &self.tart);
         }
         command.env("PYTHONDONTWRITEBYTECODE", "1");
+        if named {
+            command.env(
+                machine_service_core::launchd::TEST_VARIABLE,
+                &self.launchctl,
+            );
+        }
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }

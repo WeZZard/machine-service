@@ -234,8 +234,8 @@ cat > \"$plist\" <<'PLIST'\n\
 PLIST\n\
 chown root:wheel \"$plist\"\n\
 chmod 644 \"$plist\"\n\
-launchctl bootout system/{GUEST_FORWARDER_LABEL} 2>/dev/null || true\n\
-launchctl bootstrap system \"$plist\"\n\
+/bin/launchctl bootout system/{GUEST_FORWARDER_LABEL} 2>/dev/null || true\n\
+/bin/launchctl bootstrap system \"$plist\"\n\
 i=0\n\
 until dig +short +time=2 +tries=1 @127.0.0.1 {EGRESS_HOST} A | grep -q '^[0-9]'; do\n\
   i=$((i + 1))\n\
@@ -648,7 +648,7 @@ mod tests {
         assert!(script.contains(
             "\t\t<string>--upstream</string>\n\t\t<string>1.1.1.1#cloudflare-dns.com</string>\n\t\t<string>--upstream</string>\n\t\t<string>8.8.8.8#dns.google</string>\n"
         ));
-        assert!(script.contains("launchctl bootstrap system \"$plist\""));
+        assert!(script.contains("/bin/launchctl bootstrap system \"$plist\""));
         assert!(script.contains("dig +short +time=2 +tries=1 @127.0.0.1 example.com A"));
         assert!(script.contains("networksetup -setdnsservers \"$svc\" 127.0.0.1\n"));
         assert_eq!(

@@ -10,6 +10,7 @@ pub mod guest_link;
 pub mod host;
 pub mod image_capabilities;
 pub mod isolation;
+pub mod launchd;
 pub mod lines;
 pub mod network;
 pub mod ops;

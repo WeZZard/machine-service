@@ -8,6 +8,12 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# The test seam of `launchd`: a test's own launchctl instead of /bin/launchctl
+# (DC-1xx-LCTL-1). Only dev-dependencies enable it, so only `cargo test`
+# builds it into a binary; a release build never carries it.
+test-launchd = []
+
 [dependencies]
 byte-transfer = { path = "../byte-transfer" }
 lease-keys = { path = "../lease-keys" }

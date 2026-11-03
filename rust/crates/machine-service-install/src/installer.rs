@@ -9,7 +9,7 @@
 //! instead of parsing Python sources.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -24,6 +24,7 @@ use serde_json::{json, Map, Value};
 
 use crate::migration;
 use crate::plist;
+use machine_service_core::launchd::Launchctl;
 use service_layout::release::Release;
 
 /// The launchd label that identifies the installed agent.
@@ -992,8 +993,7 @@ fn stop_existing(
             "loaded job has no installed plist; reconcile it before installation",
         ));
     }
-    let mut unload = Command::new("launchctl");
-    unload.arg("unload").arg(plist);
+    let mut unload = launchctl_command([OsStr::new("unload"), plist.as_os_str()])?;
     let result = run_command(&mut unload, Duration::from_secs(10))?;
     if !result.status.success() {
         return Err(InstallError::refused(
@@ -1021,8 +1021,7 @@ fn launch_job(plist: &Path, label: &str) -> Result<Option<i32>, InstallError> {
     let mut jobs: Vec<i32> = Vec::new();
     for domain in ["gui", "user"] {
         let target = format!("{domain}/{uid}/{label}");
-        let mut command = Command::new("launchctl");
-        command.arg("print").arg(&target);
+        let mut command = launchctl_command(["print", target.as_str()])?;
         let output = run_command(&mut command, Duration::from_secs(10))?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if output.status.code() == Some(113) && stderr.contains("Could not find service") {
@@ -1125,12 +1124,26 @@ fn pid_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// A command that runs `launchctl` with `arguments`: the system one, never
+/// one `PATH` finds, and a test's own only in a test build
+/// ([`Launchctl`], DC-1xx-LCTL-1).
+fn launchctl_command<I, S>(arguments: I) -> Result<Command, InstallError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Ok(Launchctl::resolve()
+        .map_err(InstallError::Refused)?
+        .command(arguments))
+}
+
 fn launchctl(operands: &[&str], plist: &Path) -> Result<(), InstallError> {
-    let mut command = Command::new("launchctl");
-    for operand in operands {
-        command.arg(operand);
-    }
-    command.arg(plist);
+    let mut command = launchctl_command(
+        operands
+            .iter()
+            .map(OsStr::new)
+            .chain(std::iter::once(plist.as_os_str())),
+    )?;
     let output = run_command(&mut command, Duration::from_secs(10))?;
     if !output.status.success() {
         return Err(InstallError::refused(format!(

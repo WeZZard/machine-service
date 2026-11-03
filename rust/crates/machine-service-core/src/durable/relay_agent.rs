@@ -34,9 +34,9 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
+use crate::launchd::Launchctl;
 use serde_json::json;
 use service_layout::release::{self, Release};
 use service_layout::signing::{self, Anchor, Signature, Signing};
@@ -365,27 +365,30 @@ fn job(label: &str) -> String {
     format!("{}/{label}", domain())
 }
 
-/// Run `launchctl`, found on `PATH` as the installer finds it.
-fn launchctl(arguments: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = Command::new("launchctl");
-    command.args(arguments);
-    crate::proc::run_capture(&mut command, None, Duration::from_secs(30))
-        .map_err(|e| format!("launchctl {}: {e}", arguments.join(" ")))
+/// Run `launchctl` with `arguments`: always the system one in a release
+/// ([`Launchctl`], DC-1xx-LCTL-1).
+fn run(launchctl: &Launchctl, arguments: &[&str]) -> Result<std::process::Output, String> {
+    crate::proc::run_capture(
+        &mut launchctl.command(arguments),
+        None,
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("launchctl {}: {e}", arguments.join(" ")))
 }
 
 /// Whether the job `label` is loaded in the desktop session's domain.
-pub fn loaded(label: &str) -> Result<bool, String> {
-    Ok(launchctl(&["print", &job(label)])?.status.success())
+fn loaded(launchctl: &Launchctl, label: &str) -> Result<bool, String> {
+    Ok(run(launchctl, &["print", &job(label)])?.status.success())
 }
 
 /// Unload the job `label` when it is loaded, and wait until it is gone.
-fn unload(label: &str) -> Result<(), String> {
-    if !loaded(label)? {
+fn unload(launchctl: &Launchctl, label: &str) -> Result<(), String> {
+    if !loaded(launchctl, label)? {
         return Ok(());
     }
-    let _ = launchctl(&["bootout", &job(label)])?;
+    let _ = run(launchctl, &["bootout", &job(label)])?;
     for _ in 0..50 {
-        if !loaded(label)? {
+        if !loaded(launchctl, label)? {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -463,8 +466,11 @@ fn configured_broker(path: &Path) -> Option<String> {
 /// release's agent is in place, a Developer ID team the instance does not
 /// trust yet by its record is recorded (DC-231).
 pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
+    // The launchctl comes first, so a test build without its own refuses
+    // before anything else is decided.
+    let launchctl = Launchctl::resolve()?;
     let checked = check(spec)?;
-    let ensured = put_in_place(spec, &checked.bytes, may_restart)?;
+    let ensured = put_in_place(&launchctl, spec, &checked.bytes, may_restart)?;
     if let Some(team) = checked.anchor.to_record(&checked.signing) {
         checked.anchor.record(team).map_err(|error| {
             format!("the relay agent is in place, and the team it trusts could not be recorded: {error}")
@@ -473,10 +479,15 @@ pub fn ensure(spec: &Spec, may_restart: bool) -> Result<Ensured, String> {
     Ok(ensured)
 }
 
-fn put_in_place(spec: &Spec, bytes: &[u8], may_restart: bool) -> Result<Ensured, String> {
+fn put_in_place(
+    launchctl: &Launchctl,
+    spec: &Spec,
+    bytes: &[u8],
+    may_restart: bool,
+) -> Result<Ensured, String> {
     let paths = paths(&spec.identity);
     let domain = domain();
-    if !launchctl(&["print", &domain])?.status.success() {
+    if !run(launchctl, &["print", &domain])?.status.success() {
         return Err(format!(
             "no desktop session ({domain}) to run the relay agent in; log in at the display first"
         ));
@@ -489,7 +500,7 @@ fn put_in_place(spec: &Spec, bytes: &[u8], may_restart: bool) -> Result<Ensured,
     let restart = differs(&paths.executable, bytes) || differs(&paths.plist, &plist) || moved;
     let configure = differs(&paths.config, &config);
     let label = &spec.identity.label;
-    let running = loaded(label)?;
+    let running = loaded(launchctl, label)?;
     if configure {
         write_atomic(&paths.config, &config, 0o600, Some(0o700))?;
     }
@@ -506,7 +517,7 @@ fn put_in_place(spec: &Spec, bytes: &[u8], may_restart: bool) -> Result<Ensured,
         ));
     }
     // The old agent stops first, so no executable is replaced under it.
-    unload(label)?;
+    unload(launchctl, label)?;
     write_atomic(&paths.executable, bytes, 0o755, None)?;
     if let Some(parent) = paths.log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -515,7 +526,7 @@ fn put_in_place(spec: &Spec, bytes: &[u8], may_restart: bool) -> Result<Ensured,
     let plist_path = paths.plist.to_string_lossy().to_string();
     let mut last = String::new();
     for _ in 0..20 {
-        let output = launchctl(&["bootstrap", &domain, &plist_path])?;
+        let output = run(launchctl, &["bootstrap", &domain, &plist_path])?;
         if output.status.success() {
             return Ok(Ensured::Started {
                 build: release::sha256_hex(bytes),
@@ -551,8 +562,9 @@ fn remove_tree(path: &Path) -> Result<(), String> {
 /// is not a failure.
 pub fn remove(identity: &Identity) -> Result<bool, String> {
     let paths = paths(identity);
+    let launchctl = Launchctl::resolve()?;
     let present = paths.plist.exists();
-    unload(&identity.label)?;
+    unload(&launchctl, &identity.label)?;
     if identity.installed() {
         for file in [&paths.plist, &paths.executable, &paths.config] {
             remove_file(file)?;
@@ -567,6 +579,7 @@ pub fn remove(identity: &Identity) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn the_installed_instance_keeps_the_default_label_and_the_operators_home() {

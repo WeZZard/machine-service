@@ -642,17 +642,17 @@ PLIST
   echo "relay-start: installed $plist"
 fi
 i=0
-until launchctl print "gui/$uid" >/dev/null 2>&1; do
+until /bin/launchctl print "gui/$uid" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -gt 120 ]; then echo "relay-start: no desktop session (gui/$uid) after 120 s"; exit 3; fi
   sleep 1
 done
-if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
-  launchctl kickstart -k "gui/$uid/$label"
+if /bin/launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+  /bin/launchctl kickstart -k "gui/$uid/$label"
 else
-  launchctl bootstrap "gui/$uid" "$plist"
+  /bin/launchctl bootstrap "gui/$uid" "$plist"
 fi
-launchctl print "gui/$uid/$label" | grep -E '^[[:space:]]*(state|pid) = ' | sed 's/^[[:space:]]*/relay-start: /'
+/bin/launchctl print "gui/$uid/$label" | grep -E '^[[:space:]]*(state|pid) = ' | sed 's/^[[:space:]]*/relay-start: /'
 "#
         )
     } else {
@@ -1803,8 +1803,8 @@ mod tests {
     fn the_start_scripts_target_the_desktop_session() {
         let mac = start_script("macos");
         assert!(mac.contains("<string>Aqua</string>"));
-        assert!(mac.contains("launchctl bootstrap \"gui/$uid\""));
-        assert!(mac.contains("launchctl kickstart -k"));
+        assert!(mac.contains("/bin/launchctl bootstrap \"gui/$uid\""));
+        assert!(mac.contains("/bin/launchctl kickstart -k"));
         assert!(mac.contains(LAUNCH_AGENT_LABEL));
         let linux = start_script("linux");
         assert!(linux.contains("WantedBy=graphical-session.target"));

@@ -85,11 +85,23 @@ struct Lab {
     port: u16,
     daemon: Option<Child>,
     agent: Option<Child>,
-    /// The folder of the daemon's `launchctl`: the fake launchd, which runs
+    /// The folder of the test's `launchctl`: the fake launchd, which runs
     /// the LaunchAgents it loads, or one that refuses to load any. Never
     /// the real one, which would load the instance's relay agent into this
     /// Mac's desktop session.
     launchd: Option<PathBuf>,
+    /// How the daemon is given the test's `launchctl`.
+    seam: Seam,
+}
+
+/// How a test daemon is given its test's `launchctl` (DC-1xx-LCTL-1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// Named by the test build's variable: the daemon runs it.
+    Named,
+    /// Only first on the daemon's `PATH`, with nothing named: the test
+    /// build runs no `launchctl` at all, neither it nor `/bin/launchctl`.
+    PathOnly,
 }
 
 /// A `launchctl` that loads nothing: the daemon finds no desktop session
@@ -155,16 +167,22 @@ impl Lab {
     /// A second instance and its relay agent; `release_of` is the
     /// executable the instance's release holds.
     fn new(release_of: &Path) -> Lab {
-        Lab::with_launchd(release_of, false)
+        Lab::with_launchd(release_of, false, Seam::Named)
     }
 
     /// A second instance whose `launchctl` is the fake launchd, so it
     /// brings its own relay agent up (DC-213).
     fn provisioning(release_of: &Path) -> Lab {
-        Lab::with_launchd(release_of, true)
+        Lab::with_launchd(release_of, true, Seam::Named)
     }
 
-    fn with_launchd(release_of: &Path, launchd: bool) -> Lab {
+    /// A second instance whose fake launchd is only first on its `PATH`,
+    /// as every test daemon's was before DC-1xx-LCTL-1.
+    fn unnamed(release_of: &Path) -> Lab {
+        Lab::with_launchd(release_of, true, Seam::PathOnly)
+    }
+
+    fn with_launchd(release_of: &Path, launchd: bool, seam: Seam) -> Lab {
         let dir = tempfile::tempdir().unwrap();
         let root = canonical_dir(dir.path());
         let home = root.join("home");
@@ -209,6 +227,7 @@ impl Lab {
             daemon: None,
             agent: None,
             launchd: None,
+            seam,
         };
         let folder = lab.root.join("launchd");
         std::fs::create_dir_all(&folder).unwrap();
@@ -247,18 +266,27 @@ impl Lab {
                 _ => (free_port(), free_port()),
             };
             let err = self.root.join(format!("daemon-{port}.err"));
-            let path = match &self.launchd {
-                Some(dir) => format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", dir.display()),
-                None => "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+            let launchd = self.launchd.clone().unwrap_or_default();
+            let path = match self.seam {
+                Seam::Named => "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+                Seam::PathOnly => format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", launchd.display()),
             };
+            // The test build's seam, never `PATH`, gives it its launchctl.
+            let named = (self.seam == Seam::Named).then(|| {
+                (
+                    machine_service_core::launchd::TEST_VARIABLE,
+                    launchd.join("launchctl"),
+                )
+            });
             let mut child = Command::new(DAEMON)
                 .env_clear()
+                .envs(named)
                 .env("HOME", &self.home)
                 .env("USER", user())
                 .env("LOGNAME", user())
                 .env("SHELL", "/bin/zsh")
                 .env("PATH", path)
-                .env("FAKE_LAUNCHD", self.launchd.clone().unwrap_or_default())
+                .env("FAKE_LAUNCHD", &launchd)
                 .env("MACHINE_SERVICE_STATE", &self.state)
                 .env("MACHINE_SERVICE_PORT", port.to_string())
                 .env("MACHINE_SERVICE_HOST", "127.0.0.1")
@@ -593,6 +621,35 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
         })
     );
     assert!(!health.to_string().contains("EXAMPLE123"), "{health}");
+}
+
+/// DC-1xx-LCTL-1, keeping DC-241's guarantee: a test daemon runs only the
+/// `launchctl` its test names through the test build's seam. One named
+/// none, with a recording `launchctl` first on its `PATH`, refuses before
+/// it runs any: neither the one `PATH` finds nor `/bin/launchctl`. Its
+/// release is untrusted, so a daemon built without the seam would stop at
+/// the trust check and still load nothing, and this test fails for want of
+/// the refusal instead of reaching this Mac's launchd.
+#[test]
+fn a_test_daemon_never_runs_a_launchctl_it_is_not_given() {
+    assert!(
+        machine_service_core::launchd::is_test_build(),
+        "the test daemon is built without the launchctl seam"
+    );
+    let lab = Lab::unnamed(relay_agent_bin());
+    let refusal = format!(
+        "is not provisioned: this is a test build ({}), which runs only the launchctl a test names in {}",
+        machine_service_core::launchd::TEST_FEATURE,
+        machine_service_core::launchd::TEST_VARIABLE
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lab.log().contains(&refusal) {
+        assert!(Instant::now() < deadline, "{}", lab.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let calls = lab.launchctl_calls();
+    assert!(calls.is_empty(), "a launchctl on PATH ran: {calls}");
+    assert!(!lab.state.join("relay/agent/Library/LaunchAgents").exists());
 }
 
 /// Everything under `root`, as text.
