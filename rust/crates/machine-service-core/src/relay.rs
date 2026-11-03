@@ -147,11 +147,15 @@ impl RelaySettings {
     /// `MACHINE_SERVICE_RELAY_AGENT_WAIT` (600 s).
     pub fn from_environment() -> Result<RelaySettings, String> {
         let session_port = remote_session::session_port_from_env().map_err(|e| e.to_string())?;
+        service_layout::test_build::owned_port("the relay session port", session_port)?;
+        // An explicit session host (a second instance, DC-243) wins; otherwise
+        // every interface in a release and loopback in a test build (DC-ISO).
         let session_host = std::env::var(second_instance::SESSION_HOST_VARIABLE)
             .ok()
             .map(|host| host.trim().to_string())
             .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| "0.0.0.0".into());
+            .unwrap_or_else(|| service_layout::test_build::listener_host().into());
+        service_layout::test_build::owned_bind("the relay session host", &session_host)?;
         let relay_url = match std::env::var(RELAY_URL_VARIABLE) {
             Ok(value) if !value.trim().is_empty() => websocket_url(RELAY_URL_VARIABLE, &value)?,
             _ => default_relay_url(session_port),

@@ -16,11 +16,11 @@ mod relay_common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    canonical_dir, free_port, http_timeout, relay_agent_bin, try_http, write_relay_release, DAEMON,
+    canonical_dir, free_port, http_timeout, relay_agent_bin, try_http, write_relay_release,
 };
 use relay_agent::protocol::{ExecutionState, Op, OpKind, Outcome};
 use relay_common::{client_config_v2, Collected, TestClient};
@@ -75,6 +75,9 @@ impl Drop for Leftover {
 }
 
 struct Lab {
+    /// One lifeline for the lab's daemons and agent: what a stopped daemon
+    /// started, a restarted one sweeps (DC-1xx-ISO-6).
+    lifeline: common::Lifeline,
     _dir: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
@@ -83,13 +86,17 @@ struct Lab {
     release: PathBuf,
     session_port: u16,
     port: u16,
-    daemon: Option<Child>,
-    agent: Option<Child>,
+    daemon: Option<common::Owned>,
+    /// Daemons a restart stopped, kept until the lab ends: what they
+    /// started, such as the fake launchd's agents, outlives them as it
+    /// would outlive a real restart, and ends with the lab.
+    retired: Vec<common::Owned>,
+    agent: Option<common::Owned>,
     /// The folder of the test's `launchctl`: the fake launchd, which runs
     /// the LaunchAgents it loads, or one that refuses to load any. Never
     /// the real one, which would load the instance's relay agent into this
     /// Mac's desktop session.
-    launchd: Option<PathBuf>,
+    launchd: PathBuf,
     /// How the daemon is given the test's `launchctl`.
     seam: Seam,
 }
@@ -216,6 +223,7 @@ impl Lab {
         }
         let release = write_relay_release(&root.join("release"), release_of);
         let mut lab = Lab {
+            lifeline: common::Lifeline::new(),
             state: root.join("state"),
             _dir: dir,
             root,
@@ -225,8 +233,9 @@ impl Lab {
             session_port: 0,
             port: 0,
             daemon: None,
+            retired: Vec::new(),
             agent: None,
-            launchd: None,
+            launchd: PathBuf::new(),
             seam,
         };
         let folder = lab.root.join("launchd");
@@ -242,17 +251,14 @@ impl Lab {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        lab.launchd = Some(folder);
+        lab.launchd = folder;
         lab.start_daemon(&config);
         lab
     }
 
     /// The fake launchd's calls.
     fn launchctl_calls(&self) -> String {
-        self.launchd
-            .as_ref()
-            .and_then(|dir| std::fs::read_to_string(dir.join("calls.log")).ok())
-            .unwrap_or_default()
+        std::fs::read_to_string(self.launchd.join("calls.log")).unwrap_or_default()
     }
 
     fn start_daemon(&mut self, config: &Path) {
@@ -266,10 +272,12 @@ impl Lab {
                 _ => (free_port(), free_port()),
             };
             let err = self.root.join(format!("daemon-{port}.err"));
-            let launchd = self.launchd.clone().unwrap_or_default();
+            let launchd = self.launchd.clone();
+            // The fakes' shell utilities only; the daemon finds no tool
+            // through `PATH` (DC-1xx-ISO-4).
             let path = match self.seam {
-                Seam::Named => "/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-                Seam::PathOnly => format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", launchd.display()),
+                Seam::Named => common::BASE_PATH.to_string(),
+                Seam::PathOnly => format!("{}:{}", launchd.display(), common::BASE_PATH),
             };
             // The test build's seam, never `PATH`, gives it its launchctl.
             let named = (self.seam == Seam::Named).then(|| {
@@ -278,8 +286,8 @@ impl Lab {
                     launchd.join("launchctl"),
                 )
             });
-            let mut child = Command::new(DAEMON)
-                .env_clear()
+            let mut command = common::daemon_command_on(&self.root, &self.lifeline);
+            command
                 .envs(named)
                 .env("HOME", &self.home)
                 .env("USER", user())
@@ -305,9 +313,8 @@ impl Lab {
                 .env("TART_HOME", self.root.join("tart"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
-                .spawn()
-                .unwrap();
+                .stderr(Stdio::from(std::fs::File::create(&err).unwrap()));
+            let mut child = command.spawn().unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Ok(Some(_)) = child.try_wait() {
@@ -320,8 +327,6 @@ impl Lab {
                     return;
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -367,27 +372,24 @@ impl Lab {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let child = Command::new(executable)
+        let mut command = common::harness::command_on(executable, &self.lifeline);
+        command
             .arg("run")
             .env("HOME", &self.agent_home)
             .env("SHELL", "/bin/sh")
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.root.join("agent.log")).unwrap(),
-            ))
-            .spawn()
-            .unwrap();
+            ));
+        let child = command.spawn().unwrap();
         let pid = child.id() as i32;
         self.agent = Some(child);
         pid
     }
 
     fn stop_agent(&mut self) {
-        if let Some(mut agent) = self.agent.take() {
-            let _ = agent.kill();
-            let _ = agent.wait();
-        }
+        // Dropping the handle ends the agent and what it started.
+        self.agent.take();
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> common::Response {
@@ -438,9 +440,8 @@ impl Lab {
     /// Stop the instance and start it again on the same state (DM-8).
     fn restart_daemon(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            // SAFETY: the PID is this test's own child.
-            unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
-            let _ = daemon.wait();
+            daemon.signal(libc::SIGTERM, Duration::from_secs(30));
+            self.retired.push(daemon);
         }
         let config = self.root.join("config");
         self.start_daemon(&config);
@@ -502,12 +503,13 @@ impl Drop for Lab {
         }
         self.stop_agent();
         if let Some(mut daemon) = self.daemon.take() {
-            // SAFETY: the PID is this test's own child.
-            unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
-            let _ = daemon.wait();
+            daemon.terminate(Duration::from_secs(30));
         }
-        // The agents the fake launchd started.
-        if let Some(dir) = &self.launchd {
+        self.retired.clear();
+        // The agents the fake launchd started, which their daemon's handle
+        // has ended with it; kept as a second line.
+        {
+            let dir = &self.launchd;
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 if entry.path().extension().is_some_and(|e| e == "pid") {
                     if let Some(pid) = std::fs::read_to_string(entry.path())

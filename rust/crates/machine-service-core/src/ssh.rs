@@ -1,7 +1,6 @@
 //! SSH and SCP helpers bound to a single lease identity.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -41,7 +40,7 @@ pub fn ssh(
     timeout_s: u64,
 ) -> Option<(i32, String)> {
     let argv = ssh_argv(ip, user, key_dir, remote_cmd).ok()?;
-    let mut command = Command::new(&argv[0]);
+    let mut command = service_layout::tools::command_for(&argv[0]).ok()?;
     command.args(&argv[1..]);
     let output = run_capture(&mut command, stdin, Duration::from_secs(timeout_s)).ok()?;
     Some(code_and_text(&output))
@@ -72,7 +71,7 @@ pub fn scp(
     timeout_s: u64,
 ) -> Option<(i32, String)> {
     let argv = scp_argv(key_dir, src, dst).ok()?;
-    let mut command = Command::new(&argv[0]);
+    let mut command = service_layout::tools::command_for(&argv[0]).ok()?;
     command.args(&argv[1..]);
     let output = run_capture(&mut command, None, Duration::from_secs(timeout_s)).ok()?;
     Some(code_and_text(&output))

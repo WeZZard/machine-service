@@ -222,7 +222,7 @@ pub fn virtual_capability(env: &BTreeMap<String, String>) -> Result<Vec<String>,
     };
     let tart = match tart {
         Some(path) if Path::new(&path).is_file() && installer::is_executable(Path::new(&path)) => {
-            path
+            service_layout::tools::admitted(service_layout::tools::Tool::Tart, Path::new(&path))?
         }
         _ => return Err("Tart is not installed".to_string()),
     };

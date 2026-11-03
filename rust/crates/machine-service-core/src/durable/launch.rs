@@ -134,13 +134,25 @@ pub fn prepare(
     session: &SessionEnv,
     cwd: &Path,
 ) -> Result<String, String> {
+    // The launcher runs the shell the service resolved here, through its
+    // tool table (DC-1xx-ISO-4).
+    let zsh = || {
+        service_layout::tools::path(service_layout::tools::Tool::Zsh)
+            .map(|path| path.to_string_lossy().into_owned())
+    };
     let (shell, line, script) = match launch {
-        Launch::Program(Program::Line { shell, line }) => (shell.clone(), Some(line.clone()), None),
+        Launch::Program(Program::Line { shell, line }) => (
+            service_layout::tools::program(shell)?
+                .to_string_lossy()
+                .into_owned(),
+            Some(line.clone()),
+            None,
+        ),
         Launch::Program(Program::Script(bytes)) => {
             private_file(&files.script, bytes)?;
-            ("/bin/zsh".to_string(), None, Some(files.script.clone()))
+            (zsh()?, None, Some(files.script.clone()))
         }
-        Launch::ScriptOnInput => ("/bin/zsh".to_string(), None, None),
+        Launch::ScriptOnInput => (zsh()?, None, None),
     };
     let request = Request {
         shell,

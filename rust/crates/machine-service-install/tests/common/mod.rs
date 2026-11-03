@@ -6,6 +6,11 @@
 //! stub reaches the installer through the test build's seam
 //! (`machine_service_core::launchd`), never `PATH`, and a test build without
 //! it refuses to run any `launchctl` (DC-242).
+//!
+//! The isolated `HOME` lies under Cargo's own temporary folder for the
+//! tests, never under the account's home, and the installer runs as an
+//! isolated test child with a tool table of its own (DC-1xx-ISO-1,
+//! DC-1xx-ISO-4, DC-1xx-ISO-7).
 
 #![allow(dead_code)]
 
@@ -167,10 +172,13 @@ pub struct Harness {
 
 impl Harness {
     pub fn new() -> Self {
-        let parent = std::env::var("HOME").expect("HOME is set for the test runner");
+        // The build's own temporary folder, resolved, since the installer
+        // refuses a linked parent folder (DC-1xx-ISO-7).
+        let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        fs::create_dir_all(parent).unwrap();
         let tmp = tempfile::Builder::new()
-            .prefix(".machine-service-install-test-")
-            .tempdir_in(parent)
+            .prefix("machine-service-install-test-")
+            .tempdir_in(parent.canonicalize().unwrap())
             .unwrap();
         let home = tmp.path().to_path_buf();
         let bin = home.join("bin");
@@ -274,11 +282,24 @@ impl Harness {
         self.run_given(args, false)
     }
 
+    /// The installer's tool table (DC-1xx-ISO-4): the read-only system
+    /// tools and the fake Tart, when it has one.
+    pub fn tools(&self) -> PathBuf {
+        use service_layout::test_build::{link_system_tools, READ_ONLY_TOOLS};
+        let tools = self.home.join("tools");
+        let _ = fs::remove_dir_all(&tools);
+        link_system_tools(&tools, &READ_ONLY_TOOLS).unwrap();
+        if self.tart.exists() {
+            std::os::unix::fs::symlink(&self.tart, tools.join("tart")).unwrap();
+        }
+        tools
+    }
+
     fn run_given(&self, args: &[&str], named: bool) -> Output {
-        let mut command = Command::new(&self.installer);
+        let mut command = service_layout::test_build::harness::command(&self.installer);
         command.args(args);
-        command.env_clear();
         command.env("HOME", &self.home);
+        command.env(service_layout::tools::TEST_VARIABLE, self.tools());
         command.env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()));
         if !self.no_tart {
             command.env("TART", &self.tart);

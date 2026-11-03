@@ -10,7 +10,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::{LegacyFixture, Response};
@@ -414,27 +414,26 @@ fn ic5_a_selected_startup_with_a_broken_catalog_refuses_to_start() {
         .expect("a valid profile")
         .expect("selected");
 
-    let mut child = Command::new(common::DAEMON)
+    let err = root.join("daemon.err");
+    let mut command = common::daemon_command(&root);
+    command
         .args(["--environment", profile_path.to_str().expect("path")])
         .env("HOME", &home)
         .env("PATH", common::path_with(&bin))
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn daemon");
+        .stderr(std::fs::File::create(&err).expect("stderr file"));
+    let mut child = command.spawn().expect("spawn daemon");
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
             panic!("a selected daemon with a broken catalog kept running");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let output = child.wait_with_output().expect("output");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::fs::read_to_string(&err).unwrap_or_default();
     assert!(!status.success());
     assert!(
         stderr.contains("selected image configuration is invalid"),

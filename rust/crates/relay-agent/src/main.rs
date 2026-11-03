@@ -23,6 +23,9 @@ const GRACE: Duration = Duration::from_secs(2);
 const CONFIG_POLL: Duration = Duration::from_secs(1);
 
 fn main() {
+    // A test build keeps its marker and watches its test's lifeline
+    // (DC-1xx-ISO-6); a release does nothing.
+    service_layout::test_build::start();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["run"] => serve_broker(),

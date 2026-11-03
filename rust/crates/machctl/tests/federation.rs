@@ -5,17 +5,33 @@
 //! Every server here is an in-process HTTP fake on loopback. `CONSUL_HTTP_ADDR`
 //! always points at a fake or at a closed port, so no test reads the real
 //! Consul agent, and `MACHINE_SERVICE_PORT` always points at a fake, so no
-//! test reaches an installed instance.
+//! test reaches an installed instance. The CLI is an isolated test child
+//! whose DNS-SD is a folder of the test's own, empty unless a test
+//! advertises in it, so no test browses the network (DC-1xx-ISO-5).
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde_json::{json, Value};
 
 const MACHCTL: &str = env!("CARGO_BIN_EXE_machctl");
+
+/// An isolated `machctl` whose DNS-SD folder is `bonjour`.
+fn machctl_in(bonjour: &Path) -> service_layout::test_build::harness::Isolated {
+    let mut command = service_layout::test_build::harness::command(MACHCTL);
+    command.env("MACHINE_SERVICE_TEST_BONJOUR", bonjour);
+    command
+}
+
+/// An isolated `machctl` whose DNS-SD folder is empty.
+fn machctl() -> service_layout::test_build::harness::Isolated {
+    static EMPTY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    machctl_in(EMPTY.get_or_init(|| tempfile::tempdir().unwrap()).path())
+}
 
 /// A fake HTTP server with fixed JSON answers per path, recording every
 /// path it was asked for.
@@ -27,13 +43,6 @@ struct Fake {
 impl Fake {
     fn new(routes: Vec<(&str, Value)>) -> Fake {
         Fake::listening("127.0.0.1:0", routes)
-    }
-
-    /// A fake on every interface, for an instance found through its Bonjour
-    /// advertisement, whose address is this Mac's own network address.
-    #[cfg(target_os = "macos")]
-    fn on_all_interfaces(routes: Vec<(&str, Value)>) -> Fake {
-        Fake::listening("0.0.0.0:0", routes)
     }
 
     fn listening(address: &str, routes: Vec<(&str, Value)>) -> Fake {
@@ -176,11 +185,9 @@ impl Intranet {
 }
 
 fn run_machctl(args: &[&str], home: &std::path::Path, local_port: u16, consul: &str) -> Output {
-    Command::new(MACHCTL)
+    machctl()
         .args(args)
-        .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin")
         .env("MACHINE_SERVICE_PORT", local_port.to_string())
         .env("CONSUL_HTTP_ADDR", consul)
         // These fixtures stand in for a Consul agent (DC-84).
@@ -347,11 +354,9 @@ fn list_without_consul_warns_and_lists_the_local_instance() {
 #[test]
 fn list_with_no_instance_answering_exits_2() {
     let home = tempfile::tempdir().unwrap();
-    let output = Command::new(MACHCTL)
+    let output = machctl()
         .args(["list"])
-        .env_clear()
         .env("HOME", home.path())
-        .env("PATH", "/usr/bin:/bin")
         .env("MACHINE_SERVICE_PORT", closed_port().to_string())
         .env("CONSUL_HTTP_ADDR", format!("127.0.0.1:{}", closed_port()))
         .env("MACHINE_SERVICE_DISCOVERY", "consul")
@@ -517,8 +522,12 @@ fn ac47_a_registration_without_metadata_falls_back_to_the_node_name_and_says_so(
 /// own DNS-SD service, so nothing is sent on any network (DC-85). The fake
 /// answers `/health` with `answers` and offers one durable machine.
 #[cfg(target_os = "macos")]
-fn advertised(advertise_as: &str, answers: &str) -> (discovery::dnssd::Advertisement, Fake) {
-    let fake = Fake::on_all_interfaces(vec![
+fn advertised(
+    bonjour: &Path,
+    advertise_as: &str,
+    answers: &str,
+) -> (discovery::dnssd::Advertisement, Fake) {
+    let fake = Fake::new(vec![
         (
             "/health",
             json!({"ok": true, "service": "machine-service", "instance": answers, "kinds": ["durable"]}),
@@ -533,10 +542,10 @@ fn advertised(advertise_as: &str, answers: &str) -> (discovery::dnssd::Advertise
         discovery::SERVICE_TYPE,
         fake.port,
         &discovery::txt_entries(advertise_as, "", &["durable"]),
-        discovery::dnssd::Scope::LocalOnly,
+        discovery::dnssd::Scope::Folder(bonjour.to_path_buf()),
         std::time::Duration::from_secs(5),
     )
-    .expect("register a local-only advertisement");
+    .expect("register an advertisement in the test's folder");
     (advertisement, fake)
 }
 
@@ -544,17 +553,14 @@ fn advertised(advertise_as: &str, answers: &str) -> (discovery::dnssd::Advertise
 /// default), no local instance, and a Consul agent that records what it was
 /// asked.
 #[cfg(target_os = "macos")]
-fn list_json(mode: Option<&str>, consul: &Fake) -> (Vec<Value>, String) {
+fn list_json(bonjour: &Path, mode: Option<&str>, consul: &Fake) -> (Vec<Value>, String) {
     let home = tempfile::tempdir().unwrap();
-    let mut command = Command::new(MACHCTL);
+    let mut command = machctl_in(bonjour);
     command
         .args(["list", "--json"])
-        .env_clear()
         .env("HOME", home.path())
-        .env("PATH", "/usr/bin:/bin")
         .env("MACHINE_SERVICE_PORT", closed_port().to_string())
-        .env("CONSUL_HTTP_ADDR", consul.base())
-        .env("MACHINE_SERVICE_DISCOVERY_SCOPE", "local-only");
+        .env("CONSUL_HTTP_ADDR", consul.base());
     if let Some(mode) = mode {
         command.env("MACHINE_SERVICE_DISCOVERY", mode);
     }
@@ -575,9 +581,10 @@ fn instance<'a>(listed: &'a [Value], name: &str) -> Option<&'a Value> {
 #[test]
 fn ac48_an_advertised_instance_is_listed_without_consul() {
     let name = format!("ac48-{}", std::process::id());
-    let (_advertisement, _fake) = advertised(&name, &name);
+    let bonjour = tempfile::tempdir().unwrap();
+    let (_advertisement, _fake) = advertised(bonjour.path(), &name, &name);
     let consul = Fake::new(vec![]);
-    let (listed, errors) = list_json(None, &consul);
+    let (listed, errors) = list_json(bonjour.path(), None, &consul);
     let found =
         instance(&listed, &name).unwrap_or_else(|| panic!("{name} not in {listed:?}\n{errors}"));
     assert_eq!(found["found_by"], "bonjour", "{found}");
@@ -595,8 +602,9 @@ fn ac48_an_advertised_instance_is_listed_without_consul() {
 #[test]
 fn ac48_an_advertisement_whose_health_answers_another_id_is_not_used() {
     let name = format!("ac48-mismatch-{}", std::process::id());
-    let (_advertisement, _fake) = advertised(&name, "someone-else");
-    let (listed, errors) = list_json(None, &Fake::new(vec![]));
+    let bonjour = tempfile::tempdir().unwrap();
+    let (_advertisement, _fake) = advertised(bonjour.path(), &name, "someone-else");
+    let (listed, errors) = list_json(bonjour.path(), None, &Fake::new(vec![]));
     let found =
         instance(&listed, &name).unwrap_or_else(|| panic!("{name} not in {listed:?}\n{errors}"));
     assert_eq!(found["reachable"], false, "{found}");
@@ -614,9 +622,10 @@ fn ac48_an_advertisement_whose_health_answers_another_id_is_not_used() {
 #[test]
 fn ac49_consul_mode_asks_only_consul() {
     let name = format!("ac49-{}", std::process::id());
-    let (_advertisement, _fake) = advertised(&name, &name);
+    let bonjour = tempfile::tempdir().unwrap();
+    let (_advertisement, _fake) = advertised(bonjour.path(), &name, &name);
     let consul = Fake::new(vec![("/v1/health/service/machine-service", json!([]))]);
-    let (listed, errors) = list_json(Some("consul"), &consul);
+    let (listed, errors) = list_json(bonjour.path(), Some("consul"), &consul);
     assert!(instance(&listed, &name).is_none(), "{listed:?}\n{errors}");
     assert!(consul.asked("/v1/health/service/machine-service"));
 }
@@ -625,11 +634,9 @@ fn ac49_consul_mode_asks_only_consul() {
 #[test]
 fn an_unknown_discovery_mode_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    let output = Command::new(MACHCTL)
+    let output = machctl()
         .args(["list"])
-        .env_clear()
         .env("HOME", home.path())
-        .env("PATH", "/usr/bin:/bin")
         .env("MACHINE_SERVICE_PORT", closed_port().to_string())
         .env("MACHINE_SERVICE_DISCOVERY", "mdns")
         .output()

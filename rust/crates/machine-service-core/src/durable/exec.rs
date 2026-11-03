@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,12 +115,12 @@ pub fn start(
 ) -> Result<Running, String> {
     let (mut command, stdin) = match &request.program {
         Program::Line { shell, line } => {
-            let mut command = Command::new(shell);
+            let mut command = service_layout::tools::command_for(shell)?;
             command.arg("-c").arg(line);
             (command, None)
         }
         Program::Script(script) => {
-            let mut command = Command::new("/bin/zsh");
+            let mut command = service_layout::tools::command(service_layout::tools::Tool::Zsh)?;
             command.arg("-s");
             (command, Some(script.clone()))
         }

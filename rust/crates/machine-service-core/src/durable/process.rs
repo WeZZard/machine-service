@@ -160,8 +160,24 @@ fn process_path(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buffer).to_string())
 }
 
-/// The whole process table, optionally limited to one user.
+/// The process table the sweep sees, optionally limited to one user. In a
+/// test build, only the processes it started and its fixture's rows
+/// (`seam`, DC-1xx-ISO-3).
 pub fn process_table(uid: Option<u32>) -> Vec<ProcessInfo> {
+    if !super::seam::active() {
+        return system_table(uid);
+    }
+    let started = super::seam::signalable();
+    let mut rows: Vec<ProcessInfo> = system_table(uid)
+        .into_iter()
+        .filter(|info| started.contains(&info.pid))
+        .collect();
+    rows.extend(super::seam::fixture_rows(uid));
+    rows
+}
+
+/// The Mac's whole process table, optionally limited to one user.
+pub fn system_table(uid: Option<u32>) -> Vec<ProcessInfo> {
     let mut capacity = 4096usize;
     let pids: Vec<i32> = loop {
         let mut buffer = vec![0i32; capacity];
@@ -185,8 +201,16 @@ pub fn process_table(uid: Option<u32>) -> Vec<ProcessInfo> {
         .collect()
 }
 
-/// Read a process's arguments and start-up environment.
+/// Read a process's arguments and start-up environment; a test build's
+/// fixture row's are the fixture's.
 pub fn process_arguments(pid: i32) -> Option<Arguments> {
+    if super::seam::active() && super::seam::is_fixture(pid) {
+        return super::seam::arguments(pid);
+    }
+    system_arguments(pid)
+}
+
+fn system_arguments(pid: i32) -> Option<Arguments> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
     // SAFETY: a size query with a null buffer; `mib` is valid for its length.
@@ -665,6 +689,9 @@ impl Ended {
 /// Whether `info` still names a living process: same PID, same start time,
 /// same user, not a zombie.
 pub fn still_alive(info: &ProcessInfo) -> bool {
+    if super::seam::active() && super::seam::is_fixture(info.pid) {
+        return super::seam::fixture_alive(info.pid);
+    }
     process_info(info.pid)
         .is_some_and(|now| now.start == info.start && now.uid == info.uid && !now.zombie)
 }
@@ -673,6 +700,16 @@ pub fn still_alive(info: &ProcessInfo) -> bool {
 fn send(info: &ProcessInfo, signal: libc::c_int) -> bool {
     if info.pid <= 1 || !still_alive(info) {
         return false;
+    }
+    // A test build signals only what it started, or its fixture's rows
+    // (DC-1xx-ISO-3).
+    if super::seam::active() {
+        let name = match signal {
+            libc::SIGTERM => "TERM",
+            libc::SIGKILL => "KILL",
+            _ => "SIGNAL",
+        };
+        return super::seam::send(info.pid, signal, name);
     }
     // SAFETY: `kill` takes a PID that was re-validated immediately above.
     unsafe { libc::kill(info.pid, signal) == 0 }
@@ -1046,7 +1083,7 @@ mod tests {
         let me = process_info(pid).unwrap();
         // SAFETY: `geteuid` only reads process state.
         assert_eq!(me.uid, unsafe { libc::geteuid() });
-        assert!(process_table(Some(me.uid))
+        assert!(system_table(Some(me.uid))
             .iter()
             .any(|info| info.pid == pid));
         let args = process_arguments(pid).unwrap();

@@ -101,7 +101,8 @@ pub fn network_host_name() -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let output = std::process::Command::new("/usr/sbin/scutil")
+    let output = service_layout::tools::command(service_layout::tools::Tool::Scutil)
+        .ok()?
         .args(["--get", "LocalHostName"])
         .stderr(std::process::Stdio::null())
         .output()
@@ -147,7 +148,10 @@ mod tests {
         // Loopback itself is never the answer for a guest.
         assert_eq!(address_toward(Ipv4Addr::new(127, 0, 0, 2)), None);
         assert!(host_name().is_some());
-        if cfg!(target_os = "macos") {
+        if service_layout::test_build::is_isolated() {
+            // A test build runs no `scutil` it was not given (DC-1xx-ISO-4).
+            assert_eq!(network_host_name(), None);
+        } else if cfg!(target_os = "macos") {
             assert!(network_host_name().is_some_and(|n| n.ends_with(".local")));
         }
     }

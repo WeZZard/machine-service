@@ -23,7 +23,7 @@ mod common;
 mod relay_common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ exec "$(dirname "$0")/ssh-fake" "$@"
 
 /// The relay agent binary, run as the guest's desktop session would run it.
 struct AgentProcess {
-    child: Child,
+    child: common::Owned,
     log: PathBuf,
 }
 
@@ -71,12 +71,11 @@ impl AgentProcess {
     /// one installed in the guest.
     fn start_from(executable: &Path, home: &Path, env: &[(String, String)]) -> AgentProcess {
         let log = home.join("agent.log");
-        let child = Command::new(executable)
+        let child = common::harness::command(executable)
             .arg("run")
             .env("HOME", home)
             .env("SHELL", "/bin/sh")
             .envs(env.iter().cloned())
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
@@ -91,8 +90,7 @@ impl AgentProcess {
 
 impl Drop for AgentProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.end();
     }
 }
 

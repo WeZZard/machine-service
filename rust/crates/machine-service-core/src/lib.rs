@@ -26,6 +26,7 @@ pub mod snapshot;
 pub mod ssh;
 pub mod state;
 pub mod tart;
+pub mod test_guard;
 
 /// Python-compatible JSON number handling, re-exported for the daemon.
 pub use environment::python_json;

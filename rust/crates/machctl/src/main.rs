@@ -329,6 +329,9 @@ impl<'a> Client<'a> {
 }
 
 fn main() {
+    // A test build keeps its marker and watches its test's lifeline
+    // (DC-1xx-ISO-6); a release does nothing.
+    service_layout::test_build::start();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
     // `argparse` renders `--help` itself, with a different layout from clap's.
@@ -374,10 +377,22 @@ fn main() {
         }
     }
 
-    let mut base = format!(
-        "http://127.0.0.1:{}",
-        std::env::var("MACHINE_SERVICE_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string())
-    );
+    let port = std::env::var("MACHINE_SERVICE_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
+    // A test build never reaches the installed service or its remembered
+    // leases (DC-1xx-ISO-1).
+    if let Ok(number) = port.parse::<u16>() {
+        if let Err(refusal) = service_layout::test_build::owned_port("MACHINE_SERVICE_PORT", number)
+        {
+            usage_error(&refusal);
+        }
+    }
+    if let Some(file) = leases::path() {
+        if let Err(refusal) = service_layout::test_build::owned_path("the remembered leases", &file)
+        {
+            usage_error(&refusal);
+        }
+    }
+    let mut base = format!("http://127.0.0.1:{port}");
     if let Some(url) = environment
         .as_ref()
         .and_then(|env| env.get("profile"))

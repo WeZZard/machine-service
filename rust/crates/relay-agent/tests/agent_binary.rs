@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -23,12 +23,18 @@ const AGENT: &str = env!("CARGO_BIN_EXE_relay-agent");
 const LONG: f64 = 60.0;
 
 struct Process {
-    child: Child,
+    child: service_layout::test_build::harness::Owned,
     driver: Driver,
 }
 
 fn start(home: &Path) -> Process {
-    let mut child = Command::new(AGENT)
+    start_on(home, &service_layout::test_build::harness::Lifeline::new())
+}
+
+/// [`start`] on a lifeline the test keeps, so what a killed agent left
+/// running outlives its handle until the test ends (DC-1xx-ISO-6).
+fn start_on(home: &Path, lifeline: &service_layout::test_build::harness::Lifeline) -> Process {
+    let mut child = service_layout::test_build::harness::command_on(AGENT, lifeline)
         .arg("stdio")
         .env("HOME", home)
         .env("SHELL", "/bin/sh")
@@ -38,8 +44,10 @@ fn start(home: &Path) -> Process {
         .stderr(Stdio::null())
         .spawn()
         .expect("start the relay agent");
-    let link: StreamLink<ChildStdout, ChildStdin> =
-        StreamLink::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    let link: StreamLink<ChildStdout, ChildStdin> = StreamLink::new(
+        child.child().stdout.take().unwrap(),
+        child.child().stdin.take().unwrap(),
+    );
     let link: Arc<dyn Link> = Arc::new(link);
     let driver = Driver::open(link).expect("a hello");
     Process { child, driver }
@@ -67,8 +75,7 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.end();
     }
 }
 
@@ -307,7 +314,8 @@ fn dc139_a_restarted_agent_stops_what_a_killed_agent_left_running() {
         .spawn()
         .unwrap();
     let unrelated_pid = unrelated.id() as i32;
-    let mut process = start(home.path());
+    let lifeline = service_layout::test_build::harness::Lifeline::new();
+    let mut process = start_on(home.path(), &lifeline);
     let call = process
         .driver
         .start(
@@ -327,7 +335,7 @@ fn dc139_a_restarted_agent_stops_what_a_killed_agent_left_running() {
     assert!(alive(group), "the command outlives the killed agent");
     assert!(alive(daemon), "so does its daemon");
 
-    let mut process = start(home.path());
+    let mut process = start_on(home.path(), &lifeline);
     wait_gone(group);
     eprintln!("the command's group {group} is gone after the restart");
     match ownership {
@@ -452,7 +460,7 @@ fn commands_start_with_no_blocked_signals() {
 #[test]
 fn run_waits_for_a_private_configuration() {
     let home = tempfile::tempdir().unwrap();
-    let mut child = Command::new(AGENT)
+    let mut child = service_layout::test_build::harness::command(AGENT)
         .arg("run")
         .env("HOME", home.path())
         .env("SHELL", "/bin/sh")
@@ -462,7 +470,7 @@ fn run_waits_for_a_private_configuration() {
         .spawn()
         .unwrap();
     let (lines, logged) = mpsc::channel::<String>();
-    let stderr = child.stderr.take().unwrap();
+    let stderr = child.child().stderr.take().unwrap();
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { return };
@@ -519,7 +527,7 @@ fn a_restart_runs_the_build_written_over_the_executable() {
     let installed = home.path().join(".local/libexec/relay-agent/relay-agent");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::copy(AGENT, &installed).unwrap();
-    let mut child = Command::new(&installed)
+    let mut child = service_layout::test_build::harness::command(&installed)
         .arg("stdio")
         .env("HOME", home.path())
         .env("SHELL", "/bin/sh")
@@ -531,8 +539,8 @@ fn a_restart_runs_the_build_written_over_the_executable() {
         .unwrap();
     let pid = child.id();
     let link: Arc<dyn Link> = Arc::new(StreamLink::new(
-        child.stdout.take().unwrap(),
-        child.stdin.take().unwrap(),
+        child.child().stdout.take().unwrap(),
+        child.child().stdin.take().unwrap(),
     ));
     let mut driver = Driver::open(link).unwrap();
     let old = driver.hello().build.clone();
@@ -573,6 +581,5 @@ fn a_restart_runs_the_build_written_over_the_executable() {
         again.result.as_ref().unwrap().replayed,
         "never restarts twice"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    child.end();
 }

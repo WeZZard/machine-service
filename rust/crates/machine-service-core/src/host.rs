@@ -438,7 +438,14 @@ impl Host for RealHost {
     }
 
     fn softnet(&self) -> Result<PathBuf, String> {
-        crate::network::softnet_executable(crate::tart::tart_path(&self.config).as_deref())
+        // A test build looks for Softnet only in its tool table
+        // (DC-1xx-ISO-4).
+        let search = if service_layout::test_build::is_isolated() {
+            service_layout::test_build::tools_folder().map(std::ffi::OsString::from)
+        } else {
+            crate::tart::tart_path(&self.config)
+        };
+        crate::network::softnet_executable(search.as_deref())
     }
 
     fn guest_firewall(&self) -> Result<crate::isolation::GuestFirewall, String> {
@@ -450,7 +457,8 @@ impl Host for RealHost {
     }
 
     fn open_probe(&self) -> OpResult<Box<dyn ProbeListener>> {
-        let listener = std::net::TcpListener::bind(("0.0.0.0", 0))?;
+        let listener =
+            std::net::TcpListener::bind((service_layout::test_build::listener_host(), 0))?;
         listener.set_nonblocking(true)?;
         Ok(Box::new(TcpProbeListener { listener }))
     }

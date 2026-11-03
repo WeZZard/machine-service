@@ -6,7 +6,7 @@
 //! so no test reaches a real instance or the real Consul agent.
 
 use std::collections::HashMap;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -172,11 +172,9 @@ impl Intranet {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(MACHCTL)
+        service_layout::test_build::harness::command(MACHCTL)
             .args(args)
-            .env_clear()
             .env("HOME", self.home.path())
-            .env("PATH", "/usr/bin:/bin")
             .env("MACHINE_SERVICE_PORT", self.local.port.to_string())
             .env("MACHINE_SERVICE_STATE", self.home.path().join("state"))
             .env("CONSUL_HTTP_ADDR", self.consul.base())

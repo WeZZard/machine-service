@@ -161,6 +161,9 @@ const EXPOSE_KEY: &str = "MACHINE_SERVICE_EXPOSE_DURABLE";
 
 /// Entry point used by the `machine-service-install` binary.
 pub fn main_entry() -> Result<(), InstallError> {
+    // A test build keeps its marker and watches its test's lifeline
+    // (DC-1xx-ISO-6); a release does nothing.
+    service_layout::test_build::start();
     let cli = Cli::parse();
     let source = source_directory()?;
     run(&cli, &source, &home_directory())
@@ -202,6 +205,10 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     }
     let readonly = cli.check || cli.dry_run;
     let plist = migration::agent_plist(home, LABEL);
+    // A test build never touches the account's own installation, whatever
+    // `HOME` says (DC-1xx-ISO-1).
+    service_layout::test_build::owned_path("the LaunchAgent", &plist)
+        .map_err(InstallError::Refused)?;
     let deployed = match &cli.prefix {
         Some(_) if action != Action::Install => {
             return Err(InstallError::refused("--prefix applies to install only"));
@@ -209,6 +216,8 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
         Some(prefix) => std::path::absolute(prefix)?,
         None => source.to_path_buf(),
     };
+    service_layout::test_build::owned_path("the install folder", &deployed)
+        .map_err(InstallError::Refused)?;
 
     // A caller still exporting an old name would have it silently dropped;
     // it fails here with the fix instead (DC-37).
@@ -290,6 +299,8 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     }
 
     let new_root = state_root(&env, home)?;
+    service_layout::test_build::owned_path("the state folder", &new_root)
+        .map_err(InstallError::Refused)?;
     let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
     roots.insert(new_root.clone());
     let mut owners = ownership_paths(&env, home)?;
@@ -666,7 +677,13 @@ fn validate_install(installation: &Installation) -> Result<Validated, InstallErr
         .filter(|value| !value.is_empty())
         .cloned()
         .or_else(|| which("tart", effective.get("PATH").map(String::as_str)))
-        .filter(|path| Path::new(path).is_file() && is_executable(Path::new(path)));
+        .filter(|path| Path::new(path).is_file() && is_executable(Path::new(path)))
+        .map(|path| {
+            service_layout::tools::admitted(service_layout::tools::Tool::Tart, Path::new(&path))
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .transpose()
+        .map_err(InstallError::Refused)?;
     // Without Tart the instance creates no virtual machine, so only the
     // durable machine is left to offer (MG-4 step 5, AC-38, DC-65). With
     // exposure off too it offers nothing, which the owner may choose, such
@@ -688,6 +705,15 @@ fn validate_install(installation: &Installation) -> Result<Validated, InstallErr
                 "service helper is not executable: {}",
                 helper.display()
             )));
+        }
+    }
+
+    // A test build's executables never enter an installation; only a
+    // release refuses them, since a test installs the test builds it has
+    // (DC-1xx-ISO-8).
+    if !service_layout::test_build::is_test_build() {
+        if let Some(found) = test_builds_in(source, &helpers).into_iter().next() {
+            return Err(InstallError::Refused(found));
         }
     }
 
@@ -1228,6 +1254,31 @@ pub(crate) fn which(name: &str, path: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// The refusals of every executable of `helpers` in `source`, and of the
+/// macOS relay agent of its release, that a test build made: each carries
+/// the test seams and must never be installed (DC-1xx-ISO-8).
+pub fn test_builds_in(source: &Path, helpers: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = helpers
+        .iter()
+        .map(|name| source.join(name))
+        .filter_map(|path| service_layout::test_build::refuse_test_build(&path).err())
+        .filter(|refusal| refusal.contains(service_layout::test_build::FEATURE))
+        .collect();
+    let folder = source.join(service_layout::release::FOLDER);
+    if let Ok(release) = Release::open(&folder) {
+        let platform = service_layout::release::platform_for("macos");
+        if let Ok(bytes) = release.executable(&platform) {
+            if let Err(refusal) = service_layout::test_build::refuse_test_bytes(
+                &format!("the relay agent of {}", folder.display()),
+                &bytes,
+            ) {
+                found.push(refusal);
+            }
+        }
+    }
+    found
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {

@@ -13,6 +13,7 @@ path = "src/main.rs"
 environment = { path = "../environment" }
 byte-transfer = { path = "../byte-transfer" }
 discovery = { path = "../discovery" }
+service-layout = { path = "../service-layout" }
 clap.workspace = true
 # `argparse` reads the terminal width from an ioctl when `COLUMNS` is unset.
 libc.workspace = true
@@ -25,6 +26,10 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 ureq = { version = "3", default-features = false }
 
 [dev-dependencies]
+# The CLI a test runs is a test build (DC-1xx-ISO-1): its DNS-SD is a
+# folder, its tools a table; `cargo build` never enables this.
+service-layout = { path = "../service-layout", features = ["test-build"] }
+discovery = { path = "../discovery", features = ["test-build"] }
 tiny_http.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile.workspace = true

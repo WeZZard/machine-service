@@ -399,6 +399,8 @@ name = "discovery"
 version = "0.2.0-rc.3"
 dependencies = [
  "libc",
+ "service-layout",
+ "tempfile",
 ]
 
 [[package]]
@@ -567,6 +569,7 @@ dependencies = [
  "guest-actions",
  "libc",
  "serde_json",
+ "service-layout",
  "sha2",
  "tempfile",
  "thiserror",
@@ -659,6 +662,7 @@ name = "lease-keys"
 version = "0.2.0-rc.3"
 dependencies = [
  "libc",
+ "service-layout",
  "tempfile",
  "thiserror",
 ]
@@ -691,6 +695,7 @@ dependencies = [
  "environment",
  "libc",
  "serde_json",
+ "service-layout",
  "tempfile",
  "tiny_http",
  "ureq",
@@ -714,6 +719,7 @@ dependencies = [
  "rustls",
  "second-instance",
  "serde_json",
+ "service-layout",
  "sha2",
  "tempfile",
  "tiny_http",
@@ -988,6 +994,7 @@ dependencies = [
  "remote-session",
  "rustls",
  "serde_json",
+ "service-layout",
  "sha2",
  "tempfile",
 ]
@@ -1151,6 +1158,7 @@ dependencies = [
 name = "service-layout"
 version = "0.2.0-rc.3"
 dependencies = [
+ "libc",
  "serde_json",
  "sha2",
  "tempfile",

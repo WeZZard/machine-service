@@ -1,19 +1,26 @@
 //! Shared process-level harness for the `machine-service` daemon test suites.
 //!
+//! Every child a test starts is isolated (DC-1xx-ISO-1 to DC-1xx-ISO-6): it
+//! starts from an empty environment through
+//! `service_layout::test_build::harness`, in a process group of its own
+//! with a lifeline, and is ended with everything it started when its handle
+//! drops. A daemon gets its own name file, lease lock, configuration
+//! folder, DNS-SD folder, process fixture and tool table under its root
+//! ([`daemon_command`]); the tools it runs are the table's, never `PATH`'s.
+//!
 //! The Python integration suites start the daemon in-process and replace
 //! `tart`/`_ssh`/`_scp` with `mock.patch.object`. A Rust test cannot patch a
 //! separate process, so this harness starts the real `machine-service` binary and
-//! supplies fake `tart`, `ssh`, and `scp` executables through `PATH`, exactly
-//! as the task requires. The observable seam is therefore the subprocess and
+//! supplies fake `tart`, `ssh`, and `scp` executables through its tool table
+//! (`MACHINE_SERVICE_TEST_TOOLS`, DC-1xx-ISO-4). The observable seam is therefore the subprocess and
 //! HTTP boundary rather than the in-process `Host` trait (which stays reserved
 //! for the `machine-service-core` unit tests).
 //!
 //! Deviation from the Python fixtures (documented per suite): the Python
 //! harness also stubbed `wait_ip`, `wait_ssh`, `bootstrap`, `verify_transfer`,
 //! and `host_macos_guests` in-process. Here those run for real and are served
-//! by the PATH shims, except `host_macos_guests`, which reads `/usr/bin/pgrep`
-//! and cannot be shimmed. The tests that observe it assert the documented
-//! "no host guests" value and are therefore host-environment dependent.
+//! by the tool table's shims, `host_macos_guests` by a `pgrep` that finds no
+//! guest.
 
 #![allow(dead_code)]
 
@@ -21,14 +28,101 @@ use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+pub use service_layout::test_build::harness::{self, Isolated, Lifeline, Owned, BASE_PATH};
+
 /// The daemon binary under test, provided by Cargo for this package.
 pub const DAEMON: &str = env!("CARGO_BIN_EXE_machine-service");
+
+/// The tools a fixture's table fakes rather than links: `pgrep` finds no
+/// guest, `osascript` and `crontab` answer nothing, and each records its
+/// call beside itself.
+pub const FAKE_SYSTEM_TOOLS: [(&str, &str); 3] = [
+    ("pgrep", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nexit 1\n"),
+    ("osascript", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nexit 1\n"),
+    ("crontab", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'crontab: no crontab' >&2\nexit 1\n"),
+];
+
+/// The fakes a fixture keeps in its `bin` that its daemon's tool table
+/// takes too: Tart, OpenSSH, the software the inventory lists, and Softnet,
+/// which the daemon checks but never runs.
+pub const SHIMMED_TOOLS: [&str; 6] = ["tart", "ssh", "scp", "brew", "npm", "softnet"];
+
+/// Make `tools` a daemon's tool table (DC-1xx-ISO-4): links to the
+/// read-only system tools, the fakes of [`FAKE_SYSTEM_TOOLS`], and links to
+/// what `shims` holds, renewed at every start: the [`SHIMMED_TOOLS`] and
+/// any helper a shim runs beside itself. A system tool a test writes into
+/// `shims`, such as a guest's own `codesign`, never enters the table.
+pub fn tool_table(tools: &Path, shims: Option<&Path>) {
+    use service_layout::test_build::{link_system_tools, READ_ONLY_TOOLS};
+    std::fs::create_dir_all(tools).expect("tool table");
+    let missing: Vec<_> = READ_ONLY_TOOLS
+        .into_iter()
+        .filter(|tool| std::fs::symlink_metadata(tools.join(tool.name())).is_err())
+        .collect();
+    link_system_tools(tools, &missing).expect("link system tools");
+    for (name, script) in FAKE_SYSTEM_TOOLS {
+        if std::fs::symlink_metadata(tools.join(name)).is_err() {
+            write_exec(tools, name, script);
+        }
+    }
+    let Some(shims) = shims else {
+        return;
+    };
+    // The links of an earlier start go first, so a shim removed since is
+    // gone from the table too.
+    for entry in std::fs::read_dir(tools).into_iter().flatten().flatten() {
+        if std::fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(shims)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    for entry in std::fs::read_dir(shims).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let system = service_layout::tools::Tool::from_name(&name).is_some();
+        if system && !SHIMMED_TOOLS.contains(&name.as_str()) {
+            continue;
+        }
+        let link = tools.join(&name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(entry.path(), &link).expect("link a shim");
+    }
+}
+
+/// A daemon command under `root`: an isolated child whose name file, lease
+/// lock, configuration folder, DNS-SD folder, process fixture and tool
+/// table (`root/tools`, with the shims of `root/bin`) are its own. A
+/// caller's own values override them.
+pub fn daemon_command(root: &Path) -> Isolated {
+    daemon_command_on(root, &Lifeline::new())
+}
+
+/// [`daemon_command`] on a shared lifeline, for a fixture whose daemon
+/// restarts: what one daemon started is the next one's too.
+pub fn daemon_command_on(root: &Path, lifeline: &Lifeline) -> Isolated {
+    let name = root.join("instance-name");
+    if !name.exists() {
+        std::fs::create_dir_all(root).expect("daemon root");
+        std::fs::write(&name, "test-instance\n").expect("name file");
+    }
+    tool_table(&root.join("tools"), Some(&root.join("bin")));
+    let mut command = harness::command_on(DAEMON, lifeline);
+    command
+        .env("MACHINE_SERVICE_NAME_FILE", &name)
+        .env("MACHINE_SERVICE_DURABLE_LOCK_DIR", root.join("lock"))
+        .env("MACHINE_SERVICE_CONFIG_DIR", root.join("config"))
+        .env("MACHINE_SERVICE_TEST_BONJOUR", root.join("bonjour"))
+        .env(
+            "MACHINE_SERVICE_TEST_PROCESSES",
+            root.join("processes.json"),
+        )
+        .env("MACHINE_SERVICE_TEST_TOOLS", root.join("tools"));
+    command
+}
 
 // --------------------------------------------------------------------- HTTP
 
@@ -271,11 +365,13 @@ pub fn canonical_dir(path: &Path) -> PathBuf {
         .unwrap_or_else(|error| panic!("canonicalize {}: {error}", path.display()))
 }
 
-/// Write an executable script and return its path.
+/// Write an executable script and return its path. Whatever was at the
+/// path before, a link included, is replaced, never written through.
 pub fn write_exec(dir: &Path, name: &str, content: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).expect("shim dir");
     let path = dir.join(name);
+    let _ = std::fs::remove_file(&path);
     std::fs::write(&path, content).expect("write shim");
     let mut permissions = std::fs::metadata(&path)
         .expect("shim metadata")
@@ -285,10 +381,10 @@ pub fn write_exec(dir: &Path, name: &str, content: &str) -> PathBuf {
     path
 }
 
-/// Prepend `bin` to the ambient `PATH`.
+/// The `PATH` of a child whose fakes live in `bin`: `bin`, then the system
+/// folders, never the test runner's own `PATH` (DC-1xx-ISO-4).
 pub fn path_with(bin: &Path) -> String {
-    let base = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{}", bin.display(), base)
+    format!("{}:{BASE_PATH}", bin.display())
 }
 
 // -------------------------------------------------------------------- shims
@@ -478,7 +574,7 @@ pub fn install_shims(bin: &Path) {
 
 /// A running daemon subprocess.
 pub struct Daemon {
-    child: Option<Child>,
+    child: Option<Owned>,
     port: u16,
     stderr_path: PathBuf,
     stdout_path: PathBuf,
@@ -509,7 +605,7 @@ impl Daemon {
         let stderr_path = root.join(format!("daemon-{port}.err"));
         let stdout = std::fs::File::create(&stdout_path).map_err(|error| error.to_string())?;
         let stderr = std::fs::File::create(&stderr_path).map_err(|error| error.to_string())?;
-        let mut command = Command::new(DAEMON);
+        let mut command = daemon_command(root);
         command
             .args(arguments)
             .envs(env.iter().cloned())
@@ -538,7 +634,7 @@ impl Daemon {
 
     /// The daemon's process ID while it runs.
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(Child::id)
+        self.child.as_ref().map(Owned::id)
     }
 
     /// The captured stderr, for diagnostics.
@@ -573,31 +669,10 @@ impl Daemon {
     }
 
     /// Terminate the daemon (SIGTERM, then SIGKILL), mirroring the Python
-    /// `LiveService.__exit__`.
+    /// `LiveService.__exit__`, and end everything it started.
     pub fn stop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        // SAFETY: `kill` takes a process id owned by this handle.
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-            }
+        if let Some(mut child) = self.child.take() {
+            child.terminate(Duration::from_secs(5));
         }
     }
 }
@@ -611,24 +686,31 @@ impl Drop for Daemon {
 // -------------------------------------------------------------------- machctl
 
 /// Locate the `machctl` binary, building it on demand for `cargo test -p
-/// machine-service`, which does not build sibling packages.
+/// machine-service`, which does not build sibling packages. It is always a
+/// test build (DC-1xx-ISO-1).
 pub fn machctl_bin() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| sibling_bin("machctl", "machctl"))
+    PATH.get_or_init(|| {
+        sibling_test_bin(
+            "machctl",
+            "machctl",
+            "service-layout/test-build,discovery/test-build",
+        )
+    })
 }
 
 /// Locate the `guest-session-agent` binary, building it on demand as
 /// [`machctl_bin`] builds `machctl`.
 pub fn guest_agent_bin() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| sibling_bin("guest-session", "guest-session-agent"))
+    PATH.get_or_init(|| sibling_bin("guest-session", "guest-session-agent", &[]))
 }
 
 /// Locate the `relay-agent` binary, building it on demand as
 /// [`machctl_bin`] builds `machctl`.
 pub fn relay_agent_bin() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| sibling_bin("relay-agent", "relay-agent"))
+    PATH.get_or_init(|| sibling_test_bin("relay-agent", "relay-agent", "service-layout/test-build"))
 }
 
 /// A relay agent release in `folder`, in the form `build-relay-agent.sh`
@@ -685,15 +767,34 @@ pub fn write_relay_release_of(folder: &Path, version: &str, macos: &Path, linux:
     folder.to_path_buf()
 }
 
+/// [`sibling_bin`] that is a test build: one without the test seams is
+/// rebuilt with `features`, so no test ever runs a release's CLI or agent.
+fn sibling_test_bin(package: &str, binary: &str, features: &str) -> PathBuf {
+    let candidate = sibling_bin(package, binary, &[]);
+    let marked = |path: &Path| {
+        std::fs::read(path).is_ok_and(|bytes| service_layout::test_build::carries_marker(&bytes))
+    };
+    if marked(&candidate) {
+        return candidate;
+    }
+    let rebuilt = sibling_bin(package, binary, &["--features", features]);
+    assert!(
+        marked(&rebuilt),
+        "{} is not a test build",
+        rebuilt.display()
+    );
+    rebuilt
+}
+
 /// Build `binary` of `package` into the daemon's target directory unless it
-/// is already there.
-fn sibling_bin(package: &str, binary: &str) -> PathBuf {
+/// is already there (always, when `extra` arguments are given).
+fn sibling_bin(package: &str, binary: &str, extra: &[&str]) -> PathBuf {
     let daemon = PathBuf::from(DAEMON);
     let binary_dir = daemon
         .parent()
         .expect("daemon binary has a parent directory");
     let candidate = binary_dir.join(binary);
-    if candidate.is_file() {
+    if candidate.is_file() && extra.is_empty() {
         return candidate;
     }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -704,6 +805,7 @@ fn sibling_bin(package: &str, binary: &str) -> PathBuf {
     let target_dir = binary_dir.parent().expect("profile directory has a parent");
     let status = Command::new("cargo")
         .args(["build", "-p", package, "--bin", binary])
+        .args(extra)
         .current_dir(&workspace)
         .env("CARGO_TARGET_DIR", target_dir)
         .status()
@@ -727,18 +829,21 @@ fn sibling_bin(package: &str, binary: &str) -> PathBuf {
 /// agent or reaches an instance it lists; the CLI then lists only the
 /// fixture's daemon.
 pub fn run_machctl(arguments: &[&str], env: &[(String, String)]) -> Output {
-    let mut command = Command::new(machctl_bin());
+    let bonjour = tempfile::tempdir().expect("an empty DNS-SD folder");
+    let mut command = machctl_command();
     command
         .args(arguments)
-        .env_remove("VM_ENVIRONMENT_FILE")
-        .env_remove("VM_ENVIRONMENT_FINGERPRINT")
-        // The CLI remembers its leases under the state folder (CL-3); only a
-        // caller's own value may place them.
-        .env_remove("MACHINE_SERVICE_STATE")
         .env("CONSUL_HTTP_ADDR", format!("127.0.0.1:{}", free_port()))
-        .envs(env.iter().cloned())
-        .stdin(Stdio::null());
+        .env("MACHINE_SERVICE_TEST_BONJOUR", bonjour.path())
+        .envs(env.iter().cloned());
     command.output().expect("run machctl")
+}
+
+/// An isolated `machctl` command: an empty environment and no discovery
+/// beyond its own empty DNS-SD folder, which a caller may replace
+/// (DC-1xx-ISO-5).
+pub fn machctl_command() -> Isolated {
+    harness::command(machctl_bin())
 }
 
 // ---------------------------------------------------------- legacy fixture
@@ -941,7 +1046,7 @@ impl LegacyFixture {
                 self.tart_home.display().to_string(),
             ),
             ("HOME".to_string(), self.home.display().to_string()),
-            ("PATH".to_string(), path_with(&self.bin)),
+            ("PATH".to_string(), BASE_PATH.to_string()),
         ]
     }
 

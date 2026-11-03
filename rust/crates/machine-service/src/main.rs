@@ -19,6 +19,9 @@ mod name_watch;
 mod probe;
 
 fn main() {
+    // A test build keeps its marker and watches its test's lifeline; a
+    // release does nothing (DC-1xx-ISO-6).
+    machine_service_core::service_layout::test_build::start();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--probe-host") {
         probe::run();
@@ -46,6 +49,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     environment::renamed::refuse_legacy_variables(
         std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
     )?;
+    machine_service_core::test_guard::check_environment_selection()?;
     let mut environment_path: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
@@ -85,6 +89,8 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
     // An unknown mode stops the daemon before it serves (FD-1, DC-84).
     let discovery_mode = discovery::Mode::from_environment()?;
+    // A test build touches none of the installed defaults (DC-1xx-ISO-1).
+    machine_service_core::test_guard::check(&config)?;
 
     if bundle.is_none() {
         // A selected startup binds a store/state; legacy startup must not
@@ -238,7 +244,8 @@ fn advertise(service: &Service, mode: discovery::Mode) -> Option<discovery::dnss
         service.log("discovery: consul mode; not advertising on the network");
         return None;
     }
-    if discovery::is_loopback_host(&service.config.host) {
+    let scope = discovery::dnssd::Scope::from_environment().ok()?;
+    if discovery::is_loopback_host(&service.config.host) && !scope.is_loopback() {
         service.log(&format!(
             "discovery: bound to loopback ({}), so no other Mac could reach this instance; not advertising",
             service.config.host
@@ -256,7 +263,7 @@ fn advertise(service: &Service, mode: discovery::Mode) -> Option<discovery::dnss
         discovery::SERVICE_TYPE,
         service.config.port,
         &txt,
-        discovery::dnssd::Scope::from_environment().ok()?,
+        scope,
         std::time::Duration::from_secs(5),
     ) {
         Ok(advertisement) => {

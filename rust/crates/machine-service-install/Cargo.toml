@@ -26,8 +26,10 @@ tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# The daemon and installer a test runs take the test's own launchctl
-# (DC-242); `cargo build` never enables this.
-machine-service-core = { path = "../machine-service-core", features = ["test-launchd"] }
+# The daemon and installer a test runs are test builds: the test's own
+# launchctl (DC-242) and every other test seam (DC-1xx-ISO-1);
+# `cargo build` never enables this.
+machine-service-core = { path = "../machine-service-core", features = ["test-build"] }
+service-layout = { path = "../service-layout", features = ["test-build"] }
 serde_json.workspace = true
 tempfile.workspace = true

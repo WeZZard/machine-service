@@ -170,7 +170,11 @@ fn processes(context: &Context) -> Value {
 /// The running regular applications, those with a Dock presence, from
 /// `lsappinfo`.
 pub fn running_applications(timeout: Duration) -> Result<Value, String> {
-    let mut command = Command::new("/usr/bin/lsappinfo");
+    // A test build's running applications are its fixture's (DC-1xx-ISO-3).
+    if super::seam::active() {
+        return Ok(super::seam::applications());
+    }
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Lsappinfo)?;
     command.arg("list");
     let output = crate::proc::run_capture(&mut command, None, timeout)
         .map_err(|error| format!("lsappinfo: {error}"))?;
@@ -246,7 +250,8 @@ fn quoted_after(line: &str, prefix: &str) -> Option<String> {
 pub fn bundle_version(app: &Path, timeout: Duration) -> Option<String> {
     let plist = app.join("Contents/Info.plist");
     for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
-        let mut command = Command::new("/usr/bin/plutil");
+        let mut command =
+            service_layout::tools::command(service_layout::tools::Tool::Plutil).ok()?;
         command
             .args(["-extract", key, "raw", "-o", "-"])
             .arg(&plist);
@@ -335,8 +340,17 @@ fn folders(context: &Context) -> Value {
     Value::Object(out)
 }
 
-/// Find an executable on a `PATH`.
+/// Find an executable on a `PATH`; a test build runs what it finds only if
+/// it is a test's own, never one installed in the system's folders
+/// (DC-1xx-ISO-4).
 pub fn which(name: &str, path: Option<&String>) -> Option<PathBuf> {
+    found(name, path).filter(|found| {
+        !service_layout::test_build::is_isolated()
+            || service_layout::tools::program(&found.to_string_lossy()).is_ok()
+    })
+}
+
+fn found(name: &str, path: Option<&String>) -> Option<PathBuf> {
     path?
         .split(':')
         .filter(|dir| !dir.is_empty())
@@ -425,7 +439,7 @@ pub fn parse_npm_globals(text: &str) -> Option<Value> {
 
 /// The user's crontab, one entry per line (DC-74).
 fn crontab(context: &Context) -> Result<Value, String> {
-    let mut command = Command::new("/usr/bin/crontab");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Crontab)?;
     command
         .arg("-l")
         .env_clear()

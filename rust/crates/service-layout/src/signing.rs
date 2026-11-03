@@ -32,7 +32,7 @@
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
 
@@ -563,7 +563,7 @@ pub fn inspect(path: &Path) -> Result<Signature, String> {
 }
 
 fn codesign(arguments: &[&str], path: &Path) -> Result<std::process::Output, String> {
-    Command::new(CODESIGN)
+    crate::tools::command(crate::tools::Tool::Codesign)?
         .args(arguments)
         .arg(path)
         .stdin(Stdio::null())
@@ -605,6 +605,7 @@ pub fn verify(path: &Path, version: &str, anchor: &Anchor) -> Result<Signing, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// `codesign -dr -` output recorded on macOS, with the path and every
     /// team reduced to placeholders (a team that begins with a digit is

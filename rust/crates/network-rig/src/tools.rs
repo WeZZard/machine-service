@@ -7,9 +7,10 @@
 //! renames the result into place, so the cache only ever holds verified
 //! files. Nothing needs root.
 //!
-//! The cache is `NETWORK_RIG_CACHE` when set, else `machine-service/network-rig`
-//! under `XDG_CACHE_HOME`, else under `~/Library/Caches` on macOS and
-//! `~/.cache` elsewhere.
+//! The cache is `NETWORK_RIG_CACHE` when set, else, for a test that Cargo
+//! built, `network-rig-cache` in the build's target folder; anywhere else the
+//! rig refuses until the cache is named, so nothing is written under the
+//! account's home unless asked for (DC-1xx-ISO-7).
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -143,29 +144,37 @@ pub fn pin(tool: Tool, platform: &str) -> Result<&'static Pin, RigError> {
 
 /// The cache directory, by the rule in the module documentation.
 pub fn cache_dir() -> Result<PathBuf, RigError> {
-    cache_dir_from(&|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+    cache_dir_from(
+        &|name| std::env::var_os(name).filter(|value| !value.is_empty()),
+        std::env::current_exe().ok().as_deref(),
+    )
 }
 
-fn cache_dir_from(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf, RigError> {
+/// The target folder of a test executable Cargo built, which lives in
+/// `<target>/<profile>/deps`.
+fn test_target(executable: &Path) -> Option<PathBuf> {
+    let deps = executable.parent()?;
+    (deps.file_name()? == "deps").then(|| deps.parent()?.parent().map(Path::to_path_buf))?
+}
+
+fn cache_dir_from(
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    executable: Option<&Path>,
+) -> Result<PathBuf, RigError> {
     if let Some(dir) = var("NETWORK_RIG_CACHE") {
         return Ok(PathBuf::from(dir));
     }
-    let base = match var("XDG_CACHE_HOME") {
-        Some(dir) => PathBuf::from(dir),
-        None => {
-            let home = var("HOME").ok_or_else(|| RigError::Tool {
-                tool: "cache".into(),
-                reason: "neither NETWORK_RIG_CACHE, XDG_CACHE_HOME nor HOME is set".into(),
-            })?;
-            let home = PathBuf::from(home);
-            if cfg!(target_os = "macos") {
-                home.join("Library/Caches")
-            } else {
-                home.join(".cache")
-            }
-        }
-    };
-    Ok(base.join("machine-service").join("network-rig"))
+    // A test's cache is the build's own, never the account's (DC-1xx-ISO-7).
+    if let Some(target) = executable.and_then(test_target) {
+        return Ok(target.join("network-rig-cache"));
+    }
+    Err(RigError::Tool {
+        tool: "cache".into(),
+        reason:
+            "NETWORK_RIG_CACHE names no cache folder; outside `cargo test` the rig's tool cache is \
+only where it is named"
+                .into(),
+    })
 }
 
 /// The verified executable of `tool` for this platform, fetched on first use.
@@ -346,17 +355,32 @@ mod tests {
                     .map(|(_, v)| OsString::from(v))
             }
         };
+        let test = Path::new("/w/target/debug/deps/rig_live-0123");
+        let tool = Path::new("/w/target/release/relay-acceptance");
         assert_eq!(
-            cache_dir_from(&env(&[("NETWORK_RIG_CACHE", "/c"), ("HOME", "/h")])).unwrap(),
+            cache_dir_from(
+                &env(&[("NETWORK_RIG_CACHE", "/c"), ("HOME", "/h")]),
+                Some(test)
+            )
+            .unwrap(),
             PathBuf::from("/c")
         );
-        assert_eq!(
-            cache_dir_from(&env(&[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")])).unwrap(),
-            PathBuf::from("/x/machine-service/network-rig")
-        );
-        let home = cache_dir_from(&env(&[("HOME", "/h")])).unwrap();
-        assert!(home.starts_with("/h") && home.ends_with("machine-service/network-rig"));
-        assert!(cache_dir_from(&env(&[])).is_err());
+        // A test's cache is under its target folder, never under `HOME`.
+        for vars in [
+            &[("HOME", "/h")][..],
+            &[("XDG_CACHE_HOME", "/x")][..],
+            &[][..],
+        ] {
+            assert_eq!(
+                cache_dir_from(&env(vars), Some(test)).unwrap(),
+                PathBuf::from("/w/target/network-rig-cache")
+            );
+        }
+        // Elsewhere only a named cache is used.
+        for vars in [&[("HOME", "/h")][..], &[("XDG_CACHE_HOME", "/x")][..]] {
+            assert!(cache_dir_from(&env(vars), Some(tool)).is_err());
+            assert!(cache_dir_from(&env(vars), None).is_err());
+        }
     }
 
     #[test]

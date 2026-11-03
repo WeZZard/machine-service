@@ -423,7 +423,7 @@ impl Service {
 /// Spawn the `ssh` channel for a lease identity.
 pub fn ssh_channel(ip: &str, user: &str, key_dir: &Path, command: &str) -> OpResult<GuestChannel> {
     let argv = crate::ssh::ssh_argv(ip, user, key_dir, command)?;
-    let mut process = Command::new(&argv[0]);
+    let mut process = service_layout::tools::command_for(&argv[0]).map_err(OpError::new)?;
     process.args(&argv[1..]);
     ChildChannel::spawn(process)
 }

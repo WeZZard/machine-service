@@ -272,7 +272,7 @@ pub fn display(config: &DurableConfig, unknown: &mut Map<String, Value>) -> Valu
 
 /// `ioreg -n Root -d1`, whose `IOConsoleUsers` lists the GUI sessions.
 fn ioreg_root() -> Option<String> {
-    let mut command = std::process::Command::new("/usr/sbin/ioreg");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Ioreg).ok()?;
     command.args(["-n", "Root", "-d1"]);
     let output =
         crate::proc::run_capture(&mut command, None, std::time::Duration::from_secs(5)).ok()?;
@@ -367,7 +367,7 @@ pub fn disk(path: &str) -> Result<(u64, u64), String> {
 }
 
 fn os_facts(timeout: Duration) -> Result<Value, String> {
-    let mut command = Command::new("/usr/bin/sw_vers");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::SwVers)?;
     let output = crate::proc::run_capture(&mut command, None, timeout)
         .map_err(|error| format!("sw_vers: {error}"))?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -488,7 +488,7 @@ fn run_probe(command: &[String], timeout: Duration) -> Result<Value, String> {
     let (program, arguments) = command
         .split_first()
         .ok_or_else(|| "empty host probe command".to_string())?;
-    let mut process = Command::new(program);
+    let mut process = service_layout::tools::command_for(program)?;
     process.args(arguments);
     let output = crate::proc::run_capture(&mut process, None, timeout)
         .map_err(|error| format!("host probe: {error}"))?;

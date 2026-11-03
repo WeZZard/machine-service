@@ -285,7 +285,8 @@ fn authority_of(base: &str) -> &str {
 /// the local instance does not name itself. Consul's node name never stands
 /// in for it: the node name need not be the Mac's name (DC-80).
 fn local_host_name() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/scutil")
+    let output = service_layout::tools::command(service_layout::tools::Tool::Scutil)
+        .ok()?
         .args(["--get", "LocalHostName"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

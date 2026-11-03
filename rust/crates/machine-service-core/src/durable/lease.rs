@@ -704,7 +704,11 @@ impl DurableMachine {
     }
 
     fn base_environment() -> Vec<(String, String)> {
-        std::env::vars().collect()
+        // A test build's lease shell reads only its fixture's `HOME`, never
+        // the startup files an inherited `ZDOTDIR` names (DC-1xx-ISO-3).
+        std::env::vars()
+            .filter(|(name, _)| !(service_layout::test_build::is_isolated() && name == "ZDOTDIR"))
+            .collect()
     }
 
     fn login_environment(&self) -> Result<Vec<(String, String)>, String> {

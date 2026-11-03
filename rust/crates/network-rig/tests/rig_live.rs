@@ -9,7 +9,8 @@
 //! cargo test -p network-rig --test rig_live -- --ignored
 //! ```
 //!
-//! `NETWORK_RIG_CACHE` moves the cache. Each rig's files stay in a temporary
+//! The cache is `network-rig-cache` in the target folder; `NETWORK_RIG_CACHE`
+//! moves it. Each rig's files stay in a temporary
 //! run directory, which `NETWORK_RIG_KEEP=1` keeps for inspection.
 
 use std::time::{Duration, Instant};

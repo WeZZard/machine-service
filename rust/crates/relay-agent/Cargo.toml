@@ -22,5 +22,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The agent a test runs is a test build that watches its lifeline
+# (DC-1xx-ISO-6); `cargo build` never enables this.
+service-layout = { path = "../service-layout", features = ["test-build"] }
 tempfile.workspace = true
 byte-transfer = { path = "../byte-transfer" }

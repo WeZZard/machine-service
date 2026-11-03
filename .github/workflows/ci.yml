@@ -56,15 +56,16 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
-            tools: ~/.cache/machine-service/network-rig
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
-            tools: ~/.cache/machine-service/network-rig
           - platform: macos-aarch64
             runner: macos-latest
-            tools: ~/Library/Caches/machine-service/network-rig
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    # The rig's tool cache is named, never a default under the runner's home
+    # (DC-1xx-ISO-7).
+    env:
+      NETWORK_RIG_CACHE: ${{ github.workspace }}/.network-rig-cache
     defaults:
       run:
         working-directory: rust
@@ -89,8 +90,8 @@ jobs:
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          # The rig's default cache folder (DC-131).
-          path: ${{ matrix.tools }}
+          # The rig's named cache folder (DC-131, DC-1xx-ISO-7).
+          path: ${{ github.workspace }}/.network-rig-cache
           key: network-rig-tools-${{ matrix.platform }}-${{ steps.pins.outputs.key }}
 
       - name: cargo test -p network-rig --test rig_live -- --ignored

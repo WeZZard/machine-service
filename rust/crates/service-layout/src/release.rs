@@ -11,7 +11,7 @@
 //! `SHA256SUMS`. Nothing else is a relay agent build.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
 
@@ -221,7 +221,7 @@ impl Release {
 }
 
 fn tar(flags: &[&str], archive: &Path, member: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut command = Command::new(TAR);
+    let mut command = crate::tools::command(crate::tools::Tool::Tar)?;
     command.args(flags).arg(archive);
     if let Some(member) = member {
         command.arg(member);
@@ -244,6 +244,7 @@ fn tar(flags: &[&str], archive: &Path, member: Option<&str>) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// A release folder as `build-relay-agent.sh` makes it, with one archive
     /// per platform holding `relay-agent` with `content`.
