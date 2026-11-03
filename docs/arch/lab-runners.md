@@ -136,7 +136,7 @@ flowchart LR
 - **Durable cells** run only on a dispatch by the owner (`workflow_dispatch` with `durable: true` and `github.actor` the repository's owner), never on a push (DC-263). Their labels carry `lab-durable-target`, and their target is `durable_targets` of the plan. The workflow's own condition is a convenience; what admits a durable Mac is its controller's check of the run against its local owner login (LR-10).
 - Concurrency: one lab run at a time, whatever its ref (`group: lab`, never cancelled), and the durable cells in their own group, `lab-durable`, one at a time.
 - Every job ends with an always-run cleanup that releases every lease of its run's test environments whose purpose carries the run's ID. The runner VM is its controller's to release, and stopping a test environment releases whatever is left.
-- The first step masks every name and address of `LAB_PLAN`, and every later step's output and the uploaded evidence are redacted with them (DC-1xx-LAB-8).
+- The first step masks every name and address of `LAB_PLAN`, and every later step's output and the uploaded evidence are redacted with them (relay-lab entry LAB-8).
 
 ## LR-10: Durable Macs
 

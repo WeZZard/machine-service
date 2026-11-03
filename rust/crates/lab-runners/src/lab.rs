@@ -94,7 +94,7 @@ pub fn lan_address() -> Result<Ipv4Addr, String> {
 }
 
 /// `PILOT_REPO` from production's LaunchAgent, read at run time so nothing
-/// names the image source (DC-1xx-LAB-5).
+/// names the image source (relay-lab entry LAB-5).
 pub fn pilot_repo(home: &Path) -> Option<String> {
     let plist = home.join(INSTALLED_PLIST);
     capture(
