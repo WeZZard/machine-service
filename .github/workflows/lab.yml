@@ -8,7 +8,7 @@ name: Lab
 
 on:
   push:
-    branches: [claude/relay-agent, claude/relay-lab]
+    branches: [claude/relay-agent]
   workflow_dispatch:
     inputs:
       cells:
