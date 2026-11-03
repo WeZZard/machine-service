@@ -39,11 +39,12 @@ for arg in "$@"; do
 done
 
 # A purpose is leased once per image, so each client VM names its cell, in
-# the characters a purpose takes.
+# the characters a purpose takes. The client VM gets no credential pack: it
+# needs none, and a pack is for the environment it was made for (DC-283).
 purpose=$(printf 'acc-client-%s-%s' "$cell" "$profile" | tr 'A-Z.' 'a-z-' | cut -c1-64)
 echo "leasing the Ubuntu client VM from $client_instance"
 answer=$(curl -fsS -m 1800 -X POST "$client_instance/acquire" -H 'content-type: application/json' \
-    -d "{\"purpose\":\"$purpose\",\"image\":\"ubuntu2404\",\"ttl_hours\":8}")
+    -d "{\"purpose\":\"$purpose\",\"image\":\"ubuntu2404\",\"env\":\"none\",\"ttl_hours\":8}")
 vm=$(printf %s "$answer" | json 'd["vm"]')
 lease=$(printf %s "$answer" | json 'd.get("lease_id","")')
 echo "client VM: $vm"
@@ -81,7 +82,8 @@ for arg in "$@"; do
 done
 
 exec_script "$vm" "chmod +x ~/relay-acceptance; printf '$hosts' | sudo -n tee -a /etc/hosts >/dev/null; \
-mkdir -p ~/evidence; systemd-run --user --unit relay-acceptance-run --collect \
+mkdir -p ~/evidence ~/rig-cache; systemd-run --user --unit relay-acceptance-run --collect \
+--setenv=NETWORK_RIG_CACHE=\$HOME/rig-cache \
 --setenv=RELAY_ACCEPTANCE_LONG_MINUTES=\${RELAY_ACCEPTANCE_LONG_MINUTES:-30} \
 sh -c 'exec ~/relay-acceptance run$quoted --evidence ~/evidence > ~/evidence/run.log 2>&1'; echo started" >/dev/null
 echo "running $cell under $profile in $vm"
