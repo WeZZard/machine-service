@@ -220,6 +220,8 @@ clean() {
         release_all "http://$target.local:6272"
         $(host_shell "$target") clean || echo "relay-lab: clean of a target failed" >&2
     done
+    # The client side's network rigs, which a cancelled cell leaves running.
+    pkill -TERM -f "^$HOME/Library/Caches/machine-service/network-rig/" 2>/dev/null || true
 }
 
 # Release every lease the lab instance still holds, so that a cancelled run

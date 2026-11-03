@@ -15,24 +15,30 @@ RELAY_HOST_DIR of scripts/relay-acceptance-host.sh, and allows three things:
                                    earlier run left there
     relay-acceptance-host.sh ARGS  run the host script there, as the suite's
                                    --host-shell does (the path is ignored)
-    clean                          the host script's `clean`, and remove host/
+    clean                          release every lease the lab instance holds,
+                                   the host script's `clean`, and remove host/
 
 The deployed host.env gets PILOT_REPO from the installed instance's
 LaunchAgent, read here at run time, so the lab's instance finds the images
 the installed one does without the runner knowing where they lie.
 """
 
+import fcntl
+import json
 import os
 import plistlib
 import shlex
 import shutil
 import subprocess
 import sys
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.path.join(HERE, "host")
 SCRIPT = "relay-acceptance-host.sh"
 INSTALLED = os.path.expanduser("~/Library/LaunchAgents/com.wezzard.machine-service.plist")
+# The host-wide durable lease lock every instance on the Mac shares (DM-2).
+LOCK = "/var/tmp/com.wezzard.machine-service/durable-machine.lock"
 
 
 def host_script(args):
@@ -43,10 +49,72 @@ def host_script(args):
     return subprocess.call(["/bin/sh", script, *args], env=env)
 
 
+def lab_port():
+    try:
+        with open(os.path.join(HOST, "host.env")) as env:
+            for line in env:
+                if line.startswith("RELAY_HOST_PORT="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def release_leases():
+    """Release what the lab instance still holds, over loopback, so that its
+    VMs are deleted and its durable lease frees the Mac before it stops."""
+    port = lab_port()
+    if not port:
+        return
+    base = f"http://127.0.0.1:{port}"
+    try:
+        with urllib.request.urlopen(f"{base}/machines", timeout=30) as answer:
+            records = json.load(answer).get("machines") or []
+    except Exception as error:
+        print(f"relay-lab gate: the lab instance did not list its leases: {error}")
+        return
+    for record in records:
+        lease = record.get("lease_id")
+        if not lease or record.get("state") in ("released", "available", "offer"):
+            continue
+        body = json.dumps({"lease_id": lease, "reason": "relay lab cleanup"}).encode()
+        request = urllib.request.Request(f"{base}/machines/{record['name']}/release", data=body,
+                                         headers={"content-type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(request, timeout=900).read()
+            print("relay-lab gate: released a lease the lab instance held")
+        except Exception as error:
+            print(f"relay-lab gate: a release failed: {error}")
+
+
+def free_own_lock():
+    """A durable lease of the lab instance that outlived its state can never
+    be released by anyone, so the lock entry naming the lab's own removed
+    state folder is cleared; any other holder is left alone."""
+    try:
+        fd = os.open(LOCK, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError:
+        return
+    with os.fdopen(fd, "r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            holder = json.load(handle).get("holder")
+        except ValueError:
+            return
+        state = (holder or {}).get("state_dir", "")
+        if state.startswith(HOST + "/") and not os.path.exists(state):
+            handle.seek(0)
+            handle.truncate()
+            json.dump({"holder": None}, handle)
+            print("relay-lab gate: freed the Mac from a lease of the removed lab instance")
+
+
 def clean():
     if os.path.isfile(os.path.join(HOST, SCRIPT)):
+        release_leases()
         host_script(["clean"])
     shutil.rmtree(HOST, ignore_errors=True)
+    free_own_lock()
 
 
 def pilot_repo():
