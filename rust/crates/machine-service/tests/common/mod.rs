@@ -632,18 +632,41 @@ pub fn relay_agent_bin() -> &'static PathBuf {
 }
 
 /// A relay agent release in `folder`, in the form `build-relay-agent.sh`
-/// makes without a Developer ID identity (a pre-release, DC-224), whose archives for this host's macOS and Linux platforms hold
-/// `executable` (DC-140). Answers the folder.
+/// makes without a Developer ID identity (a pre-release, DC-224), whose
+/// archives for this host's macOS and Linux platforms hold `executable`
+/// (DC-140), the macOS one signed ad hoc with the release identifier
+/// (DC-135), so the daemon trusts it (DC-231). Answers the folder.
 pub fn write_relay_release(folder: &Path, executable: &Path) -> PathBuf {
+    write_relay_release_of(folder, "0.0.0-adhoc", executable, executable)
+}
+
+/// [`write_relay_release`] of `version`, whose macOS archive holds `macos`
+/// signed ad hoc with the release identifier, and whose Linux archive
+/// holds `linux` as it is.
+pub fn write_relay_release_of(folder: &Path, version: &str, macos: &Path, linux: &Path) -> PathBuf {
     use machine_service_core::service_layout::release;
     let _ = std::fs::remove_dir_all(folder);
     std::fs::create_dir_all(folder).unwrap();
-    let stage = tempfile::tempdir().unwrap();
-    std::fs::copy(executable, stage.path().join(release::MEMBER)).unwrap();
     let mut sums = String::new();
-    for kind in ["macos", "linux"] {
+    for (kind, executable) in [("macos", macos), ("linux", linux)] {
+        let stage = tempfile::tempdir().unwrap();
+        let member = stage.path().join(release::MEMBER);
+        std::fs::copy(executable, &member).unwrap();
+        if kind == "macos" {
+            let output = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--identifier"])
+                .arg(machine_service_core::service_layout::signing::IDENTIFIER)
+                .arg(&member)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let file = format!(
-            "relay-agent-0.0.0-adhoc-{}.tar.gz",
+            "relay-agent-{version}-{}.tar.gz",
             release::platform_for(kind)
         );
         let status = Command::new("/usr/bin/tar")

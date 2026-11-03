@@ -343,9 +343,16 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
                 base = legacy.extra.clone();
             }
         }
-        Some(validate_install(
-            cli, &base, &previous, &checked, &env, source, &deployed, home,
-        )?)
+        Some(validate_install(&Installation {
+            cli,
+            old: &base,
+            previous: &previous,
+            env: &checked,
+            written: &env,
+            source,
+            deployed: &deployed,
+            home,
+        })?)
     } else {
         None
     };
@@ -601,17 +608,38 @@ fn refuse_leases(roots: &BTreeSet<PathBuf>) -> Result<(), InstallError> {
 /// to copy, and the relay agent release, when the installation needs one.
 type Validated = (Vec<u8>, Vec<String>, Option<Release>);
 
-#[allow(clippy::too_many_arguments)]
-fn validate_install(
-    cli: &Cli,
-    old: &Map<String, Value>,
-    previous: &BTreeMap<String, String>,
-    env: &BTreeMap<String, String>,
-    written: &BTreeMap<String, String>,
-    source: &Path,
-    deployed: &Path,
-    home: &Path,
-) -> Result<Validated, InstallError> {
+/// What [`validate_install`] checks an installation against.
+#[derive(Clone, Copy)]
+struct Installation<'a> {
+    /// The installer's command line.
+    cli: &'a Cli,
+    /// The LaunchAgent's entries to keep.
+    old: &'a Map<String, Value>,
+    /// The environment of the installation in place.
+    previous: &'a BTreeMap<String, String>,
+    /// The environment to check, with a legacy console configuration.
+    env: &'a BTreeMap<String, String>,
+    /// The environment the LaunchAgent will carry.
+    written: &'a BTreeMap<String, String>,
+    /// The build folder.
+    source: &'a Path,
+    /// The install folder.
+    deployed: &'a Path,
+    /// The operator's home.
+    home: &'a Path,
+}
+
+fn validate_install(installation: &Installation) -> Result<Validated, InstallError> {
+    let Installation {
+        cli,
+        old,
+        previous,
+        env,
+        written,
+        source,
+        deployed,
+        home,
+    } = *installation;
     let service_name = service_layout::Executable::Service.name();
     let service = source.join(service_name);
     if !service.is_file() || !is_executable(&service) {

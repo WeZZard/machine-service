@@ -90,6 +90,20 @@ This page is for two readers:
       never the trust anchor by itself, because it travels with the archive
       that it describes.
   - An ad hoc signature with the identifier, for a pre-release only.
+- The installer and the daemon run the same check (DC-1xx-TRUST2-1). The
+  daemon checks the release that it holds at startup, and again before it
+  uploads a build into a guest or replaces a guest's agent. This holds on
+  every instance, including a Tart-only one with durable exposure off, whose
+  installation never checks the signature:
+  - A release that fails is never sent. Every new lease is served over SSH,
+    and its `link_reason` says why.
+  - `/health` shows the last check as `relay_agent_release`, with
+    `"trusted": true`, the version and the signature kind, or with
+    `"trusted": false` and the reason. A reason names a team only by its
+    fingerprint.
+  - Before any record, the first Developer ID release that the daemon checks
+    is trusted and recorded, as an installation records it
+    (DC-1xx-TRUST2-2).
 - Signing never downgrades (DC-232). machine-service never replaces a relay
   agent signed with Developer ID by a build that is not, on a guest or on a
   Mac, because the grants given to the Developer ID agent would no longer
@@ -97,10 +111,13 @@ This page is for two readers:
   - The installer and the daemon read the installed agent's signature
     before they replace it, and refuse with the reason.
   - At a lease's bootstrap, machine-service reads the guest's agent's
-    signature with `codesign` over SSH. A lease whose only build would
+    signature with `/usr/bin/codesign` over SSH, never with a `codesign`
+    that the guest's `PATH` finds (DC-1xx-TRUST2-4). A lease whose only build would
     downgrade the agent is served over SSH, and its `link_reason` says why.
   - On a lease that lives on, the agent reports its own signature in its
-    hello (relay protocol 3), and a downgrading replacement is not made.
+    hello (relay protocol 3), and a downgrading replacement is not made. An
+    agent of an earlier protocol on macOS is asked with
+    `/usr/bin/codesign` through the relay.
   - Ad hoc by ad hoc, and ad hoc by Developer ID, are allowed.
 - `/health` shows the trusted team as `relay_agent_team`: a fingerprint,
   `sha256:` and 16 hex digits, and whether the team is `configured` or

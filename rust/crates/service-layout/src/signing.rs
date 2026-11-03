@@ -390,6 +390,18 @@ pub fn fingerprint(team: &str) -> String {
     format!("sha256:{hex}")
 }
 
+/// `text` with each team ID of `teams` shown as its [`fingerprint`]
+/// instead, for a message that leaves the operator's terminal, such as a
+/// lease's `link_reason` or `/health` (DC-1xx-TRUST2-3).
+pub fn redact<'a>(text: &str, teams: impl IntoIterator<Item = &'a str>) -> String {
+    teams
+        .into_iter()
+        .filter(|team| valid_team(team))
+        .fold(text.to_string(), |text, team| {
+            text.replace(team, &fingerprint(team))
+        })
+}
+
 fn read_trust_record(path: &Path) -> Result<Option<String>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -807,6 +819,32 @@ mod tests {
             .contains("fix or remove it"));
         std::fs::write(&path, r#"{"team": "lower"}"#).unwrap();
         assert!(Anchor::resolve(state.path(), None).is_err());
+    }
+
+    /// DC-1xx-TRUST2-3: a refusal that leaves the operator's terminal names
+    /// every team by its fingerprint; anything that is not a team ID, such
+    /// as `SHA256SUMS`, is left as it is.
+    #[test]
+    fn a_redacted_refusal_names_teams_by_fingerprint() {
+        let refusal = accept(
+            &Designated::DeveloperId {
+                identifier: IDENTIFIER.into(),
+                team: "OTHER45678".into(),
+            },
+            "1.0.0",
+            &anchor(None, Some("EXAMPLE123")),
+        )
+        .unwrap_err();
+        assert!(refusal.contains("EXAMPLE123") && refusal.contains("OTHER45678"));
+        let redacted = redact(
+            &format!("{refusal}; SHA256SUMS"),
+            ["EXAMPLE123", "OTHER45678", "not-a-team"],
+        );
+        assert!(!redacted.contains("EXAMPLE123"), "{redacted}");
+        assert!(!redacted.contains("OTHER45678"), "{redacted}");
+        assert!(redacted.contains(&fingerprint("EXAMPLE123")), "{redacted}");
+        assert!(redacted.contains(&fingerprint("OTHER45678")), "{redacted}");
+        assert!(redacted.contains("SHA256SUMS"), "{redacted}");
     }
 
     #[test]

@@ -425,6 +425,8 @@ fn handle_get(service: &Service, request: &mut Request, url: &str) -> OpResult<(
             for (key, value) in relay.discovery() {
                 body[key] = json!(value);
             }
+            // DC-1xx-TRUST2-1: the last check of the held release.
+            body["relay_agent_release"] = relay.release_health();
         }
         return Ok((200, body));
     }

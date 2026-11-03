@@ -193,11 +193,9 @@ pub fn plist(identity: &Identity, paths: &Paths) -> Vec<u8> {
 /// [`IDENTIFIER`]: with Developer ID by the team the instance trusts
 /// (`anchor`, or on first use any), or, for a pre-release only, ad hoc
 /// (DC-135, DC-140, DC-224, DC-231). A `SIGNING.json` that disagrees with
-/// the executable is refused. Answers it with the signature it carries.
-pub fn release_executable(
-    release_dir: &Path,
-    anchor: &Anchor,
-) -> Result<(Vec<u8>, Signing), String> {
+/// the executable is refused. The one check of a release's trust, for the
+/// installer and for the daemon's guests alike (DC-1xx-TRUST2-1).
+pub fn release_executable(release_dir: &Path, anchor: &Anchor) -> Result<Trusted, String> {
     let platform = release::platform_for("macos");
     let release = Release::open(release_dir)?;
     release.check_members(&platform)?;
@@ -206,7 +204,23 @@ pub fn release_executable(
     if let Some(record) = signing::Record::read(release_dir)? {
         record.agrees(&signing)?;
     }
-    Ok((bytes, signing))
+    Ok(Trusted {
+        release,
+        bytes,
+        signing,
+    })
+}
+
+/// A release whose macOS executable [`release_executable`] accepted.
+#[derive(Debug, Clone)]
+pub struct Trusted {
+    /// The release, with the `SHA256SUMS` it was read with, so every other
+    /// platform's executable is checked against the same sums.
+    pub release: Release,
+    /// The macOS executable.
+    pub bytes: Vec<u8>,
+    /// Its signature.
+    pub signing: Signing,
 }
 
 /// A release that [`check`] found may be installed.
@@ -250,7 +264,7 @@ impl Checked {
 /// (DC-232). Nothing is written.
 pub fn check(spec: &Spec) -> Result<Checked, String> {
     let anchor = Anchor::resolve(&spec.state_dir, spec.team.clone())?;
-    let (bytes, signing) = release_executable(&spec.release_dir, &anchor)?;
+    let Trusted { bytes, signing, .. } = release_executable(&spec.release_dir, &anchor)?;
     let installed = paths(&spec.identity).executable;
     if installed.exists() && differs(&installed, &bytes) {
         let present = signing::inspect(&installed)?;
@@ -739,6 +753,46 @@ mod tests {
         );
     }
 
+    /// DC-1xx-TRUST2-1: the daemon's check of the release it holds is the
+    /// installer's: an ad hoc pre-release with the identifier is trusted
+    /// and records no team; an ad hoc release that is not a pre-release,
+    /// an executable without the identifier and a damaged trust record are
+    /// refused.
+    #[test]
+    fn the_daemon_checks_its_release_as_the_installer_does() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let builds = root.join("builds");
+        std::fs::create_dir_all(&builds).unwrap();
+        let state = root.join("state");
+        let adhoc = signed_executable(&builds, "adhoc", "/usr/bin/true", "-");
+        release_of(&root.join("pre"), "1.0.0-adhoc", &adhoc);
+        let held = crate::relay::check_release(&root.join("pre"), &state, None).unwrap();
+        assert_eq!(held.signing(), &Signing::AdHoc);
+        assert_eq!(held.version(), "1.0.0-adhoc");
+        assert_eq!(held.build("macos").unwrap(), std::fs::read(&adhoc).unwrap());
+        assert!(!state.join(signing::TRUST_RECORD).exists());
+
+        release_of(&root.join("release"), "1.0.0", &adhoc);
+        let refused = crate::relay::check_release(&root.join("release"), &state, None).unwrap_err();
+        assert!(refused.contains("DC-224"), "{refused}");
+
+        // The system's own `true` carries Apple's identifier, not the
+        // release's.
+        release_of(
+            &root.join("apple"),
+            "1.0.0-adhoc",
+            Path::new("/usr/bin/true"),
+        );
+        assert!(crate::relay::check_release(&root.join("apple"), &state, None).is_err());
+
+        let record = state.join(signing::TRUST_RECORD);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "not json").unwrap();
+        let refused = crate::relay::check_release(&root.join("pre"), &state, None).unwrap_err();
+        assert!(refused.contains("fix or remove it"), "{refused}");
+    }
+
     /// DC-231 and DC-232 with a real Developer ID signature, on a Mac whose
     /// keychain holds the identity:
     /// `RELAY_AGENT_TEST_IDENTITY="Developer ID Application" cargo test -p
@@ -795,6 +849,26 @@ mod tests {
         assert!(refused.contains("DC-232"), "{refused}");
         // The same Developer ID build in place is no replacement at all.
         assert!(check(&first).is_ok());
+
+        // DC-1xx-TRUST2: the daemon's check trusts and records the first
+        // team as an installation does, and its refusal of another
+        // configured team names both by fingerprint only.
+        let state = root.join("daemon-state");
+        let held = crate::relay::check_release(&root.join("signed"), &state, None).unwrap();
+        assert_eq!(held.signing(), &checked.signing);
+        assert_eq!(
+            Anchor::resolve(&state, None).unwrap().recorded.as_deref(),
+            Some(team.as_str())
+        );
+        let refused =
+            crate::relay::check_release(&root.join("signed"), &state, Some(other.to_string()))
+                .unwrap_err();
+        assert!(refused.contains("DC-231"), "{refused}");
+        assert!(
+            !refused.contains(&team) && !refused.contains(other),
+            "{refused}"
+        );
+        assert!(refused.contains(&signing::fingerprint(&team)), "{refused}");
     }
 
     #[test]

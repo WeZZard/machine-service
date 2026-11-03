@@ -134,11 +134,6 @@ pub trait Host: Send + Sync {
         crate::guest_link::agent_bytes_for(kind)
     }
 
-    /// The relay agent build for a guest of `kind` (RA-6, RA-7).
-    fn relay_agent(&self, kind: &str) -> OpResult<Vec<u8>> {
-        crate::relay::agent_bytes_for(kind)
-    }
-
     /// Wait for a VM to report an IP within `timeout_s`.
     fn wait_ip(&self, name: &str, timeout_s: u64) -> Option<String>;
 

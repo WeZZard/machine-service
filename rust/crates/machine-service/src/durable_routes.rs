@@ -54,11 +54,13 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
             &format!("WARN: relay: no durable agent credential: {error}"),
         ),
     }
-    let expected_build = machine_service_core::relay::release_executable(
-        &machine_service_core::service_layout::release::platform_for("macos"),
-    )
-    .map(|bytes| machine_service_core::service_layout::release::sha256_hex(&bytes))
-    .map_err(|error| format!("no relay agent release: {}", error.message));
+    // DC-1xx-TRUST2-1: only a release that the instance trusts names the
+    // build its agent must run for the lease's calls to take it.
+    let expected_build = relay
+        .held_release()
+        .and_then(|held| held.build("macos"))
+        .map(|bytes| machine_service_core::service_layout::release::sha256_hex(&bytes))
+        .map_err(|error| format!("no trusted relay agent release: {error}"));
     if let Err(reason) = &expected_build {
         machine_service_core::config::log_to_file(
             &machine.config.log_file,

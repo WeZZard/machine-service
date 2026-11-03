@@ -19,9 +19,15 @@
 //!   call is out (RA-6, [`Service::watch_relay_agents`]).
 //! - Neither path downgrades the agent's signing (DC-232): a guest whose
 //!   agent is signed with Developer ID is never given a build that is not.
-//!   Bootstrap reads the guest's agent's signature with `codesign` over
-//!   SSH, and a long-lived lease takes it from the agent's hello (protocol
-//!   3) or, from an earlier agent, with `codesign` through the relay.
+//!   Bootstrap reads the guest's agent's signature with `/usr/bin/codesign`
+//!   over SSH, and a long-lived lease takes it from the agent's hello
+//!   (protocol 3) or, from an earlier agent, with `/usr/bin/codesign`
+//!   through the relay ([`GUEST_CODESIGN`]).
+//! - Every build sent comes from a release checked against the instance's
+//!   trust, as the installer checks it ([`Relay::held_release`], DC-231):
+//!   at startup and before every upload or replacement. A release that
+//!   fails serves leases over SSH with the reason (RA-8), and `/health`
+//!   shows it as `relay_agent_release`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, TcpListener};
@@ -37,7 +43,7 @@ use relay_broker::tls::Authority;
 use relay_broker::{Answer, Broker, BrokerConfig, RestartError, Role, RunError, Target, Upload};
 use remote_session::{Listening, ServerConfig, SessionServer};
 use serde_json::{json, Value};
-use service_layout::signing::{self, Signature};
+use service_layout::signing::{self, Signature, Signing};
 
 use crate::error::{OpError, OpResult};
 use crate::service::Service;
@@ -178,19 +184,80 @@ pub fn release_dir() -> OpResult<PathBuf> {
         .ok_or_else(|| OpError::new("relay agent release unavailable"))
 }
 
-/// The relay agent for `platform`: the executable of the release's archive
-/// for it, checked against the release's `SHA256SUMS`. It is the only build
-/// this service ever sends or expects (DC-140).
-pub fn release_executable(platform: &str) -> OpResult<Vec<u8>> {
-    let dir = release_dir()?;
-    service_layout::release::Release::open(&dir)
-        .and_then(|release| release.executable(platform))
-        .map_err(OpError::new)
+/// The relay agent release this instance holds, once its trust is checked
+/// ([`held_release`]). It is the only source of the builds this service
+/// ever sends or expects (DC-140).
+#[derive(Debug, Clone)]
+pub struct HeldRelease {
+    trusted: crate::durable::relay_agent::Trusted,
 }
 
-/// The relay agent for a guest of `kind`, from the release.
-pub fn agent_bytes_for(kind: &str) -> OpResult<Vec<u8>> {
-    release_executable(&service_layout::release::platform_for(kind))
+impl HeldRelease {
+    /// The signature of its macOS executable.
+    pub fn signing(&self) -> &Signing {
+        &self.trusted.signing
+    }
+
+    /// Its version.
+    pub fn version(&self) -> &str {
+        &self.trusted.release.version
+    }
+
+    /// The relay agent for a guest of `kind`: the executable of the
+    /// release's archive for its platform, checked against the
+    /// `SHA256SUMS` the trust was checked with.
+    pub fn build(&self, kind: &str) -> Result<Vec<u8>, String> {
+        self.trusted
+            .release
+            .executable(&service_layout::release::platform_for(kind))
+    }
+}
+
+/// Check the relay agent release in `release_dir` that the instance on
+/// `state_dir` holds against the instance's trust, with the operator's
+/// `configured` team, exactly as the installer checks a release
+/// ([`crate::durable::relay_agent::release_executable`], DC-231,
+/// DC-1xx-TRUST2-1). A Developer ID team the record does not name yet is
+/// recorded, as an installation records it (DC-1xx-TRUST2-2). A refusal
+/// names every team by its fingerprint, because it reaches a lease's
+/// `link_reason` and `/health` (DC-1xx-TRUST2-3).
+pub fn check_release(
+    release_dir: &Path,
+    state_dir: &Path,
+    configured: Option<String>,
+) -> Result<HeldRelease, String> {
+    let anchor = signing::Anchor::resolve(state_dir, configured)?;
+    let trusted = crate::durable::relay_agent::release_executable(release_dir, &anchor)
+        .map_err(|error| redacted(&error, &anchor, release_dir))?;
+    if let Some(team) = anchor.to_record(&trusted.signing) {
+        anchor.record(team).map_err(|error| {
+            format!("the team that signed it could not be recorded as trusted: {error}")
+        })?;
+    }
+    Ok(HeldRelease { trusted })
+}
+
+/// `error` with the anchor's teams and the release's signer shown by
+/// their fingerprints.
+fn redacted(error: &str, anchor: &signing::Anchor, release_dir: &Path) -> String {
+    let signer = service_layout::release::Release::open(release_dir)
+        .and_then(|release| release.executable(&service_layout::release::platform_for("macos")))
+        .and_then(|bytes| build_signature(&bytes))
+        .ok()
+        .and_then(|signature| signature.team().map(str::to_string));
+    let teams = [&anchor.configured, &anchor.recorded, &signer];
+    signing::redact(error, teams.into_iter().flatten().map(String::as_str))
+}
+
+/// [`check_release`] for this process: the release [`release_dir`] names,
+/// and the team [`signing::TEAM_VARIABLE`] names.
+pub fn held_release(state_dir: &Path) -> Result<HeldRelease, String> {
+    let release_dir = release_dir().map_err(|error| error.message)?;
+    check_release(
+        &release_dir,
+        state_dir,
+        crate::durable::relay_agent::configured_team()?,
+    )
 }
 
 /// The broker and its listener.
@@ -210,6 +277,11 @@ pub struct Relay {
     /// The build each lease's replacement last failed to bring, so a guest
     /// that cannot take it is not tried again for that build.
     failed_builds: Mutex<HashMap<String, String>>,
+    /// The instance's state folder, which holds its trust record.
+    state_dir: PathBuf,
+    /// What `/health` shows of the last check of the held release; held
+    /// through each check, so two checks never record the trust at once.
+    release_check: Mutex<Value>,
 }
 
 impl Relay {
@@ -252,7 +324,7 @@ impl Relay {
             settings.relay_url,
             authority.sha256()
         ));
-        Ok(Arc::new(Relay {
+        let relay = Arc::new(Relay {
             settings,
             broker,
             authority,
@@ -260,7 +332,50 @@ impl Relay {
             credentials: Mutex::new(HashMap::new()),
             replacing: Mutex::new(HashSet::new()),
             failed_builds: Mutex::new(HashMap::new()),
-        }))
+            state_dir: state_dir.to_path_buf(),
+            release_check: Mutex::new(Value::Null),
+        });
+        // DC-1xx-TRUST2-1: the held release is checked at startup, whatever
+        // else this instance offers.
+        match relay.held_release() {
+            Ok(held) => log(&format!(
+                "relay: the relay agent release {} is trusted: signed {}",
+                held.version(),
+                held.signing().kind()
+            )),
+            Err(reason) => log(&format!(
+                "WARN: relay: the relay agent release is not trusted: {reason}; leases are served over SSH until it is (RA-8)"
+            )),
+        }
+        Ok(relay)
+    }
+
+    /// Check the relay agent release this instance holds against its trust
+    /// ([`held_release`]): at startup, and before every upload or
+    /// replacement of a guest's relay agent, so the release in place when
+    /// a build is sent is the one checked (DC-1xx-TRUST2-1). A release
+    /// that fails serves leases over SSH with the reason (RA-8).
+    pub fn held_release(&self) -> Result<HeldRelease, String> {
+        let mut shown = self.release_check.lock().unwrap_or_else(|e| e.into_inner());
+        let held = held_release(&self.state_dir);
+        *shown = match &held {
+            Ok(held) => json!({
+                "trusted": true,
+                "version": held.version(),
+                "signing": held.signing().kind(),
+            }),
+            Err(reason) => json!({"trusted": false, "reason": reason}),
+        };
+        held
+    }
+
+    /// What `/health` shows of the held release as `relay_agent_release`:
+    /// the outcome of its last check, `null` before any.
+    pub fn release_health(&self) -> Value {
+        self.release_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Stop accepting connections.
@@ -395,16 +510,27 @@ pub fn inspect_command() -> String {
 /// What [`signature_command`] prints where the guest has no `codesign`.
 const NO_CODESIGN: &str = "machine-service-relay: no codesign";
 
-/// Print what `codesign` shows of the guest's relay agent's signature
-/// (DC-232); `codesign` is found on the guest's `PATH`.
+/// The `codesign` a guest's signature check runs: macOS's only system
+/// `codesign`, never one found on the guest's `PATH`, which the guest's
+/// account controls (DC-1xx-TRUST2-4).
+pub const GUEST_CODESIGN: &str = "/usr/bin/codesign";
+
+/// Print what [`GUEST_CODESIGN`] shows of the guest's relay agent's
+/// signature (DC-232), or [`NO_CODESIGN`] where the guest has none.
 pub fn signature_command() -> String {
     sh(
         &format!(
-            "p=\"$HOME/{GUEST_EXECUTABLE}\"; if command -v codesign >/dev/null 2>&1; then \
-codesign -d -r- \"$p\" 2>&1; else echo '{NO_CODESIGN}'; fi; exit 0"
+            "p=\"$HOME/{GUEST_EXECUTABLE}\"; if [ -x {GUEST_CODESIGN} ]; then \
+{GUEST_CODESIGN} -d -r- \"$p\" 2>&1; else echo '{NO_CODESIGN}'; fi; exit 0"
         ),
         "signature",
     )
+}
+
+/// The command a relay agent of an earlier protocol on macOS runs to show
+/// its own executable's signature with [`GUEST_CODESIGN`] (DC-232).
+pub fn relay_signature_command() -> String {
+    format!("{GUEST_CODESIGN} -d -r- \"$HOME/{GUEST_EXECUTABLE}\" 2>&1")
 }
 
 /// The signature of a relay agent in place from what [`signature_command`]
@@ -786,11 +912,13 @@ impl Service {
             return;
         };
         let kind = crate::ops::record_kind(&record).to_string();
-        let build = match self.host.relay_agent(&kind) {
+        // DC-1xx-TRUST2-1: the release is checked against the instance's
+        // trust before its build is compared, let alone written.
+        let build = match relay.held_release().and_then(|held| held.build(&kind)) {
             Ok(build) => build,
             Err(error) => {
                 self.log(&format!(
-                    "WARN: relay: {vm}: cannot compare the relay agent's build: {error}"
+                    "WARN: relay: {vm}: the relay agent is not replaced: the relay agent release is not trusted or has no build for it: {error}"
                 ));
                 return;
             }
@@ -859,7 +987,7 @@ impl Service {
                 target,
                 &uuid::Uuid::new_v4().to_string(),
                 Op::Exec {
-                    command: format!("codesign -d -r- \"$HOME/{GUEST_EXECUTABLE}\" 2>&1"),
+                    command: relay_signature_command(),
                     stdin: false,
                     timeout_s: 60.0,
                 },
@@ -1093,10 +1221,12 @@ impl Service {
         };
 
         // The build: the image's when it is the release's, else the
-        // release's executable, uploaded (RA-6, DC-140).
-        let build = self
-            .host
-            .relay_agent(kind)
+        // release's executable, uploaded (RA-6, DC-140), from a release
+        // checked against the instance's trust now (DC-1xx-TRUST2-1).
+        let build = relay
+            .held_release()
+            .map_err(|e| format!("the relay agent release is not trusted: {e}"))?
+            .build(kind)
             .map_err(|e| format!("no relay agent to send: {e}"))?;
         let want = sha256_hex(&build);
         let (rc, have) = ssh(&inspect_command(), None, 60)?;
@@ -1585,6 +1715,44 @@ mod tests {
         assert!(config_command().contains("mv -f"));
         assert!(upload_command().contains(GUEST_EXECUTABLE));
         assert!(signature_command().contains(GUEST_EXECUTABLE));
+    }
+
+    /// DC-1xx-TRUST2-4: a guest's signature check runs `/usr/bin/codesign`;
+    /// a `codesign` that the guest's `PATH` finds first, which would claim
+    /// any signature, is never run, at bootstrap or through the relay.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_guests_signature_check_never_runs_a_codesign_from_its_path() {
+        let guest = tempfile::tempdir().unwrap();
+        let bin = guest.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("codesign");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'designated => identifier \"com.wezzard.relay-agent\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EXAMPLE123'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = guest.path().join(GUEST_EXECUTABLE);
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "an unsigned build\n").unwrap();
+        for command in [signature_command(), relay_signature_command()] {
+            assert!(command.contains(GUEST_CODESIGN), "{command}");
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&command)
+                .env("HOME", guest.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .unwrap();
+            let shown = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                guest_signature("macos", &shown).unwrap(),
+                Signature::Unsigned,
+                "{command}: {shown}"
+            );
+        }
     }
 
     /// DC-232: the guest's agent's signature is read from `codesign`; a

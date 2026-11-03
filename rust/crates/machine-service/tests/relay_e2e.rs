@@ -47,6 +47,10 @@ case "$*" in
     last=""
     for a in "$@"; do last="$a"; done
     printf '%s\n' "$last" >> "$FAKE_ROOT/relay-calls.log"
+    # The fake guest's own /usr/bin/codesign, when the test gives it one.
+    if [ -x "$FAKE_ROOT/guest-codesign" ]; then
+      last=$(printf '%s' "$last" | sed "s#/usr/bin/codesign#$FAKE_ROOT/guest-codesign#g")
+    fi
     HOME="$FAKE_GUEST_HOME" exec sh -c "$last" ;;
 esac
 exec "$(dirname "$0")/ssh-fake" "$@"
@@ -755,7 +759,9 @@ fn a_long_lived_lease_gets_the_instances_new_relay_agent_build() {
     build.extend_from_slice(b"a newer build");
     let new = sha256_hex(&build);
     std::fs::write(&held, &build).unwrap();
-    write_relay_release(&release, &held);
+    // Only the Linux build is new: the macOS one must stay a signable
+    // executable for the daemon to trust the release (DC-231).
+    write_relay_release_of(&release, "0.0.0-adhoc", relay_agent_bin(), &held);
     daemon.stop();
     let _daemon = lab.start();
 
@@ -816,19 +822,27 @@ fn wait_until_e2e(mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-/// A `codesign` on the guest's `PATH` that shows the recorded output
-/// `fixture` of service-layout's tests, so the guest's relay agent reads as
-/// signed that way. The daemon's own checks run `/usr/bin/codesign`.
-fn guest_codesign(lab: &Lab, fixture: &str) {
+/// A script that shows the recorded `codesign` output `fixture` of
+/// service-layout's tests.
+fn recorded_codesign(fixture: &str) -> String {
     let recorded = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../service-layout/tests/fixtures/codesign")
         .join(fixture)
         .canonicalize()
         .unwrap();
+    format!("#!/bin/sh\ncat '{}'\n", recorded.display())
+}
+
+/// The fake guest's `/usr/bin/codesign`: the fake `ssh`, which stands for
+/// the guest, runs it wherever a command names `/usr/bin/codesign`, so the
+/// guest's relay agent reads as signed as `fixture` shows. The daemon's
+/// command is the production one; only the guest is fake
+/// (DC-1xx-TRUST2-4).
+fn guest_codesign(lab: &Lab, fixture: &str) {
     write_exec(
-        &lab.fixture.bin,
-        "codesign",
-        &format!("#!/bin/sh\ncat '{}'\n", recorded.display()),
+        &lab.fixture.tart_home,
+        "guest-codesign",
+        &recorded_codesign(fixture),
     );
 }
 
@@ -1009,4 +1023,179 @@ fn a_long_lived_lease_never_downgrades_a_developer_id_agent() {
     let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
     assert_eq!(released.status, 200, "{}", released.body);
     signed.shutdown(Duration::from_secs(1));
+}
+
+/// DC-1xx-TRUST2-4: the guest's signature check runs `/usr/bin/codesign`;
+/// a `codesign` that the guest's `PATH` finds first, claiming Developer ID,
+/// is never run. The guest's agent reads as the unsigned file it is, so the
+/// instance's build replaces it and the lease runs over the relay.
+#[test]
+fn a_codesign_on_the_guests_path_is_never_run() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    write_exec(
+        &lab.fixture.bin,
+        "codesign",
+        &recorded_codesign("developer-id.txt"),
+    );
+    let installed = guest_agent(&lab, b"an earlier unsigned build");
+    let agent = AgentProcess::start(&lab.guest_home, &[]);
+    let _daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(
+        answer["link"],
+        "relay",
+        "{answer}\nagent log:\n{}",
+        agent.log()
+    );
+    let calls = lab.relay_calls();
+    assert!(calls.contains("machine-service-relay-signature"), "{calls}");
+    assert!(calls.contains("machine-service-relay-upload"), "{calls}");
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(relay_agent_bin()).unwrap()
+    );
+    let vm = answer["vm"].as_str().unwrap();
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+    drop(agent);
+}
+
+/// The lab's release made a release, `1.0.0`, signed ad hoc: refused by
+/// the trust check, because only a pre-release may be ad hoc (DC-224).
+fn untrusted_release(lab: &Lab) {
+    write_relay_release_of(&lab.release, "1.0.0", relay_agent_bin(), relay_agent_bin());
+}
+
+fn health(lab: &Lab) -> Value {
+    http(lab.fixture.port(), "GET", "/health", None, None).body
+}
+
+/// DC-1xx-TRUST2-1 at startup: an instance that runs the relay link
+/// without durable exposure checks its release against its trust as the
+/// installer would. A release that fails is never sent: `/health` says so
+/// with the reason, and every lease is served over SSH with it (RA-8),
+/// before anything is read from or uploaded into the guest.
+#[test]
+fn an_untrusted_release_serves_every_lease_over_ssh() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    untrusted_release(&lab);
+    let _daemon = lab.start();
+    let shown = health(&lab)["relay_agent_release"].clone();
+    assert_eq!(shown["trusted"], false, "{shown}");
+    assert!(
+        shown["reason"].as_str().unwrap().contains("DC-224"),
+        "{shown}"
+    );
+    assert!(
+        service_log(&lab).contains("WARN: relay: the relay agent release is not trusted"),
+        "{}",
+        service_log(&lab)
+    );
+    let answer = acquire(&lab);
+    assert_eq!(answer["state"], "running");
+    assert_eq!(answer["link"], "ssh-fallback", "{answer}");
+    let reason = answer["link_reason"].as_str().unwrap();
+    assert!(reason.contains("not trusted"), "{reason}");
+    assert!(reason.contains("DC-224"), "{reason}");
+    assert!(answer.get("relay").is_none(), "{answer}");
+    let calls = lab.relay_calls();
+    assert!(!calls.contains("machine-service-relay-"), "{calls}");
+    let vm = answer["vm"].as_str().unwrap();
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+}
+
+/// DC-1xx-TRUST2-1 before every upload: a release trusted at startup and
+/// then replaced in place by one that fails is checked again at the next
+/// acquisition, which is served over SSH, and `/health` follows.
+#[test]
+fn a_release_is_checked_again_before_every_upload() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    let _daemon = lab.start();
+    let shown = health(&lab)["relay_agent_release"].clone();
+    assert_eq!(
+        shown,
+        json!({"trusted": true, "version": "0.0.0-adhoc", "signing": "adhoc"})
+    );
+    untrusted_release(&lab);
+    let answer = acquire(&lab);
+    assert_eq!(answer["link"], "ssh-fallback", "{answer}");
+    assert!(
+        answer["link_reason"]
+            .as_str()
+            .unwrap()
+            .contains("not trusted"),
+        "{answer}"
+    );
+    assert!(!lab.relay_calls().contains("machine-service-relay-upload"));
+    assert_eq!(health(&lab)["relay_agent_release"]["trusted"], false);
+    let vm = answer["vm"].as_str().unwrap();
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+}
+
+/// DC-1xx-TRUST2-1 before every replacement: an instance that restarts
+/// with a release that fails its trust never writes that release's build
+/// over a long-lived lease's agent; the lease keeps the agent it has.
+#[test]
+fn a_long_lived_lease_never_gets_an_untrusted_build() {
+    let session_port = free_session_port();
+    let lab = Lab::new(
+        session_port,
+        &format!("wss://localhost:{session_port}/relay"),
+    );
+    let installed = guest_agent(&lab, &std::fs::read(relay_agent_bin()).unwrap());
+    let agent = AgentProcess::start_from(&installed, &lab.guest_home, &[]);
+    let mut daemon = lab.start();
+    let answer = acquire(&lab);
+    assert_eq!(
+        answer["link"],
+        "relay",
+        "{answer}\nagent log:\n{}",
+        agent.log()
+    );
+    let vm = answer["vm"].as_str().unwrap().to_string();
+
+    // The instance comes back with a new Linux build in a release that
+    // fails its trust.
+    let held = lab.fixture.root.join("held-relay-agent");
+    let mut build = std::fs::read(relay_agent_bin()).unwrap();
+    build.extend_from_slice(b"an untrusted build");
+    std::fs::write(&held, &build).unwrap();
+    write_relay_release_of(&lab.release, "1.0.0", relay_agent_bin(), &held);
+    daemon.stop();
+    let _daemon = lab.start();
+    assert!(
+        wait_until_e2e(|| service_log(&lab).contains("the relay agent is not replaced")),
+        "{}\nagent log:\n{}",
+        service_log(&lab),
+        agent.log()
+    );
+    let log = service_log(&lab);
+    assert!(log.contains("not trusted"), "{log}");
+    assert!(!log.contains("replacing it (RA-6)"), "{log}");
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(relay_agent_bin()).unwrap()
+    );
+    let ran = lab.post(
+        &format!("/machines/{vm}/exec"),
+        &json!({"argv": ["echo", "kept"]}),
+    );
+    assert_eq!(ran.body["output"], "kept\n", "{}", ran.body);
+    let released = lab.post(&format!("/machines/{vm}/release"), &json!({}));
+    assert_eq!(released.status, 200, "{}", released.body);
+    drop(agent);
 }

@@ -85,10 +85,17 @@ struct Lab {
     port: u16,
     daemon: Option<Child>,
     agent: Option<Child>,
-    /// The fake launchd's folder, when the daemon is given a `launchctl`
-    /// that runs the LaunchAgents it loads.
+    /// The folder of the daemon's `launchctl`: the fake launchd, which runs
+    /// the LaunchAgents it loads, or one that refuses to load any. Never
+    /// the real one, which would load the instance's relay agent into this
+    /// Mac's desktop session.
     launchd: Option<PathBuf>,
 }
+
+/// A `launchctl` that loads nothing: the daemon finds no desktop session
+/// and leaves its relay agent unprovisioned, with nothing loaded into this
+/// Mac's own session.
+const NO_LAUNCHCTL: &str = "#!/bin/sh\necho 'this test loads no LaunchAgent' >&2\nexit 1\n";
 
 /// A `launchctl` that runs a LaunchAgent's program as launchd would, with
 /// its `HOME`, and keeps its process ID by label, so a test sees the daemon
@@ -203,14 +210,20 @@ impl Lab {
             agent: None,
             launchd: None,
         };
-        if launchd {
-            let folder = lab.root.join("launchd");
-            std::fs::create_dir_all(&folder).unwrap();
-            let fake = folder.join("launchctl");
-            std::fs::write(&fake, FAKE_LAUNCHCTL).unwrap();
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            lab.launchd = Some(folder);
-        }
+        let folder = lab.root.join("launchd");
+        std::fs::create_dir_all(&folder).unwrap();
+        let fake = folder.join("launchctl");
+        std::fs::write(
+            &fake,
+            if launchd {
+                FAKE_LAUNCHCTL
+            } else {
+                NO_LAUNCHCTL
+            },
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lab.launchd = Some(folder);
         lab.start_daemon(&config);
         lab
     }
@@ -289,8 +302,25 @@ impl Lab {
         panic!("the daemon did not start");
     }
 
-    /// Configure and start the relay agent as the installer does (IN-3).
+    /// Configure and start the release's relay agent as the installer does
+    /// (IN-3): the release's macOS executable, which the daemon trusts. An
+    /// agent this lab started before is stopped first, so none outlives
+    /// the test and no running executable is written over.
     fn start_agent(&mut self) -> i32 {
+        self.stop_agent();
+        let release = machine_service_core::service_layout::release::Release::open(&self.release)
+            .unwrap()
+            .executable(&machine_service_core::service_layout::release::platform_for("macos"))
+            .unwrap();
+        let executable = self.root.join("release-agent");
+        std::fs::write(&executable, release).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.start_agent_from(&executable)
+    }
+
+    /// [`Lab::start_agent`], running `executable` as the agent.
+    fn start_agent_from(&mut self, executable: &Path) -> i32 {
+        self.stop_agent();
         let credential =
             std::fs::read_to_string(self.state.join("relay/durable-agent.credential")).unwrap();
         let ca = std::fs::read_to_string(self.state.join("relay/tls/ca.pem")).unwrap();
@@ -309,7 +339,7 @@ impl Lab {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let child = Command::new(relay_agent_bin())
+        let child = Command::new(executable)
             .arg("run")
             .env("HOME", &self.agent_home)
             .env("SHELL", "/bin/sh")
@@ -548,6 +578,8 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
     // shows in `/health` as a fingerprint, never as the team.
     let health = lab.request("GET", "/health", None).body;
     assert_eq!(health["relay_agent_team"], Value::Null, "{health}");
+    // DC-1xx-TRUST2-1: the daemon checked the release it holds itself.
+    assert_eq!(health["relay_agent_release"]["trusted"], true, "{health}");
     let record = lab
         .state
         .join(machine_service_core::service_layout::signing::TRUST_RECORD);
@@ -761,7 +793,7 @@ fn m4_without_the_release_agent_exec_falls_back_to_the_session() {
 
     // An agent that is not the release's build (DC-140).
     let mut lab = Lab::new(Path::new("/usr/bin/true"));
-    lab.start_agent();
+    lab.start_agent_from(relay_agent_bin());
     let (name, lease, _) = lab.acquire("none");
     let deadline = Instant::now() + Duration::from_secs(60);
     let reason = loop {
