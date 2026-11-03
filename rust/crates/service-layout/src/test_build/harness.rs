@@ -1,4 +1,4 @@
-//! How a test starts a child (DC-1xx-ISO-1, DC-1xx-ISO-6): from an empty
+//! How a test starts a child (DC-251, DC-256): from an empty
 //! environment, in a process group of its own, with a lifeline, and ended
 //! with everything related to it when its handle drops.
 //!
@@ -52,7 +52,7 @@ impl Lifeline {
 
     /// Close both ends in this process as a test that dies does, without
     /// ending anything itself: what holds the lifeline sees it end and ends
-    /// its own, which a guard test proves (DC-1xx-ISO-6). Nothing can start
+    /// its own, which a guard test proves (DC-256). Nothing can start
     /// on it afterwards.
     pub fn sever(&self) {
         for end in [&self.0.write, &self.0.read] {

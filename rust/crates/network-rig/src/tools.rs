@@ -10,7 +10,7 @@
 //! The cache is `NETWORK_RIG_CACHE` when set, else, for a test that Cargo
 //! built, `network-rig-cache` in the build's target folder; anywhere else the
 //! rig refuses until the cache is named, so nothing is written under the
-//! account's home unless asked for (DC-1xx-ISO-7).
+//! account's home unless asked for (DC-257).
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -164,7 +164,7 @@ fn cache_dir_from(
     if let Some(dir) = var("NETWORK_RIG_CACHE") {
         return Ok(PathBuf::from(dir));
     }
-    // A test's cache is the build's own, never the account's (DC-1xx-ISO-7).
+    // A test's cache is the build's own, never the account's (DC-257).
     if let Some(target) = executable.and_then(test_target) {
         return Ok(target.join("network-rig-cache"));
     }

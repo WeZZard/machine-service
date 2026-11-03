@@ -7,7 +7,7 @@
 //! Consul agent, and `MACHINE_SERVICE_PORT` always points at a fake, so no
 //! test reaches an installed instance. The CLI is an isolated test child
 //! whose DNS-SD is a folder of the test's own, empty unless a test
-//! advertises in it, so no test browses the network (DC-1xx-ISO-5).
+//! advertises in it, so no test browses the network (DC-255).
 
 use std::collections::HashMap;
 use std::net::TcpListener;

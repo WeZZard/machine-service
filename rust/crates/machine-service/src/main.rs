@@ -20,7 +20,7 @@ mod probe;
 
 fn main() {
     // A test build keeps its marker and watches its test's lifeline; a
-    // release does nothing (DC-1xx-ISO-6).
+    // release does nothing (DC-256).
     machine_service_core::service_layout::test_build::start();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--probe-host") {
@@ -89,7 +89,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
     // An unknown mode stops the daemon before it serves (FD-1, DC-84).
     let discovery_mode = discovery::Mode::from_environment()?;
-    // A test build touches none of the installed defaults (DC-1xx-ISO-1).
+    // A test build touches none of the installed defaults (DC-251).
     machine_service_core::test_guard::check(&config)?;
 
     if bundle.is_none() {

@@ -1,6 +1,6 @@
 //! MI-1 to MI-3 / DC-87 to DC-89 at TL-2: isolated real daemons, a file
 //! name source, and the test build's DNS-SD folder, so every daemon binds
-//! loopback and nothing is advertised beyond this test (DC-1xx-ISO-2). No
+//! loopback and nothing is advertised beyond this test (DC-252). No
 //! test changes the Mac's name.
 
 mod common;

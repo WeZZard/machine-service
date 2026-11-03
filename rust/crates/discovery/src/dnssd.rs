@@ -16,7 +16,7 @@ pub enum Scope {
     LocalOnly,
     /// A test build's folder, which stands for DNS-SD: an advertisement is
     /// a file in it, found at loopback, and nothing reaches mDNSResponder
-    /// (DC-1xx-ISO-2).
+    /// (DC-252).
     #[cfg(feature = "test-build")]
     Folder(std::path::PathBuf),
 }
@@ -40,7 +40,7 @@ impl Scope {
     /// Read the scope a binary advertises and browses in. A test build's
     /// is always the folder [`TEST_VARIABLE`] names, and without one it has
     /// none: no binary the default suite starts reaches DNS-SD
-    /// (DC-1xx-ISO-2). The opt-in live layer reads the setting as a release
+    /// (DC-252). The opt-in live layer reads the setting as a release
     /// does.
     pub fn from_environment() -> Result<Self, String> {
         #[cfg(feature = "test-build")]

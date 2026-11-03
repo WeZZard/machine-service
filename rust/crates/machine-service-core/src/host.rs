@@ -439,7 +439,7 @@ impl Host for RealHost {
 
     fn softnet(&self) -> Result<PathBuf, String> {
         // A test build looks for Softnet only in its tool table
-        // (DC-1xx-ISO-4).
+        // (DC-254).
         let search = if service_layout::test_build::is_isolated() {
             service_layout::test_build::tools_folder().map(std::ffi::OsString::from)
         } else {

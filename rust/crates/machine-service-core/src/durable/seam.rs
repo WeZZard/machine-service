@@ -1,5 +1,5 @@
 //! The process table and the running applications that a test build's
-//! release sweep sees (DC-1xx-ISO-3; `docs/arch/hygiene.md` HY-3).
+//! release sweep sees (DC-253; `docs/arch/hygiene.md` HY-3).
 //!
 //! A release reads the Mac's process table and `lsappinfo`, and signals what
 //! its rules match. A test build never acts on the developer's login

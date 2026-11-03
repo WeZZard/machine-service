@@ -9,8 +9,8 @@
 //!
 //! The isolated `HOME` lies under Cargo's own temporary folder for the
 //! tests, never under the account's home, and the installer runs as an
-//! isolated test child with a tool table of its own (DC-1xx-ISO-1,
-//! DC-1xx-ISO-4, DC-1xx-ISO-7).
+//! isolated test child with a tool table of its own (DC-251,
+//! DC-254, DC-257).
 
 #![allow(dead_code)]
 
@@ -173,7 +173,7 @@ pub struct Harness {
 impl Harness {
     pub fn new() -> Self {
         // The build's own temporary folder, resolved, since the installer
-        // refuses a linked parent folder (DC-1xx-ISO-7).
+        // refuses a linked parent folder (DC-257).
         let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
         fs::create_dir_all(parent).unwrap();
         let tmp = tempfile::Builder::new()
@@ -282,7 +282,7 @@ impl Harness {
         self.run_given(args, false)
     }
 
-    /// The installer's tool table (DC-1xx-ISO-4): the read-only system
+    /// The installer's tool table (DC-254): the read-only system
     /// tools and the fake Tart, when it has one.
     pub fn tools(&self) -> PathBuf {
         use service_layout::test_build::{link_system_tools, READ_ONLY_TOOLS};

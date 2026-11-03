@@ -1,5 +1,5 @@
 //! Test builds: what a binary that `cargo test` built may touch, and how it
-//! is told from a release (DC-1xx-ISO-1 to DC-1xx-ISO-8).
+//! is told from a release (DC-251 to DC-258).
 //!
 //! The feature [`FEATURE`], which only the workspace's dev-dependencies
 //! enable, builds the test seams into the daemon, the installer, the CLI and
@@ -126,7 +126,7 @@ pub fn carries_marker(bytes: &[u8]) -> bool {
 }
 
 /// Refuse the executable at `path` when it is a test build: an installation
-/// never holds one (DC-1xx-ISO-8).
+/// never holds one (DC-258).
 pub fn refuse_test_build(path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     refuse_test_bytes(&path.display().to_string(), &bytes)
@@ -212,7 +212,7 @@ pub fn link_system_tools(folder: &Path, tools: &[crate::tools::Tool]) -> std::io
 /// In a test build, the processes this one may signal beyond its own
 /// records: those it started, by descent or by its lifeline
 /// ([`processes::descendants`]); a sweep never signals any other
-/// (DC-1xx-ISO-3). A release answers `None`: no such limit.
+/// (DC-253). A release answers `None`: no such limit.
 pub fn signalable() -> Option<std::collections::HashSet<i32>> {
     is_test_build().then(processes::descendants)
 }

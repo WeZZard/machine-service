@@ -114,7 +114,7 @@ impl DurableConfig {
             .unwrap_or_else(|| home.join(".config/machine-service"));
         let lock_dir = lock_dir_from(std::env::var_os(LOCK_DIR_VARIABLE).map(PathBuf::from))?;
         // A test build touches no installed folder and never the host-wide
-        // lease lock that an installed instance holds (DC-1xx-ISO-1).
+        // lease lock that an installed instance holds (DC-251).
         service_layout::test_build::owned_path(CONFIG_DIR_VARIABLE, &config_dir)?;
         if service_layout::test_build::is_isolated() && lock_dir == Path::new(HOST_LOCK_DIR) {
             return Err(format!(
@@ -231,7 +231,7 @@ pub fn read_instance_name() -> Result<String, String> {
         return Ok(name.to_string());
     }
     // A test build never reads the Mac's own name, which another Mac on
-    // the network could match (DC-1xx-ISO-5).
+    // the network could match (DC-255).
     if service_layout::test_build::is_isolated() {
         return Err(
             "this is a test build, which reads its name only from MACHINE_SERVICE_NAME_FILE"

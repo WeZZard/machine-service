@@ -13,7 +13,7 @@
 //! Commands really run on this Mac, as this user, in their own process
 //! sessions, and end with the test. The release sweep of a test build sees
 //! only the processes the daemon started and the rows of the test's process
-//! fixture, and signals nothing else (DC-1xx-ISO-3): stand-in processes the
+//! fixture, and signals nothing else (DC-253): stand-in processes the
 //! lease did not start survive, and the fixture's rows prove the rules
 //! without any real application or process of the owner's session. The
 //! applications a real lease opens are proved only in the opt-in live layer
@@ -37,7 +37,7 @@ const LONG: Duration = Duration::from_secs(180);
 /// One isolated durable-machine fixture.
 struct Fixture {
     /// One lifeline for every daemon of the fixture: what a stopped daemon
-    /// started, a restarted one sweeps (DC-1xx-ISO-6).
+    /// started, a restarted one sweeps (DC-256).
     lifeline: common::Lifeline,
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -298,7 +298,7 @@ impl Daemon {
         Some(child)
     }
 
-    /// The process fixture of the daemon's sweep (DC-1xx-ISO-3).
+    /// The process fixture of the daemon's sweep (DC-253).
     fn processes(&self) -> PathBuf {
         self.state.parent().unwrap().join("processes.json")
     }
@@ -1491,7 +1491,7 @@ fn now_s() -> u64 {
         .as_secs()
 }
 
-/// One row of the sweep's process fixture (DC-1xx-ISO-3), run by this
+/// One row of the sweep's process fixture (DC-253), run by this
 /// account, started at `start`.
 fn row(pid: i32, start: u64, path: &str, env: &[String], job_lease: Option<&str>) -> Value {
     // SAFETY: `geteuid` only reads process state.
@@ -1528,7 +1528,7 @@ fn signals(daemon: &Daemon) -> Vec<(i64, String)> {
 /// owner opened, before or during the lease, and one already running before
 /// it, keep running; a process that carries the lease's ID is ended by the
 /// environment rule and an untagged one is not. Proved through the test
-/// build's process seam (DC-1xx-ISO-3): the applications and processes are
+/// build's process seam (DC-253): the applications and processes are
 /// rows of the test's fixture, so no application of this Mac is opened,
 /// asked to quit or signalled; the real applications are proved in the
 /// opt-in live layer (`live_durable.rs`).
@@ -1659,7 +1659,7 @@ fn hy6_low_free_disk_warning() {
 /// HY-5, AC-32 (DC-75): the CI runner is sampled at acquisition, on every
 /// GC pass and at release; the hygiene record carries the intervals during
 /// which a job ran. The job is a row of the sweep's process fixture
-/// (DC-1xx-ISO-3), which the release never signals.
+/// (DC-253), which the release never signals.
 #[test]
 fn hy5_ci_busy_intervals_are_recorded() {
     let fixture = Fixture::new();

@@ -21,7 +21,7 @@
 //! layer's opt-in (`MACHINE_SERVICE_TEST_LIVE=TL-6`), which only these
 //! ignored tests set: with it the build sweeps the real session and runs the
 //! system's tools as a release does, and still refuses the installed ports
-//! and folders (DC-1xx-ISO-3).
+//! and folders (DC-253).
 //!
 //! ```sh
 //! cargo test -p machine-service --test live_durable -- --ignored --test-threads=1
@@ -157,7 +157,7 @@ impl Live {
                 .env("MACHINE_SERVICE_HOST", "127.0.0.1")
                 .env("MACHINE_SERVICE_CONFIG_DIR", &self.config)
                 .env("MACHINE_SERVICE_EXPOSE_DURABLE", "on")
-                // The opt-in live layer (DC-1xx-ISO-3): the test build runs
+                // The opt-in live layer (DC-253): the test build runs
                 // the system's tools, reads the Mac's name, takes the
                 // host-wide lock and sweeps the real session, as a release
                 // does; the installed ports and folders stay refused.
@@ -908,7 +908,7 @@ impl Drop for Registered {
 /// an application the owner opened during the lease, which no rule may
 /// touch, keeps running. It builds, registers and opens two stand-in
 /// applications in this Mac's desktop session, which is why it is not in
-/// the default suite (DC-1xx-ISO-3).
+/// the default suite (DC-253).
 #[test]
 #[ignore = "live TL-6: builds, registers and opens stand-in applications in this Mac's desktop session through a second instance with exposure on; see the module documentation"]
 fn live_ac30_release_quits_the_applications_the_lease_opened_and_only_those() {

@@ -12,11 +12,11 @@ use crate::proc::{combined_text, run_capture, ProcError};
 pub const BOOT_SETTLE_S: u64 = 10;
 
 /// Build a `tart` command with the configured executable and environment;
-/// a test build's Tart is its tool table's (DC-1xx-ISO-4).
+/// a test build's Tart is its tool table's (DC-254).
 pub fn tart_command(config: &Config, args: &[&str]) -> OpResult<Command> {
     let program = if Path::new(&config.tart_executable).is_absolute() {
         // A path the configuration names; a test build refuses one in the
-        // system's folders (DC-1xx-ISO-4).
+        // system's folders (DC-254).
         service_layout::tools::program(&config.tart_executable)
     } else {
         service_layout::tools::located(service_layout::tools::Tool::Tart, || {

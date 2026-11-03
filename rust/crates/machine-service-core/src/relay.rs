@@ -149,7 +149,7 @@ impl RelaySettings {
         let session_port = remote_session::session_port_from_env().map_err(|e| e.to_string())?;
         service_layout::test_build::owned_port("the relay session port", session_port)?;
         // An explicit session host (a second instance, DC-243) wins; otherwise
-        // every interface in a release and loopback in a test build (DC-ISO).
+        // every interface in a release and loopback in a test build (DC-251..DC-258).
         let session_host = std::env::var(second_instance::SESSION_HOST_VARIABLE)
             .ok()
             .map(|host| host.trim().to_string())

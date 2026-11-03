@@ -21,5 +21,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# The agent a test runs is an isolated test child (DC-1xx-ISO-1).
+# The agent a test runs is an isolated test child (DC-251).
 service-layout = { path = "../service-layout", features = ["test-build"] }

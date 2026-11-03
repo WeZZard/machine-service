@@ -23,7 +23,7 @@
 //! output is never logged or stored, because the job inherits whatever the
 //! caller's environment held. It is always the system `launchctl`
 //! ([`crate::launchd::LAUNCHCTL`]) (DC-242); a test build of the default
-//! suite reads its fixture's jobs instead and runs none (DC-1xx-ISO-3).
+//! suite reads its fixture's jobs instead and runs none (DC-253).
 //!
 //! A matched application is first asked to quit, as the Dock's Quit does
 //! (`NSRunningApplication.terminate`, an Apple event), and is given the
@@ -103,7 +103,7 @@ impl JobReader {
     /// The lease ID of `pid`'s launchd job, when its job carries one.
     pub fn lease_of(&mut self, pid: i32) -> Option<String> {
         // A test build reads no launchd job; its fixture names them
-        // (DC-1xx-ISO-3).
+        // (DC-253).
         if super::seam::active() {
             return super::seam::job_lease(pid);
         }

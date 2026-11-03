@@ -1,5 +1,5 @@
 //! The external tools the service, its installer and its CLI run, and where
-//! each one is found (DC-1xx-ISO-4).
+//! each one is found (DC-254).
 //!
 //! Every external program is a [`Tool`] of one table, and is run by the
 //! absolute path the table gives. A release finds macOS's own tools at their

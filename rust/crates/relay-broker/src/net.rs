@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(address_toward(Ipv4Addr::new(127, 0, 0, 2)), None);
         assert!(host_name().is_some());
         if service_layout::test_build::is_isolated() {
-            // A test build runs no `scutil` it was not given (DC-1xx-ISO-4).
+            // A test build runs no `scutil` it was not given (DC-254).
             assert_eq!(network_host_name(), None);
         } else if cfg!(target_os = "macos") {
             assert!(network_host_name().is_some_and(|n| n.ends_with(".local")));

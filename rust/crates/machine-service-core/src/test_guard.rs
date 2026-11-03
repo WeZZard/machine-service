@@ -1,4 +1,4 @@
-//! A test build's daemon refuses the installed defaults (DC-1xx-ISO-1).
+//! A test build's daemon refuses the installed defaults (DC-251).
 //!
 //! A daemon that `cargo test` built serves a test, never the operator's
 //! installation: it refuses to start on the installed ports, to bind

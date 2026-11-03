@@ -162,7 +162,7 @@ const EXPOSE_KEY: &str = "MACHINE_SERVICE_EXPOSE_DURABLE";
 /// Entry point used by the `machine-service-install` binary.
 pub fn main_entry() -> Result<(), InstallError> {
     // A test build keeps its marker and watches its test's lifeline
-    // (DC-1xx-ISO-6); a release does nothing.
+    // (DC-256); a release does nothing.
     service_layout::test_build::start();
     let cli = Cli::parse();
     let source = source_directory()?;
@@ -206,7 +206,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     let readonly = cli.check || cli.dry_run;
     let plist = migration::agent_plist(home, LABEL);
     // A test build never touches the account's own installation, whatever
-    // `HOME` says (DC-1xx-ISO-1).
+    // `HOME` says (DC-251).
     service_layout::test_build::owned_path("the LaunchAgent", &plist)
         .map_err(InstallError::Refused)?;
     let deployed = match &cli.prefix {
@@ -710,7 +710,7 @@ fn validate_install(installation: &Installation) -> Result<Validated, InstallErr
 
     // A test build's executables never enter an installation; only a
     // release refuses them, since a test installs the test builds it has
-    // (DC-1xx-ISO-8).
+    // (DC-258).
     if !service_layout::test_build::is_test_build() {
         if let Some(found) = test_builds_in(source, &helpers).into_iter().next() {
             return Err(InstallError::Refused(found));
@@ -1258,7 +1258,7 @@ pub(crate) fn which(name: &str, path: Option<&str>) -> Option<String> {
 
 /// The refusals of every executable of `helpers` in `source`, and of the
 /// macOS relay agent of its release, that a test build made: each carries
-/// the test seams and must never be installed (DC-1xx-ISO-8).
+/// the test seams and must never be installed (DC-258).
 pub fn test_builds_in(source: &Path, helpers: &[String]) -> Vec<String> {
     let mut found: Vec<String> = helpers
         .iter()

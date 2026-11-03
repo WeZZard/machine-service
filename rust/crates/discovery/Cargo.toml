@@ -9,7 +9,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [features]
-# A test build's DNS-SD folder instead of mDNSResponder (DC-1xx-ISO-2);
+# A test build's DNS-SD folder instead of mDNSResponder (DC-252);
 # only the workspace's dev-dependencies enable it.
 test-build = ["service-layout/test-build"]
 

@@ -492,7 +492,7 @@ mod tests {
         fn new() -> Self {
             let guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
             // A temporary folder of the test's own, never under `HOME`
-            // (DC-1xx-ISO-7).
+            // (DC-257).
             // Resolved, since the trust check refuses a linked parent such
             // as macOS's `/var`.
             let temp = std::env::temp_dir()

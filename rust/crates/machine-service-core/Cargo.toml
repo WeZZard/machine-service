@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # (DC-242). Only dev-dependencies enable it, so only `cargo test`
 # builds it into a binary; a release build never carries it.
 test-launchd = []
-# Every test seam of a test build (DC-1xx-ISO-1): the launchctl one above,
+# Every test seam of a test build (DC-251): the launchctl one above,
 # and `service_layout::test_build`'s guard, tool table, process seams and
 # lifeline. Only dev-dependencies enable it.
 test-build = ["test-launchd", "service-layout/test-build"]

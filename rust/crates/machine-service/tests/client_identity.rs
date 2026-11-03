@@ -1,7 +1,7 @@
 //! MI-4/MI-5 and AC-52 to AC-54 at TL-2: real daemons and the real CLI.
 //! DNS-SD is the test build's folder, which the daemon on loopback and the
 //! CLI share, so nothing is advertised or browsed beyond this test and no
-//! daemon binds outside loopback (DC-1xx-ISO-2); the Consul fixture
+//! daemon binds outside loopback (DC-252); the Consul fixture
 //! publishes installer output.
 
 mod common;

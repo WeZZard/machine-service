@@ -122,7 +122,7 @@ fn test_timeout_never_replays_the_command() {
 
     let fixture = common::Fixture::new();
     let keys = fixture.key_dir("key-command-test");
-    // The test build runs `ssh` only from a tool table (DC-1xx-ISO-4); this
+    // The test build runs `ssh` only from a tool table (DC-254); this
     // one is never run, since the override answers in its place.
     let tools = tempfile::tempdir().unwrap();
     let ssh = tools.path().join("ssh");

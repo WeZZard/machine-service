@@ -3,7 +3,7 @@
 //!
 //! A `softnet` placed in the fixture's `bin` enters the daemon's tool table,
 //! where a test build looks for it instead of Tart's `PATH`
-//! (DC-1xx-ISO-4), so it is the one the daemon checks. A symlink to
+//! (DC-254), so it is the one the daemon checks. A symlink to
 //! `/usr/bin/sudo` stands in for a setuid-root Softnet; a plain file stands in
 //! for one that Tart cannot run unattended.
 //!

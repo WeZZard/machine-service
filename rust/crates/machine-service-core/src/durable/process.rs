@@ -162,7 +162,7 @@ fn process_path(pid: i32) -> Option<String> {
 
 /// The process table the sweep sees, optionally limited to one user. In a
 /// test build, only the processes it started and its fixture's rows
-/// (`seam`, DC-1xx-ISO-3).
+/// (`seam`, DC-253).
 pub fn process_table(uid: Option<u32>) -> Vec<ProcessInfo> {
     if !super::seam::active() {
         return system_table(uid);
@@ -702,7 +702,7 @@ fn send(info: &ProcessInfo, signal: libc::c_int) -> bool {
         return false;
     }
     // A test build signals only what it started, or its fixture's rows
-    // (DC-1xx-ISO-3).
+    // (DC-253).
     if super::seam::active() {
         let name = match signal {
             libc::SIGTERM => "TERM",

@@ -170,7 +170,7 @@ fn processes(context: &Context) -> Value {
 /// The running regular applications, those with a Dock presence, from
 /// `lsappinfo`.
 pub fn running_applications(timeout: Duration) -> Result<Value, String> {
-    // A test build's running applications are its fixture's (DC-1xx-ISO-3).
+    // A test build's running applications are its fixture's (DC-253).
     if super::seam::active() {
         return Ok(super::seam::applications());
     }
@@ -342,7 +342,7 @@ fn folders(context: &Context) -> Value {
 
 /// Find an executable on a `PATH`; a test build runs what it finds only if
 /// it is a test's own, never one installed in the system's folders
-/// (DC-1xx-ISO-4).
+/// (DC-254).
 pub fn which(name: &str, path: Option<&String>) -> Option<PathBuf> {
     found(name, path).filter(|found| {
         !service_layout::test_build::is_isolated()

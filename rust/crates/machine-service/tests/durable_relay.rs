@@ -76,7 +76,7 @@ impl Drop for Leftover {
 
 struct Lab {
     /// One lifeline for the lab's daemons and agent: what a stopped daemon
-    /// started, a restarted one sweeps (DC-1xx-ISO-6).
+    /// started, a restarted one sweeps (DC-256).
     lifeline: common::Lifeline,
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -274,7 +274,7 @@ impl Lab {
             let err = self.root.join(format!("daemon-{port}.err"));
             let launchd = self.launchd.clone();
             // The fakes' shell utilities only; the daemon finds no tool
-            // through `PATH` (DC-1xx-ISO-4).
+            // through `PATH` (DC-254).
             let path = match self.seam {
                 Seam::Named => common::BASE_PATH.to_string(),
                 Seam::PathOnly => format!("{}:{}", launchd.display(), common::BASE_PATH),

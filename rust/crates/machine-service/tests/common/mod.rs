@@ -1,6 +1,6 @@
 //! Shared process-level harness for the `machine-service` daemon test suites.
 //!
-//! Every child a test starts is isolated (DC-1xx-ISO-1 to DC-1xx-ISO-6): it
+//! Every child a test starts is isolated (DC-251 to DC-256): it
 //! starts from an empty environment through
 //! `service_layout::test_build::harness`, in a process group of its own
 //! with a lifeline, and is ended with everything it started when its handle
@@ -12,7 +12,7 @@
 //! `tart`/`_ssh`/`_scp` with `mock.patch.object`. A Rust test cannot patch a
 //! separate process, so this harness starts the real `machine-service` binary and
 //! supplies fake `tart`, `ssh`, and `scp` executables through its tool table
-//! (`MACHINE_SERVICE_TEST_TOOLS`, DC-1xx-ISO-4). The observable seam is therefore the subprocess and
+//! (`MACHINE_SERVICE_TEST_TOOLS`, DC-254). The observable seam is therefore the subprocess and
 //! HTTP boundary rather than the in-process `Host` trait (which stays reserved
 //! for the `machine-service-core` unit tests).
 //!
@@ -53,7 +53,7 @@ pub const FAKE_SYSTEM_TOOLS: [(&str, &str); 3] = [
 /// which the daemon checks but never runs.
 pub const SHIMMED_TOOLS: [&str; 6] = ["tart", "ssh", "scp", "brew", "npm", "softnet"];
 
-/// Make `tools` a daemon's tool table (DC-1xx-ISO-4): links to the
+/// Make `tools` a daemon's tool table (DC-254): links to the
 /// read-only system tools, the fakes of [`FAKE_SYSTEM_TOOLS`], and links to
 /// what `shims` holds, renewed at every start: the [`SHIMMED_TOOLS`] and
 /// any helper a shim runs beside itself. A system tool a test writes into
@@ -382,7 +382,7 @@ pub fn write_exec(dir: &Path, name: &str, content: &str) -> PathBuf {
 }
 
 /// The `PATH` of a child whose fakes live in `bin`: `bin`, then the system
-/// folders, never the test runner's own `PATH` (DC-1xx-ISO-4).
+/// folders, never the test runner's own `PATH` (DC-254).
 pub fn path_with(bin: &Path) -> String {
     format!("{}:{BASE_PATH}", bin.display())
 }
@@ -687,7 +687,7 @@ impl Drop for Daemon {
 
 /// Locate the `machctl` binary, building it on demand for `cargo test -p
 /// machine-service`, which does not build sibling packages. It is always a
-/// test build (DC-1xx-ISO-1).
+/// test build (DC-251).
 pub fn machctl_bin() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
@@ -841,7 +841,7 @@ pub fn run_machctl(arguments: &[&str], env: &[(String, String)]) -> Output {
 
 /// An isolated `machctl` command: an empty environment and no discovery
 /// beyond its own empty DNS-SD folder, which a caller may replace
-/// (DC-1xx-ISO-5).
+/// (DC-255).
 pub fn machctl_command() -> Isolated {
     harness::command(machctl_bin())
 }

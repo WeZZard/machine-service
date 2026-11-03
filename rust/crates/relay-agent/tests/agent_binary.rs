@@ -32,7 +32,7 @@ fn start(home: &Path) -> Process {
 }
 
 /// [`start`] on a lifeline the test keeps, so what a killed agent left
-/// running outlives its handle until the test ends (DC-1xx-ISO-6).
+/// running outlives its handle until the test ends (DC-256).
 fn start_on(home: &Path, lifeline: &service_layout::test_build::harness::Lifeline) -> Process {
     let mut child = service_layout::test_build::harness::command_on(AGENT, lifeline)
         .arg("stdio")

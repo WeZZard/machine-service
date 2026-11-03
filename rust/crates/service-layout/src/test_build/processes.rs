@@ -1,4 +1,4 @@
-//! A test child's process tree and its lifeline (DC-1xx-ISO-6).
+//! A test child's process tree and its lifeline (DC-256).
 //!
 //! A test hands every child a lifeline: the read end of a pipe whose write
 //! end only the test holds, open in the child under one descriptor number

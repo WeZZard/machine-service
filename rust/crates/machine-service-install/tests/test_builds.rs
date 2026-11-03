@@ -1,4 +1,4 @@
-//! A test build never enters an installation (DC-1xx-ISO-8).
+//! A test build never enters an installation (DC-258).
 //!
 //! `cargo test` builds the daemon, the CLI, the installer and the relay
 //! agent with the test seams, which read `MACHINE_SERVICE_TEST_*` and accept
@@ -112,7 +112,7 @@ fn release_installer() -> PathBuf {
     target.join("debug/machine-service-install")
 }
 
-/// DC-1xx-ISO-8: a release's installer refuses an installation folder that
+/// DC-258: a release's installer refuses an installation folder that
 /// holds a test build, before it writes anything or runs any `launchctl`.
 #[test]
 fn a_release_installer_refuses_a_test_build() {

@@ -135,7 +135,7 @@ pub fn prepare(
     cwd: &Path,
 ) -> Result<String, String> {
     // The launcher runs the shell the service resolved here, through its
-    // tool table (DC-1xx-ISO-4).
+    // tool table (DC-254).
     let zsh = || {
         service_layout::tools::path(service_layout::tools::Tool::Zsh)
             .map(|path| path.to_string_lossy().into_owned())

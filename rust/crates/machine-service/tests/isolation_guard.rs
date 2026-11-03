@@ -1,4 +1,4 @@
-//! The guard of a test build (DC-1xx-ISO-1 to DC-1xx-ISO-6), proved on the
+//! The guard of a test build (DC-251 to DC-256), proved on the
 //! real daemon that `cargo test` built.
 //!
 //! Each test starts the daemon from a hostile environment, the one a
@@ -398,7 +398,7 @@ fn account_installed_touched(owned: &Path) -> bool {
 
 /// When the test is gone, without its harness ending anything, the
 /// daemon's own watch of its lifeline ends the daemon and every process the
-/// lease started, its own session included (DC-1xx-ISO-6).
+/// lease started, its own session included (DC-256).
 #[test]
 fn a_severed_lifeline_ends_the_daemon_and_everything_it_started() {
     let dir = tempfile::tempdir().unwrap();
