@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 # The test seam of `launchd`: a test's own launchctl instead of /bin/launchctl
-# (DC-1xx-LCTL-1). Only dev-dependencies enable it, so only `cargo test`
+# (DC-242). Only dev-dependencies enable it, so only `cargo test`
 # builds it into a binary; a release build never carries it.
 test-launchd = []
 
