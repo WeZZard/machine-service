@@ -2,10 +2,13 @@
 # Install a lab runner on a durable Mac (docs/arch/hygiene.md, HY-5): a
 # GitHub Actions runner of its own folder, registered to the repository with
 # the label `lab`, run by a per-user LaunchAgent of its own label in the
-# operator's desktop session, with the job hooks of lab-runner-hook.sh, so
-# every job holds the Mac's durable lease while it runs.
+# operator's desktop session, with the job hooks of lab-runner.sh, so every
+# job holds the Mac's durable lease while it runs. The LaunchAgent starts the
+# runner over a loopback SSH session with a key that can do nothing else,
+# because macOS's local network privacy would deny a launchd agent's builds
+# any connection to the lab's other machines (lab-runner.sh explains).
 #
-# Run it on the Mac, from the runner folder it creates, with the hook script
+# Run it on the Mac, from the runner folder it creates, with lab-runner.sh
 # beside it and a registration token on standard input:
 #
 #   gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token \
@@ -31,7 +34,7 @@ logs="$HOME/Library/Logs/actions-runner-lab"
 
 IFS= read -r token
 [ -n "$token" ] || { echo "no registration token on standard input" >&2; exit 1; }
-[ -f "$dir/lab-runner-hook.sh" ] || { echo "lab-runner-hook.sh is not beside this script" >&2; exit 1; }
+[ -f "$dir/lab-runner.sh" ] || { echo "lab-runner.sh is not beside this script" >&2; exit 1; }
 if [ -f "$dir/.runner" ]; then
     echo "$dir already holds a configured runner; remove it with config.sh remove first" >&2
     exit 1
@@ -49,9 +52,8 @@ fi
 tar -xzf "$archive"
 rm -f "$archive"
 
-mkdir -p hooks "$logs"
-cp lab-runner-hook.sh hooks/lab-runner-hook.sh
-chmod 755 hooks/lab-runner-hook.sh
+mkdir -p "$logs"
+chmod 755 lab-runner.sh
 # The runner prints a hook's path in the job's public log before any step
 # can mask it, so the runner is given links outside the home folder, in a
 # folder of this account's that survives a restart.
@@ -59,8 +61,18 @@ links=/var/tmp/lab-runner-hooks
 mkdir -p "$links"
 chmod 755 "$links"
 [ -O "$links" ] || { echo "$links belongs to another account" >&2; exit 1; }
-ln -sf "$dir/hooks/lab-runner-hook.sh" "$links/job-started.sh"
-ln -sf "$dir/hooks/lab-runner-hook.sh" "$links/job-completed.sh"
+ln -sf "$dir/lab-runner.sh" "$links/job-started.sh"
+ln -sf "$dir/lab-runner.sh" "$links/job-completed.sh"
+
+# The loopback session's key: from this Mac only, and only to start the
+# runner; and this Mac's own host key, so the session checks whom it reaches.
+self_key="$HOME/.ssh/lab-runner-self_ed25519"
+known="$HOME/.ssh/lab-runner-known_hosts"
+[ -f "$self_key" ] || ssh-keygen -q -t ed25519 -N "" -C "lab runner session" -f "$self_key"
+grep -qF "$(cut -d' ' -f2 "$self_key.pub")" "$HOME/.ssh/authorized_keys" 2>/dev/null ||
+    printf 'from="127.0.0.1,::1",restrict,command="exec /bin/sh %s/lab-runner.sh session" %s\n' \
+        "$dir" "$(cat "$self_key.pub")" >>"$HOME/.ssh/authorized_keys"
+printf 'localhost %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >"$known"
 
 name="lab-$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ {print $4}' | shasum -a 256 | cut -c1-6)"
 path="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -85,7 +97,21 @@ cat >"$plist" <<EOF
 	<string>$label</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$dir/run.sh</string>
+		<string>/usr/bin/ssh</string>
+		<string>-T</string>
+		<string>-i</string>
+		<string>$self_key</string>
+		<string>-o</string>
+		<string>IdentitiesOnly=yes</string>
+		<string>-o</string>
+		<string>BatchMode=yes</string>
+		<string>-o</string>
+		<string>UserKnownHostsFile=$known</string>
+		<string>-o</string>
+		<string>StrictHostKeyChecking=yes</string>
+		<string>-o</string>
+		<string>ServerAliveInterval=30</string>
+		<string>localhost</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>$dir</string>
