@@ -2,14 +2,17 @@ name: Lab
 
 # The relay acceptance (docs/arch/test-layers.md, TL-7) on the lab's
 # ephemeral runners (docs/arch/lab-runners.md): every lab job runs in a fresh
-# VM that a VM host's dispatcher leases for it from the host's lab instance,
-# with a one-job runner and a network limited to GitHub and the lab
-# instances, and the VM is deleted afterwards. No step builds or fetches
-# anything in a runner VM: the build job runs on GitHub-hosted runners.
-# VM cells run on a push to claude/relay-agent of this repository and on a
-# dispatch; durable cells run only on the owner's dispatch, because they run
-# commands on a real Mac as the owner (DC-263). No pull request runs
-# here, and no secret is used.
+# VM that a VM host's runner controller has production, the host's installed
+# machine-service, lend it, with a one-job runner and a network limited to
+# GitHub and the run's test environments, and the VM is deleted afterwards.
+# The code under test is this run's own build: the environment job builds it
+# on a GitHub-hosted runner and uploads it, and each runner controller that
+# serves the run downloads it, checks it against the run, starts it as the
+# run's test environment and removes it after the run (DC-284). No step
+# builds or fetches anything in a runner VM. VM cells run on a push to
+# claude/relay-agent of this repository and on a dispatch; durable cells run
+# only on the owner's dispatch, because they run commands on a real Mac as
+# the owner (DC-263). No pull request runs here, and no secret is used.
 
 on:
   push:
@@ -30,10 +33,11 @@ on:
 permissions:
   contents: read
 
-# One run per ref at a time; a newer run waits rather than cancel one that
-# holds VMs. Per host, the dispatcher's capacity rule is the limit (LR-7).
+# One lab run at a time, whatever its ref: a host runs one test environment
+# at a time on the lab ports. A newer run waits rather than cancel one that
+# holds VMs. Per host, the controller's capacity rule is the limit (LR-7).
 concurrency:
-  group: lab-${{ github.ref }}
+  group: lab
   cancel-in-progress: false
 
 jobs:
@@ -64,8 +68,8 @@ jobs:
               "ubuntu-client.ubuntu-vm": ["self-hosted", "lab-ubuntu"],
           }
           durable = {
-              "macos-client.durable-mac": ["self-hosted", "lab-macos"],
-              "ubuntu-client.durable-mac": ["self-hosted", "lab-ubuntu"],
+              "macos-client.durable-mac": ["self-hosted", "lab-macos", "lab-durable-target"],
+              "ubuntu-client.durable-mac": ["self-hosted", "lab-ubuntu", "lab-durable-target"],
           }
           asked = [c.strip() for c in os.environ["CELLS"].split(",") if c.strip()]
           vm = [c for c in labels if "all" in asked or c in asked]
@@ -138,9 +142,51 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # The run's test environment: an installation of this commit and the
+  # second-instance launcher, as one archive, and a manifest that names the
+  # run, the commit and the archive's SHA-256, which every runner controller
+  # checks before it starts the build (LR-6).
+  environment:
+    name: Build the test environment
+    needs: plan
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+          components: llvm-tools
+
+      - name: Build the installation and the launcher
+        run: |
+          bundle="$RUNNER_TEMP/bundle"
+          out="$RUNNER_TEMP/test-environment"
+          scripts/build-release.sh "$bundle"
+          cargo build --release -p second-instance
+          cp target/release/second-instance "$bundle/"
+          mkdir -p "$out"
+          tar -czf "$out/test-environment.tar.gz" -C "$bundle" .
+          sha=$(shasum -a 256 "$out/test-environment.tar.gz" | awk '{print $1}')
+          printf '{"run_id": %s, "head_sha": "%s", "archive": "test-environment.tar.gz", "sha256": "%s"}\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_SHA" "$sha" >"$out/test-environment.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-test-environment
+          path: ${{ runner.temp }}/test-environment
+          if-no-files-found: error
+          retention-days: 1
+
   vm-cells:
     name: ${{ matrix.cell }}
-    needs: [plan, build]
+    needs: [plan, build, environment]
     if: needs.plan.outputs.vm != '' && fromJSON(needs.plan.outputs.vm).include[0] != null
     strategy:
       fail-fast: false
@@ -156,8 +202,8 @@ jobs:
       run:
         shell: bash
     steps: &cell-steps
-      # Before anything prints a name: mask every lab name and address the
-      # dispatcher's plan holds.
+      # Before anything prints a name: mask every name and address the
+      # controller's plan holds.
       - name: Mask the lab's names
         run: |
           python3 -I -c '
@@ -200,7 +246,7 @@ jobs:
 
   durable-cells:
     name: ${{ matrix.cell }}
-    needs: [plan, build]
+    needs: [plan, build, environment]
     # The owner's dispatch only (DC-263); the plan names no durable
     # cell otherwise.
     if: >-

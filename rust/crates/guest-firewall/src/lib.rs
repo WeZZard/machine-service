@@ -53,8 +53,8 @@ pub const DEFAULT_BROKER_PORT: u16 = 6241;
 pub const EGRESS_TABLE: &str = "vm_service_egress";
 /// The pf table of the public addresses an egress guest may reach.
 pub const EGRESS_ALLOW_TABLE: &str = "vm_service_egress_allow";
-/// The pf table of the lab hosts' addresses an egress guest may reach on
-/// the lab ports.
+/// The pf table of the lab hosts' addresses, where test environments run,
+/// that an egress guest may reach on the lab ports.
 pub const EGRESS_LAB_TABLE: &str = "vm_service_egress_lab";
 /// The egress guests' table file, beside the `internet` table file.
 pub const EGRESS_GUESTS_FILE: &str = "egress-guests";
@@ -62,7 +62,8 @@ pub const EGRESS_GUESTS_FILE: &str = "egress-guests";
 pub const EGRESS_ALLOW_FILE: &str = "egress-allow";
 /// The lab table's file, beside the `internet` table file.
 pub const EGRESS_LAB_FILE: &str = "egress-lab";
-/// The lab instance's ports: its HTTP API and its broker (DC-270).
+/// A test environment's ports: its HTTP API and its broker (DC-270,
+/// DC-284).
 pub const LAB_PORTS: [u16; 2] = [6272, 6273];
 /// The ports an egress guest may reach on the allow table's addresses:
 /// HTTPS and DNS over TLS (DC-16).
@@ -115,13 +116,16 @@ fn port_list(ports: &[u16]) -> String {
 ///
 /// - the host's connections to the guests keep state, and DHCP reaches
 ///   bootpd(8), as for every `internet` guest;
-/// - a guest may open TCP to this host's own addresses on the lab ports,
-///   to the lab table's addresses on the lab ports, and to the allow
-///   table's addresses on HTTPS and DNS over TLS;
-/// - everything else a guest sends is dropped, the installed instance's
-///   broker port of DC-107 included.
-pub fn egress_rules(files: &EgressFiles) -> String {
+/// - a guest may open TCP to this host's own addresses on the lab ports and
+///   on `broker_port`, the broker of production, which lends the guest and
+///   whose relay agent link it dials (DC-107, DC-284); to the lab table's
+///   addresses on the lab ports; and to the allow table's addresses on
+///   HTTPS and DNS over TLS;
+/// - everything else a guest sends is dropped.
+pub fn egress_rules(files: &EgressFiles, broker_port: Option<u16>) -> String {
     let lab = port_list(&LAB_PORTS);
+    let own: Vec<u16> = broker_port.into_iter().chain(LAB_PORTS).collect();
+    let own = port_list(&own);
     let allow = port_list(&ALLOW_PORTS);
     format!(
         "# Egress guests (DC-267): the lab's ports, and HTTPS and DNS over TLS to the allow table.\n\
@@ -130,7 +134,7 @@ table <{EGRESS_ALLOW_TABLE}> persist file \"{allow_file}\"\n\
 table <{EGRESS_LAB_TABLE}> persist file \"{lab_file}\"\n\
 pass out quick inet to <{EGRESS_TABLE}> keep state\n\
 pass in quick inet proto udp from <{EGRESS_TABLE}> port 68 to any port 67\n\
-pass in quick inet proto tcp from <{EGRESS_TABLE}> to self port {{ {lab} }} keep state\n\
+pass in quick inet proto tcp from <{EGRESS_TABLE}> to self port {{ {own} }} keep state\n\
 pass in quick inet proto tcp from <{EGRESS_TABLE}> to <{EGRESS_LAB_TABLE}> port {{ {lab} }} keep state\n\
 pass in quick inet proto tcp from <{EGRESS_TABLE}> to <{EGRESS_ALLOW_TABLE}> port {{ {allow} }} keep state\n\
 # Anything else an egress guest sends is dropped.\n\
@@ -282,7 +286,7 @@ pass in quick inet proto udp from <{TABLE}> port 68 to any port 67\n\
 # Any other connection a guest opens to this host is dropped.\n\
 block drop in quick inet proto {{ tcp udp }} from <{TABLE}> to self\n",
         table_file.display(),
-        egress = egress_rules(&EgressFiles::beside(table_file)),
+        egress = egress_rules(&EgressFiles::beside(table_file), broker_port),
     )
 }
 
@@ -670,9 +674,9 @@ mod tests {
         );
     }
 
-    /// DC-267: the egress section passes only the lab's ports and the
-    /// allow table's HTTPS and DNS over TLS, and drops the rest, before any
-    /// `internet` rule.
+    /// DC-267: the egress section passes only production's broker and the
+    /// lab's ports, and the allow table's HTTPS and DNS over TLS, and drops
+    /// the rest, before any `internet` rule.
     #[test]
     fn egress_guests_reach_only_the_lab_ports_and_the_allow_table() {
         let rules = anchor_rules(&default_table(), Some(DEFAULT_BROKER_PORT));
@@ -688,7 +692,7 @@ mod tests {
                 "table <vm_service_egress_lab> persist file \"/var/db/com.wezzard.vm-service/egress-lab\"",
                 "pass out quick inet to <vm_service_egress> keep state",
                 "pass in quick inet proto udp from <vm_service_egress> port 68 to any port 67",
-                "pass in quick inet proto tcp from <vm_service_egress> to self port { 6272 6273 } keep state",
+                "pass in quick inet proto tcp from <vm_service_egress> to self port { 6241 6272 6273 } keep state",
                 "pass in quick inet proto tcp from <vm_service_egress> to <vm_service_egress_lab> port { 6272 6273 } keep state",
                 "pass in quick inet proto tcp from <vm_service_egress> to <vm_service_egress_allow> port { 443 853 } keep state",
                 "block drop in quick inet from <vm_service_egress> to any",

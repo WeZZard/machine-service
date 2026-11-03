@@ -517,8 +517,8 @@ impl RealTarget {
     /// and the run's evidence keeps it as `host-exposure.json`.
     fn record_exposure(&mut self, cell: Cell, run_dir: &Path) -> Result<(), String> {
         let Some(control) = self.settings.host.as_ref() else {
-            // A lab instance, which a job reaches without host control,
-            // says the same in its `/health` (DC-260).
+            // A test environment, which a lab job reaches without host
+            // control, says the same in its `/health` (DC-273).
             let health = self
                 .discovery
                 .as_ref()
@@ -770,7 +770,7 @@ mod tests {
         let local = json!({"durable": true, "loopback": true, "durable_cell": null});
         assert!(exposure_admits(&local, "macos-client.durable-mac").is_ok());
         assert!(exposure_admits(&json!({"durable": false, "loopback": true}), "x").is_err());
-        // A lab instance serves both durable cells (DC-260).
+        // A durable Mac's test environment serves both durable cells (DC-273).
         let lab = json!({"durable": true, "loopback": false,
             "durable_cell": "macos-client.durable-mac,ubuntu-client.durable-mac"});
         assert!(exposure_admits(&lab, "ubuntu-client.durable-mac").is_ok());
@@ -778,9 +778,9 @@ mod tests {
     }
 
     #[test]
-    fn a_lab_instances_exposure_comes_from_its_health() {
+    fn a_test_environments_exposure_comes_from_its_health() {
         let health = json!({"kinds": ["durable", "virtual"],
-            "second_instance": {"id": "lab", "durable_cell": "macos-client.durable-mac"}});
+            "second_instance": {"id": "r42", "durable_cell": "macos-client.durable-mac"}});
         let exposure = exposure_of_health(&health, "http://mac-b:6272");
         assert_eq!(exposure["durable"], true);
         assert_eq!(exposure["loopback"], false);

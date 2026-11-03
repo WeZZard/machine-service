@@ -1,7 +1,7 @@
 //! A test build's seams (DC-251): one JSON file, named by
 //! `LAB_HOST_TEST_SEAMS`, that stands for every party outside the test.
 //! A release reads no such variable and has no seams; a test build without
-//! the file refuses to reach GitHub, an instance or the keychain at all.
+//! the file refuses to reach GitHub, production or the keychain at all.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -17,8 +17,21 @@ pub const VARIABLE: &str = "LAB_HOST_TEST_SEAMS";
 pub struct Seams {
     /// GitHub's API, a loopback fake.
     pub github: Option<String>,
-    /// The lab instance, a loopback fake.
-    pub instance: Option<String>,
+    /// Production, a loopback fake.
+    pub production: Option<String>,
+    /// The host's role, `vm-host` or `durable`, in place of production's
+    /// `/health`.
+    pub role: Option<String>,
+    /// The local configuration file, in place of
+    /// `~/.config/vm-service-lab/controller.json`.
+    pub config: Option<PathBuf>,
+    /// The address a test environment binds, in place of the LAN address.
+    pub address: Option<Ipv4Addr>,
+    /// A test environment's HTTP port, in place of 6272.
+    pub environment_port: Option<u16>,
+    /// The other hosts' test environment endpoints to probe, in place of
+    /// discovery.
+    pub peers: Vec<(Ipv4Addr, u16)>,
     /// A file holding the token, in place of the keychain.
     pub token: Option<PathBuf>,
     /// The state folder, in place of `~/.local/state/vm-service-lab`.
@@ -30,8 +43,6 @@ pub struct Seams {
     /// Runner archives by platform: a path and its SHA-256, in place of the
     /// pinned download.
     pub runners: BTreeMap<String, (PathBuf, String)>,
-    /// The host's lab endpoints, in place of discovery.
-    pub endpoints: Option<Value>,
     /// How many rounds `run` makes before it exits.
     pub rounds: Option<u64>,
     /// Seconds between rounds.
@@ -91,15 +102,32 @@ impl Seams {
                     .collect()
             })
             .unwrap_or_default();
+        let peers = value
+            .get("peers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|peer| {
+                let (address, port) = peer.as_str()?.rsplit_once(':')?;
+                Some((address.parse().ok()?, port.parse().ok()?))
+            })
+            .collect();
         Ok(Seams {
             github: string("github"),
-            instance: string("instance"),
+            production: string("production"),
+            role: string("role"),
+            config: path_of("config"),
+            address: string("address").and_then(|address| address.parse().ok()),
+            environment_port: value
+                .get("environment_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok()),
+            peers,
             token: path_of("token"),
             state: path_of("state"),
             egress: path_of("egress"),
             dns,
             runners,
-            endpoints: value.get("endpoints").cloned(),
             rounds: value.get("rounds").and_then(Value::as_u64),
             interval_s: value.get("interval_s").and_then(Value::as_u64),
         })

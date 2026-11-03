@@ -109,7 +109,7 @@ fn sort_key(entry: &str) -> (u32, u8) {
 }
 
 /// The guests' resolvers' addresses and their DNS-over-TLS upstream texts,
-/// as the lab instance gives them (`MACHINE_SERVICE_GUEST_DNS`, DC-16).
+/// as production gives them (`MACHINE_SERVICE_GUEST_DNS`, DC-16).
 pub fn resolvers() -> (Vec<Ipv4Addr>, Vec<String>) {
     let parsed = machine_service_core::isolation::parse_guest_dns(Some(
         machine_service_core::isolation::DEFAULT_GUEST_DNS,

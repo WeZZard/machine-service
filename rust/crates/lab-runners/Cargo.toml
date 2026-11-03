@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "lab-host: the lab's ephemeral GitHub Actions runners and lab instances (docs/arch/lab-runners.md)"
+description = "lab-host: the runner controller of the lab's ephemeral GitHub Actions runners and per-run test environments (docs/arch/lab-runners.md)"
 
 [lib]
 name = "lab_runners"

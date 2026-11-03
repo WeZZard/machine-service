@@ -383,6 +383,38 @@ fn test_acquire_old_field_aliases_on_the_wire() {
     assert_eq!(response.body["env"], "default");
 }
 
+/// DC-283: the lab's runner controller asks for the `ci` pack by name. A
+/// host without it refuses the acquisition before anything is cloned, and
+/// never serves it with `default`; with an empty `ci` the lease records
+/// `ci` and no file of any pack reaches the guest.
+#[test]
+fn test_a_missing_named_pack_is_refused_never_replaced_by_default() {
+    let live = Live::new();
+    let body = json!({"purpose": "lab-7", "image": "ubuntu2404", "env": "ci"});
+    let response = live.request("POST", "/acquire", Some(&body));
+    assert_ne!(response.status, 200, "{}", response.body);
+    let error = response.body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("credential pack not found"), "{error}");
+    assert!(error.contains("vm-credentials/ci"), "{error}");
+    assert!(
+        !live.fixture.tart_calls().contains("clone"),
+        "cloned before the refusal: {}",
+        live.fixture.tart_calls()
+    );
+    assert!(live.fixture.vms_empty());
+
+    std::fs::create_dir_all(live.fixture.home.join(".config/vm-credentials/ci")).expect("ci pack");
+    let response = live.request("POST", "/acquire", Some(&body));
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.body["env"], "ci");
+    let copied =
+        std::fs::read_to_string(live.fixture.tart_home.join("scp-calls.log")).unwrap_or_default();
+    assert!(
+        !copied.contains("env.extra"),
+        "a file of the default pack reached the guest: {copied}"
+    );
+}
+
 #[test]
 fn test_purpose_collision_409() {
     let live = Live::new();

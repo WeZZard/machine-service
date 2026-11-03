@@ -43,7 +43,7 @@ pub const SESSION_HOST_VARIABLE: &str = "MACHINE_SERVICE_SESSION_HOST";
 /// The variable by which the launcher tells the daemon the durable cells
 /// its durable exposure off loopback is for, which `/health` then reports,
 /// so a durable cell without host control can still check it
-/// (DC-260).
+/// (DC-273).
 pub const DURABLE_CELL_VARIABLE: &str = "MACHINE_SERVICE_SECOND_INSTANCE_DURABLE_CELL";
 
 /// Whether an exposure's `durable_cell`, one cell or a comma-separated

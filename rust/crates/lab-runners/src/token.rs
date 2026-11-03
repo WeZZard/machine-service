@@ -1,4 +1,4 @@
-//! The dispatcher's token, from the VM host's login keychain (LR-4,
+//! The controller's token, from the Mac's login keychain (LR-4,
 //! DC-261). It is read into memory for each round and never printed,
 //! logged, written or sent anywhere but GitHub's API.
 

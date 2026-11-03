@@ -93,6 +93,38 @@ fn ac46_installs_exactly_the_layout_into_a_prefix() {
     );
 }
 
+/// DC-283: an installation creates the lab's `ci` credential pack empty,
+/// and keeps one that is there, with what the operator put in it.
+#[test]
+fn dc283_the_ci_pack_is_created_empty_and_an_existing_one_is_kept() {
+    let harness = Harness::new();
+    let ci = harness.home.join(".config/vm-credentials/ci");
+    let output = install_into_prefix(&harness);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(ci.is_dir());
+    assert_eq!(fs::read_dir(&ci).unwrap().count(), 0);
+    assert_eq!(
+        fs::metadata(&ci).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    fs::write(ci.join("env.extra"), "export A_DELIBERATE_CI_NEED=1\n").unwrap();
+    let output = install_into_prefix(&harness);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(ci.join("env.extra")).unwrap(),
+        "export A_DELIBERATE_CI_NEED=1\n"
+    );
+}
+
 /// AC-46: the session agent the guest link uploads is installed, for macOS
 /// and Linux guests alike: the regression that left `machctl exec` and
 /// `machctl push` failing with "guest session agent unavailable".

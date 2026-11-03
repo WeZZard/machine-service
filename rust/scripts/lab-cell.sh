@@ -1,18 +1,20 @@
 #!/bin/sh
-# One relay acceptance cell in a lab runner VM (docs/arch/lab-runners.md,
-# LR-9). The runner VM reaches GitHub and the lab instances only; its plan,
-# LAB_PLAN, names the lab instances, and the client executables come from
-# the workflow's build job, so nothing here builds or fetches.
+# One relay acceptance cell in an ephemeral runner VM
+# (docs/arch/lab-runners.md, LR-9). The runner VM reaches GitHub and its
+# run's test environments only; its plan, LAB_PLAN, names them, and the
+# client executables come from the workflow's build job, so nothing here
+# builds or fetches.
 #
 #   lab-cell.sh mask                       print every name and address of the plan
 #   lab-cell.sh run <cell> <profiles> <client dir> <evidence dir>
-#   lab-cell.sh clean                      release this run's leases on the lab instances
+#   lab-cell.sh clean                      release this run's leases on its test environments
 #   lab-cell.sh redact                     filter: replace the plan's names and addresses
 #   lab-cell.sh scrub <from> <to>          copy reports and logs, redacted
 #
-# A VM cell's target is the runner's own host's lab instance; a durable
-# cell's is a durable Mac's lab instance. Every lease the cell makes has a
-# purpose that starts with acc-r<run>-, so `clean` finds them.
+# A VM cell's target is the run's test environment on the runner's own
+# host; a durable cell's is the run's test environment on a durable Mac.
+# Every lease the cell makes has a purpose that starts with acc-r<run>-, so
+# `clean` finds them; stopping a test environment releases the rest.
 set -eu
 plan="${LAB_PLAN:?LAB_PLAN names no plan; this runs only in a lab runner VM}"
 run="${GITHUB_RUN_ID:?}"
@@ -57,7 +59,7 @@ run_cell() {
     evidence="${4:?evidence dir}"
     url="$(target_url "$cell")"
     if [ -z "$url" ]; then
-        echo "the plan names no lab instance for $cell" >&2
+        echo "the plan names no test environment for $cell" >&2
         exit 1
     fi
     image="$(image_of "$cell")"

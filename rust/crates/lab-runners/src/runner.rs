@@ -24,7 +24,7 @@ pub const ARCHIVES: [(&str, &str); 2] = [
     ),
 ];
 
-/// Where the dispatcher puts a job's files in the guest before the start
+/// Where the controller puts a job's files in the guest before the start
 /// script moves them.
 pub const GUEST_DIR: &str = "/tmp/lab-runner";
 

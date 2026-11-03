@@ -7,8 +7,12 @@ pub const SELF_HOSTED: &str = "self-hosted";
 pub const MACOS: &str = "lab-macos";
 /// A runner VM of the `ubuntu2404` image.
 pub const UBUNTU: &str = "lab-ubuntu";
-/// The job will lease one macOS VM of its host's lab instance as its target.
+/// The job will lease one macOS VM of its host's test environment as its
+/// target.
 pub const MACOS_TARGET: &str = "lab-macos-target";
+/// The job's target is a durable Mac's test environment, which exists only
+/// during a run the owner dispatched (LR-10).
+pub const DURABLE_TARGET: &str = "lab-durable-target";
 
 /// The image of a macOS runner VM.
 pub const MACOS_IMAGE: &str = "macos26";
@@ -27,6 +31,9 @@ pub struct Need {
     pub macos_slots: u32,
     /// The slots of those that the runner VM itself takes.
     pub runner_slots: u32,
+    /// Whether its target is a durable Mac's test environment rather than
+    /// this host's own.
+    pub durable: bool,
 }
 
 /// A runner VM's guest kind.
@@ -60,13 +67,13 @@ pub fn key(labels: &[String]) -> Vec<String> {
 }
 
 /// What a job with `labels` needs, or `None` when it is not a lab job this
-/// dispatcher serves: `self-hosted`, exactly one of `lab-macos` and
+/// controller serves: `self-hosted`, exactly one of `lab-macos` and
 /// `lab-ubuntu`, optionally `lab-macos-target`, and nothing else. A job
 /// that asks for any other label, such as a durable Mac's name or `macOS`,
 /// is never given a runner VM.
 pub fn need(labels: &[String]) -> Option<Need> {
     let key = key(labels);
-    let known = [SELF_HOSTED, MACOS, UBUNTU, MACOS_TARGET];
+    let known = [SELF_HOSTED, MACOS, UBUNTU, MACOS_TARGET, DURABLE_TARGET];
     if !key.iter().all(|label| known.contains(&label.as_str())) {
         return None;
     }
@@ -75,18 +82,24 @@ pub fn need(labels: &[String]) -> Option<Need> {
     }
     let has = |label: &str| key.iter().any(|item| item == label);
     let target = u32::from(has(MACOS_TARGET));
+    let durable = has(DURABLE_TARGET);
+    if durable && target > 0 {
+        return None;
+    }
     match (has(MACOS), has(UBUNTU)) {
         (true, false) => Some(Need {
             image: MACOS_IMAGE,
             kind: Kind::Macos,
             macos_slots: 1 + target,
             runner_slots: 1,
+            durable,
         }),
         (false, true) => Some(Need {
             image: UBUNTU_IMAGE,
             kind: Kind::Linux,
             macos_slots: target,
             runner_slots: 0,
+            durable,
         }),
         _ => None,
     }
@@ -120,6 +133,10 @@ mod tests {
             (ubuntu_target.macos_slots, ubuntu_target.runner_slots),
             (1, 0)
         );
+        // A durable cell's target is on a durable Mac: no slot here.
+        let durable = need(&labels(&["self-hosted", "lab-macos", "lab-durable-target"])).unwrap();
+        assert_eq!((durable.macos_slots, durable.durable), (1, true));
+        assert!(!macos.durable);
     }
 
     #[test]
@@ -127,6 +144,13 @@ mod tests {
         for job in [
             labels(&["self-hosted", "lab-macos", "lab-ubuntu"]),
             labels(&["self-hosted", "lab-macos-target"]),
+            labels(&[
+                "self-hosted",
+                "lab-macos",
+                "lab-macos-target",
+                "lab-durable-target",
+            ]),
+            labels(&["self-hosted", "lab-durable-target"]),
             labels(&["lab-macos"]),
             labels(&["self-hosted", "lab"]),
             labels(&["self-hosted", "macOS", "ARM64", "lab"]),

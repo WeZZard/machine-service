@@ -1,38 +1,40 @@
-//! The dispatcher's decisions, as functions over values (LR-2, LR-3, LR-7).
+//! The controller's decisions, as functions over values (LR-2, LR-3, LR-7).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::github::{Job, Runner};
-use crate::instance::Capacity;
 use crate::labels::{self, Need};
+use crate::production::Capacity;
 
-/// Every lab runner's name starts with it, so the dispatcher tells its
+/// Every lab runner's name starts with it, so the controller tells its
 /// runners from any other in the repository's list.
 pub const RUNNER_PREFIX: &str = "lab-";
 
 /// A runner that has not taken a job this long after it started is
-/// released: the second runner when two dispatchers saw one job (LR-2).
+/// released: the second runner when two controllers saw one job (LR-2).
 pub const IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 /// A runner VM is released this long after its runner started, whatever
 /// the job does: past GitHub's 6-hour job limit (LR-3).
 pub const DEADLINE: Duration = Duration::from_secs(6 * 3600 + 30 * 60);
 
-/// A runner VM's lease TTL, in hours: past the deadline, so a dispatcher
-/// that died leaves a VM its instance reclaims (LR-3).
+/// A runner VM's lease TTL, in hours: past the deadline, so a controller
+/// that died leaves a VM production reclaims (LR-3).
 pub const TTL_HOURS: f64 = 7.0;
 
-/// One of this dispatcher's jobs, between its start and its release.
+/// One of this controller's jobs, between its start and its release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ours {
     /// The job it was started for.
     pub job: u64,
+    /// The job's run.
+    pub run: u64,
     /// The job's labels, as [`labels::key`] gives them.
     pub key: Vec<String>,
     /// Its runner's name, once its JIT config was made.
     pub runner: Option<String>,
-    /// Whether its runner VM is leased, so the instance counts its slot.
+    /// Whether its runner VM is leased, so production counts its slot.
     pub acquired: bool,
     /// What it needs.
     pub need: Need,
@@ -43,7 +45,7 @@ pub fn runner_name(tag: &str, job: u64) -> String {
     format!("{RUNNER_PREFIX}{tag}-{job}")
 }
 
-/// The purpose of a job's runner VM lease, by which a restarted dispatcher
+/// The purpose of a job's runner VM lease, by which a restarted controller
 /// finds what an earlier one left (LR-3).
 pub fn purpose(job: u64) -> String {
     format!("lab-{job}")
@@ -54,8 +56,8 @@ pub fn job_of_purpose(purpose: &str) -> Option<u64> {
     purpose.strip_prefix("lab-")?.parse().ok()
 }
 
-/// The macOS slots this dispatcher's jobs will take that the instance
-/// does not count yet: a runner VM's until it is leased, and a target's
+/// The macOS slots this controller's jobs will take that production does
+/// not count yet: a runner VM's until it is leased, and a target's
 /// for the job's whole life, because the job leases it itself (LR-7).
 pub fn reserved(ours: &[Ours]) -> u32 {
     ours.iter()
@@ -71,6 +73,16 @@ pub fn reserved(ours: &[Ours]) -> u32 {
         .sum()
 }
 
+/// Production's capacity with the test environment's own macOS guests,
+/// which production counts as another program's, taken out of the foreign
+/// ones: the lab yields to an image build, not to its own targets (LR-7).
+pub fn without_test_environment(capacity: Capacity, environment_running: u32) -> Capacity {
+    Capacity {
+        foreign: capacity.foreign.saturating_sub(environment_running),
+        ..capacity
+    }
+}
+
 /// The queued jobs this host starts now, oldest first (LR-2, LR-7):
 ///
 /// - only lab jobs ([`labels::need`]) that are not already ours;
@@ -78,7 +90,7 @@ pub fn reserved(ours: &[Ours]) -> u32 {
 ///   runners: a lab runner that is registered and not busy (any host's),
 ///   and each of ours whose runner is not registered yet;
 /// - each only while the host has its macOS slots, counting every guest the
-///   instance reports and the slots ours will take ([`reserved`]), and none
+///   host runs and the slots ours will take ([`reserved`]), and none
 ///   that needs a macOS slot while another program's macOS guest runs.
 pub fn to_start(
     jobs: &[Job],
@@ -146,6 +158,7 @@ mod tests {
             id,
             run_id: 1,
             labels: labels.iter().map(|label| label.to_string()).collect(),
+            status: "queued".into(),
         }
     }
 
@@ -168,6 +181,7 @@ mod tests {
             limit: 2,
             taken,
             foreign: 0,
+            running: 0,
         }
     }
 
@@ -202,8 +216,14 @@ mod tests {
             limit: 2,
             taken: 1,
             foreign: 1,
+            running: 0,
         };
         assert_eq!(ids(&to_start(&jobs, &[], building, &[])), vec![2]);
+        // The test environment's own target is no other program's.
+        let target = without_test_environment(building, 1);
+        assert_eq!(target.foreign, 0);
+        assert_eq!(ids(&to_start(&jobs, &[], target, &[])), vec![1, 2]);
+        assert_eq!(without_test_environment(building, 0), building);
     }
 
     #[test]
@@ -228,6 +248,7 @@ mod tests {
         let need = labels::need(&MAC_TARGET.map(String::from)).unwrap();
         let starting = Ours {
             job: 7,
+            run: 1,
             key: labels::key(&MAC_TARGET.map(String::from)),
             runner: None,
             acquired: false,
@@ -249,7 +270,8 @@ mod tests {
             Capacity {
                 limit: 4,
                 taken: 0,
-                foreign: 0
+                foreign: 0,
+                running: 0
             },
             std::slice::from_ref(&starting)
         )
@@ -268,7 +290,8 @@ mod tests {
             Capacity {
                 limit: 4,
                 taken: 1,
-                foreign: 0
+                foreign: 0,
+                running: 0
             },
             std::slice::from_ref(&named)
         )
@@ -281,7 +304,8 @@ mod tests {
                 Capacity {
                     limit: 4,
                     taken: 1,
-                    foreign: 0
+                    foreign: 0,
+                    running: 0
                 },
                 &[named]
             )),

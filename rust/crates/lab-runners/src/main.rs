@@ -1,5 +1,7 @@
-//! `lab-host`: keep this host's lab instance running and, on a VM host,
-//! serve queued lab jobs with one-job runner VMs (`docs/arch/lab-runners.md`).
+//! `lab-host`: the runner controller (`docs/arch/lab-runners.md`). On a VM
+//! host it serves queued lab jobs with ephemeral runner VMs that production
+//! lends and runs each run's test environment; on a durable Mac it runs the
+//! test environment only for a run its owner dispatched by hand.
 //!
 //! ```text
 //! lab-host run            # the LaunchAgent's program (LR-1)
@@ -9,24 +11,27 @@
 //! ```
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lab_runners::dispatcher::{Archives, Dispatcher, Given, Pinned};
+use lab_runners::config::Config;
+use lab_runners::dispatcher::{Archives, Dispatcher, Given, Lab, Pinned, SourceFactory};
 use lab_runners::dns::{Fixed, OverTls, Resolve};
+use lab_runners::durable::Controller;
+use lab_runners::environment::{Environments, Place, HTTP_PORT};
 use lab_runners::github::{JobSource, Rest, API};
-use lab_runners::instance::{Http, Instance};
-use lab_runners::lab::{self, Endpoint, Role, Settings};
+use lab_runners::lab::{self, Role};
+use lab_runners::production::{Http, Production, CI_PACK, PRODUCTION};
 use lab_runners::seams::Seams;
 use lab_runners::{allowlist, log, token, REPOSITORY};
 use serde_json::Value;
 
-/// How often the dispatcher looks for queued jobs.
+/// How often a VM host looks for queued jobs.
 const ROUND_S: u64 = 15;
-/// How often the lab instance and the lab table are checked.
-const LAB_S: u64 = 60;
+/// How often a durable Mac looks for its owner's dispatched runs.
+const DURABLE_S: u64 = 30;
 
 fn main() {
     service_layout::test_build::start();
@@ -76,26 +81,42 @@ impl Host {
         service_layout::test_build::is_test_build()
     }
 
-    /// The installed instance's `/health`, read only, for the host's role
-    /// and its machine ID. A test build never reads it.
-    fn installed_health(&self) -> Option<Value> {
-        if self.test_build() {
-            return None;
+    /// Production's loopback API: a test build's fake, else the installed
+    /// instance's port on loopback (DC-284).
+    fn production(&self) -> Result<String, String> {
+        match (&self.seams.production, self.test_build()) {
+            (Some(url), true) => Ok(url.clone()),
+            (None, true) => Err("a test build reaches production only through its seams".into()),
+            (_, false) => Ok(PRODUCTION.to_string()),
         }
-        lab::get_json("http://127.0.0.1:6240/health", Duration::from_secs(5))
     }
 
-    fn role(&self) -> Role {
-        self.installed_health()
+    fn production_health(&self) -> Option<Value> {
+        Http::new(&self.production().ok()?).health()
+    }
+
+    /// The host's role: a test build's seam, else what production's
+    /// `/health` shows. Without production there is nothing to do.
+    fn role(&self) -> Result<Role, String> {
+        if self.test_build() {
+            return Ok(match self.seams.role.as_deref() {
+                Some("durable") => Role::DurableMac,
+                _ => Role::VmHost,
+            });
+        }
+        self.production_health()
             .map(|health| lab::role_of(&health))
-            .unwrap_or(Role::VmHost)
+            .ok_or_else(|| {
+                "production machine-service does not answer on loopback; nothing to do".into()
+            })
     }
 
-    /// This host's tag in its runners' names: a hash of its machine ID, so
-    /// a public job log never names the Mac.
+    /// This host's tag in its runners' names: a hash of production's
+    /// machine ID, so a public job log never names the Mac.
     fn tag(&self) -> String {
-        let id = self
-            .installed_health()
+        let id = (!self.test_build())
+            .then(|| self.production_health())
+            .flatten()
             .and_then(|health| {
                 health
                     .get("machine_id")
@@ -104,6 +125,45 @@ impl Host {
             })
             .unwrap_or_else(|| "test".to_string());
         lab_runners::runner::sha256(id.as_bytes())[..8].to_string()
+    }
+
+    fn config(&self) -> Result<Config, String> {
+        if self.test_build() {
+            return match &self.seams.config {
+                Some(path) => Config::load(path),
+                None => Ok(Config::default()),
+            };
+        }
+        Config::load(&self.home.join(lab::CONFIG))
+    }
+
+    fn address(&self) -> Result<Ipv4Addr, String> {
+        match (self.seams.address, self.test_build()) {
+            (Some(address), true) => Ok(address),
+            (None, true) => Ok(Ipv4Addr::LOCALHOST),
+            (_, false) => lab::lan_address(),
+        }
+    }
+
+    /// Where this host's test environments run.
+    fn place(&self, role: Role) -> Result<Place, String> {
+        let test = self.test_build();
+        Ok(Place {
+            bind: self.address()?,
+            port: self.seams.environment_port.unwrap_or(HTTP_PORT),
+            tart_home: if test {
+                self.state.join("tart")
+            } else {
+                self.home.join(".tart")
+            },
+            pilot_repo: (!test).then(|| lab::pilot_repo(&self.home)).flatten(),
+            durable: role == Role::DurableMac,
+            fallback_launcher: self.bundle.join("second-instance"),
+            // By convention, a published release in the controller's bundle,
+            // which `lab-host.sh install --relay-agent-release` puts there.
+            relay_agent_release: Some(self.bundle.join(service_layout::release::FOLDER))
+                .filter(|release| !test && release.is_dir()),
+        })
     }
 
     fn resolver(&self) -> Result<Box<dyn Resolve>, String> {
@@ -140,23 +200,11 @@ impl Host {
         Ok(())
     }
 
-    /// The lab endpoints: in a test build the seams', else every listed
-    /// instance's host that answers as a lab instance.
-    fn endpoints(&self, own: Ipv4Addr) -> Vec<Endpoint> {
-        if let Some(value) = &self.seams.endpoints {
-            return value
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    Some(Endpoint {
-                        name: item.get("name")?.as_str()?.to_string(),
-                        address: item.get("address")?.as_str()?.parse().ok()?,
-                        kinds: vec!["virtual".into()],
-                        own: item.get("own").and_then(Value::as_bool).unwrap_or(false),
-                    })
-                })
-                .collect();
+    /// The other lab hosts' test environment endpoints: in a test build
+    /// the seams', else the port 6272 of every instance discovery lists.
+    fn peers(&self, own: Ipv4Addr) -> Vec<(Ipv4Addr, u16)> {
+        if self.test_build() {
+            return self.seams.peers.clone();
         }
         let listed = Command::new(self.bundle.join("machctl"))
             .args(["list", "--json"])
@@ -167,207 +215,133 @@ impl Host {
             .ok()
             .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
             .unwrap_or(Value::Null);
-        let probe = |address: Ipv4Addr| {
-            lab::get_json(
-                &format!("{}/health", lab::base(address)),
-                Duration::from_secs(5),
-            )
-        };
-        lab::endpoints(own, &lab::listed_addresses(&listed), &probe)
+        lab::listed_addresses(&listed)
+            .into_iter()
+            .filter(|address| *address != own)
+            .map(|address| (address, HTTP_PORT))
+            .collect()
     }
 
-    /// Write the lab table: the endpoints' addresses (LR-5).
-    fn write_lab_table(&self, endpoints: &[Endpoint]) {
-        let mut entries: Vec<String> = endpoints
-            .iter()
-            .map(|endpoint| endpoint.address.to_string())
-            .collect();
-        entries.sort();
-        entries.dedup();
-        let comments = [
-            "lab hosts an egress guest may reach on the lab ports (DC-267); written by lab-host"
-                .to_string(),
-        ];
-        if let Err(error) = guest_firewall::write_addresses(&self.egress.lab, &comments, &entries) {
-            log(&format!("lab table: {error}"));
-        }
+    fn rounds(&self) -> (Option<u64>, Option<Duration>) {
+        (
+            self.seams.rounds,
+            self.seams.interval_s.map(Duration::from_secs),
+        )
     }
 
-    /// Keep the lab instance running and current (LR-6). Answers its base
-    /// URL once it answers as the lab instance.
-    fn ensure_lab(&self, role: Role, idle: bool) -> Result<String, String> {
-        let bind = lab::lan_address()?;
-        let settings = Settings {
-            root: self.state.join("instance"),
-            bind,
-            tart_home: self.home.join(".tart"),
-            executable: self.bundle.join("machine-service"),
-            pilot_repo: lab::pilot_repo(&self.home),
-            role,
-        };
-        let base = lab::base(bind);
-        let healthy = lab::get_json(&format!("{base}/health"), Duration::from_secs(5))
-            .is_some_and(|health| lab::is_lab(&health));
-        let manifest = second_instance::Manifest::read(&settings.root)?;
-        let current = manifest.as_ref().is_some_and(|manifest| {
-            manifest.bind == bind.to_string() && manifest.executable == settings.executable
-        });
-        let launcher = self.bundle.join("second-instance");
-        if healthy && current {
-            return Ok(base);
-        }
-        if manifest.is_some() && !current {
-            let leases = Http::new(&base)
-                .leases()
-                .map(|leases| leases.len())
-                .unwrap_or(0);
-            if !idle || leases > 0 {
-                return Err("the lab instance needs a restart for a new bundle or address; waiting until it is idle".into());
-            }
-            log("restarting the lab instance for a new bundle or address");
-            launch(
-                &launcher,
-                &[
-                    "stop".into(),
-                    "--root".into(),
-                    settings.root.display().to_string(),
-                ],
-            )?;
-        }
-        launch(&launcher, &lab::start_args(&settings))?;
-        log("lab instance started");
-        Ok(base)
+    /// Whether a newer bundle is `current`, so this one exits once idle and
+    /// launchd starts the new one.
+    fn superseded(&self) -> bool {
+        !self.test_build()
+            && lab::current_bundle(&self.home).is_some_and(|current| current != self.bundle)
     }
 }
 
-fn launch(launcher: &Path, args: &[String]) -> Result<(), String> {
-    let output = Command::new(launcher)
-        .args(args)
-        .output()
-        .map_err(|error| format!("{}: {error}", launcher.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "second-instance {} failed: {}",
-            args.first().map(String::as_str).unwrap_or(""),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
+fn source_factory(github: String) -> SourceFactory {
+    Box::new(move || -> Result<Arc<dyn JobSource>, String> {
+        let token = token::read()?;
+        Ok(Arc::new(Rest::new(&github, REPOSITORY, token)) as Arc<dyn JobSource>)
+    })
 }
 
 fn run() -> Result<(), String> {
     let host = Arc::new(Host::new()?);
-    let role = host.role();
+    let role = host.role()?;
+    let config = host.config()?;
     log(&format!(
-        "running as a {} lab host",
-        if role == Role::VmHost {
-            "VM"
-        } else {
-            "durable Mac"
-        }
+        "running as the runner controller of a {}",
+        role.name()
     ));
-    let instance_url = match &host.seams.instance {
-        Some(url) => Some(url.clone()),
-        None if host.test_build() => {
-            return Err("a test build reaches an instance only through its seams".into())
-        }
-        None => None,
-    };
+    let environments = Arc::new(Environments::new(
+        host.state.join("runs"),
+        host.place(role)?,
+    ));
     let github = host.github()?;
-    let source = Box::new(move || -> Result<Arc<dyn JobSource>, String> {
-        let token = token::read()?;
-        Ok(Arc::new(Rest::new(&github, REPOSITORY, token)) as Arc<dyn JobSource>)
-    });
+    match role {
+        Role::VmHost => run_vm_host(&host, github, environments),
+        Role::DurableMac => run_durable(&host, github, environments, config.owner),
+    }
+}
+
+fn run_vm_host(
+    host: &Arc<Host>,
+    github: String,
+    environments: Arc<Environments>,
+) -> Result<(), String> {
     let archives: Arc<dyn Archives> = if host.test_build() {
         Arc::new(Given(host.seams.runners.clone()))
     } else {
         Arc::new(Pinned(host.state.join("cache")))
     };
-    let mut dispatcher: Option<Arc<Dispatcher>> = None;
-    let mut last_lab: Option<Instant> = None;
+    let own = environments.address();
+    let peers = {
+        let host = Arc::clone(host);
+        Box::new(move || host.peers(own))
+    };
+    let dispatcher = Dispatcher::new(
+        source_factory(github),
+        Arc::new(Http::new(&host.production()?)) as Arc<dyn Production>,
+        archives,
+        environments,
+        Lab {
+            own,
+            peers,
+            table: host.egress.lab.clone(),
+        },
+        &host.tag(),
+        host.state.clone(),
+    );
+    dispatcher.recover();
+    let (rounds, interval) = host.rounds();
+    let interval = interval.unwrap_or(Duration::from_secs(ROUND_S));
     let mut last_allowlist: Option<Instant> = None;
-    let rounds = host.seams.rounds;
-    let interval = Duration::from_secs(host.seams.interval_s.unwrap_or(ROUND_S));
     let mut round = 0u64;
     loop {
-        let idle = dispatcher
-            .as_ref()
-            .is_none_or(|dispatcher| dispatcher.ours().is_empty());
-        // A new bundle in `current`: exit once idle, and launchd starts it.
-        if !host.test_build() && idle {
-            if let Some(current) = lab::current_bundle(&host.home) {
-                if current != host.bundle {
-                    log("a new lab bundle is current; exiting so launchd starts it");
-                    return Ok(());
-                }
-            }
+        if dispatcher.idle() && host.superseded() {
+            log("a new lab bundle is current; exiting so launchd starts it");
+            return Ok(());
         }
-        if last_lab.is_none_or(|at| at.elapsed() >= Duration::from_secs(LAB_S)) {
-            last_lab = Some(Instant::now());
-            let base = match &instance_url {
-                Some(url) => Ok(url.clone()),
-                None => host.ensure_lab(role, idle),
-            };
-            match base {
-                Ok(base) if role == Role::VmHost => {
-                    let own = if host.test_build() {
-                        Ipv4Addr::LOCALHOST
-                    } else {
-                        lab::lan_address().unwrap_or(Ipv4Addr::LOCALHOST)
-                    };
-                    let endpoints = host.endpoints(own);
-                    host.write_lab_table(&endpoints);
-                    let dispatcher = dispatcher.get_or_insert_with(|| {
-                        let created = Dispatcher::new(
-                            source.clone_box(),
-                            Arc::new(Http::new(&base)) as Arc<dyn Instance>,
-                            Arc::clone(&archives),
-                            &host.tag(),
-                            host.state.clone(),
-                        );
-                        created.recover();
-                        created
-                    });
-                    dispatcher.set_endpoints(endpoints);
-                }
-                Ok(_) => {}
-                Err(error) => log(&format!("lab instance: {error}")),
-            }
-        }
-        if role == Role::VmHost
-            && last_allowlist
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(allowlist::REFRESH_S))
+        if last_allowlist.is_none_or(|at| at.elapsed() >= Duration::from_secs(allowlist::REFRESH_S))
         {
             last_allowlist = Some(Instant::now());
             if let Err(error) = host.refresh_allowlist() {
                 log(&format!("egress allowlist: {error}"));
             }
         }
-        if let Some(dispatcher) = &dispatcher {
-            dispatcher.round();
-        }
+        dispatcher.round();
         round += 1;
         if rounds.is_some_and(|rounds| round >= rounds) {
-            if let Some(dispatcher) = &dispatcher {
-                dispatcher.join();
-            }
+            dispatcher.join();
+            // One last round retires what the ended jobs left.
+            dispatcher.round();
             return Ok(());
         }
         std::thread::sleep(interval);
     }
 }
 
-/// A source factory that can be handed to a dispatcher more than once.
-trait CloneBox {
-    fn clone_box(&self) -> lab_runners::dispatcher::SourceFactory;
-}
-
-impl<F> CloneBox for Box<F>
-where
-    F: Fn() -> Result<Arc<dyn JobSource>, String> + Send + Sync + Clone + 'static,
-{
-    fn clone_box(&self) -> lab_runners::dispatcher::SourceFactory {
-        Box::new((**self).clone())
+fn run_durable(
+    host: &Arc<Host>,
+    github: String,
+    environments: Arc<Environments>,
+    owner: Option<String>,
+) -> Result<(), String> {
+    let controller = Controller::new(source_factory(github), environments, owner);
+    controller.recover();
+    let (rounds, interval) = host.rounds();
+    let interval = interval.unwrap_or(Duration::from_secs(DURABLE_S));
+    let mut round = 0u64;
+    loop {
+        if controller.idle() && host.superseded() {
+            log("a new lab bundle is current; exiting so launchd starts it");
+            return Ok(());
+        }
+        controller.round();
+        round += 1;
+        if rounds.is_some_and(|rounds| round >= rounds) {
+            return Ok(());
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -376,6 +350,13 @@ where
 fn doctor() -> Result<(), String> {
     let host = Host::new()?;
     let mark = |ok: bool| if ok { "ok     " } else { "MISSING" };
+    let role = host.role();
+    println!(
+        "{} production machine-service answering on loopback",
+        mark(role.is_ok())
+    );
+    let role = role.unwrap_or(Role::VmHost);
+    println!("        role: {}", role.name());
     let token = token::read();
     println!(
         "{} GitHub token in the login keychain{}",
@@ -385,40 +366,58 @@ fn doctor() -> Result<(), String> {
             Err(_) => format!(": {}", token::store_command()),
         }
     );
-    let anchor = std::fs::read_to_string(guest_firewall::ANCHOR_FILE).unwrap_or_default();
-    let egress = guest_firewall::parse_anchor_egress(&anchor);
-    println!(
-        "{} guest firewall egress section{}",
-        mark(egress.is_some()),
-        if egress.is_some() {
-            String::new()
-        } else {
-            format!(
-                ": sudo {} install",
-                host.bundle.join(guest_firewall::INSTALLER).display()
-            )
+    let config = host.config();
+    match role {
+        Role::VmHost => {
+            let ci = host.home.join(".config/vm-credentials").join(CI_PACK);
+            println!(
+                "{} production's {CI_PACK} credential pack{}",
+                mark(ci.is_dir()),
+                if ci.is_dir() {
+                    String::new()
+                } else {
+                    format!(": mkdir -m 700 {}", ci.display())
+                }
+            );
+            let anchor = std::fs::read_to_string(guest_firewall::ANCHOR_FILE).unwrap_or_default();
+            let egress = guest_firewall::parse_anchor_egress(&anchor);
+            println!(
+                "{} guest firewall egress section{}",
+                mark(egress.is_some()),
+                if egress.is_some() {
+                    String::new()
+                } else {
+                    format!(
+                        ": sudo {} install",
+                        host.bundle.join(guest_firewall::INSTALLER).display()
+                    )
+                }
+            );
+            let allow = std::fs::read_to_string(&host.egress.allow).unwrap_or_default();
+            println!(
+                "{} egress allowlist ({} entries)",
+                mark(guest_firewall::parse_check_name(&allow).is_some()),
+                guest_firewall::parse_addresses(&allow).len()
+            );
         }
-    );
-    let allow = std::fs::read_to_string(&host.egress.allow).unwrap_or_default();
-    println!(
-        "{} egress allowlist ({} entries)",
-        mark(guest_firewall::parse_check_name(&allow).is_some()),
-        guest_firewall::parse_addresses(&allow).len()
-    );
-    let lab_ok = lab::lan_address()
-        .ok()
-        .and_then(|bind| {
-            lab::get_json(
-                &format!("{}/health", lab::base(bind)),
-                Duration::from_secs(5),
-            )
-        })
-        .is_some_and(|health| lab::is_lab(&health));
-    println!(
-        "{} lab instance answering on port {}",
-        mark(lab_ok),
-        lab::HTTP_PORT
-    );
+        Role::DurableMac => {
+            let owner = config.as_ref().ok().and_then(|config| config.owner.clone());
+            println!(
+                "{} owner login in ~/{}{}",
+                mark(owner.is_some()),
+                lab::CONFIG,
+                match &config {
+                    Err(error) => format!(": {error}"),
+                    Ok(_) if owner.is_none() => ": a durable Mac serves no run without it".into(),
+                    Ok(_) => String::new(),
+                }
+            );
+        }
+    }
+    let runs = std::fs::read_dir(host.state.join("runs"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    println!("        test environments on this Mac now: {runs}");
     let plist = host
         .home
         .join("Library/LaunchAgents")
@@ -427,14 +426,6 @@ fn doctor() -> Result<(), String> {
         "{} LaunchAgent {}",
         mark(plist.exists()),
         lab_runners::LAUNCH_AGENT
-    );
-    println!(
-        "        role: {}",
-        if host.role() == Role::VmHost {
-            "VM host"
-        } else {
-            "durable Mac"
-        }
     );
     Ok(())
 }

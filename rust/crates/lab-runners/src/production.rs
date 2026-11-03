@@ -1,13 +1,15 @@
-//! The host's lab instance, as the dispatcher uses it: its capacity, its
-//! leases, an egress acquisition, a file into a guest, an exec and a
-//! release (LR-3). Only the lab instance, never the installed one (DC-245).
+//! Production, the host's installed machine-service, as the runner
+//! controller uses it on loopback: its capacity, its leases, the egress
+//! acquisition of an ephemeral runner with the `ci` credential pack, a file
+//! into a guest, an exec and a release (LR-3, DC-283, DC-284). The same
+//! HTTP API reads a test environment's `/health` and capacity.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// A host's macOS slots, as its lab instance's `GET /images` counts them
+/// A host's macOS slots, as an instance's `GET /images` counts them
 /// (DC-18, LR-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capacity {
@@ -15,12 +17,15 @@ pub struct Capacity {
     pub limit: u32,
     /// Every macOS guest on the host, whoever started it.
     pub taken: u32,
-    /// Those another program started, such as an image build.
+    /// Those another program started, such as an image build or a test
+    /// environment.
     pub foreign: u32,
+    /// The instance's own running macOS guests.
+    pub running: u32,
 }
 
-/// A lease of the lab instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A lease of production.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Lease {
     /// The VM's name.
     pub vm: String,
@@ -28,13 +33,36 @@ pub struct Lease {
     pub lease_id: String,
     /// Its purpose.
     pub purpose: String,
+    /// The credential pack its record shows, if any.
+    pub env: Option<String>,
 }
 
-/// What the dispatcher asks of its lab instance.
-pub trait Instance: Send + Sync {
+/// The credential pack of every ephemeral runner VM: empty unless a CI need
+/// is added on purpose, and never the agent pack (DC-283).
+pub const CI_PACK: &str = "ci";
+
+/// The installed instance's loopback API, which lends the runner VMs.
+pub const PRODUCTION: &str = "http://127.0.0.1:6240";
+
+/// Whether a lease's record shows the `ci` pack, which the controller
+/// checks before it starts a runner: a request alone proves nothing on an
+/// API without authentication (DC-283, FD-5).
+pub fn check_ci(lease: &Lease) -> Result<(), String> {
+    match lease.env.as_deref() {
+        Some(CI_PACK) => Ok(()),
+        other => Err(format!(
+            "the runner VM {} was leased with the credential pack {:?}, not {CI_PACK:?}; it gets no runner",
+            lease.vm,
+            other.unwrap_or("none")
+        )),
+    }
+}
+
+/// What the runner controller asks of production.
+pub trait Production: Send + Sync {
     /// The host's macOS slots.
     fn capacity(&self) -> Result<Capacity, String>;
-    /// The instance's current leases.
+    /// Production's current leases.
     fn leases(&self) -> Result<Vec<Lease>, String>;
     /// Acquire a VM; blocks until it is `running` or refused.
     fn acquire(&self, request: &Value) -> Result<Lease, String>;
@@ -48,13 +76,13 @@ pub trait Instance: Send + Sync {
 }
 
 /// The acquisition of a runner VM (LR-3): the image, the `internet`
-/// network with the egress allowlist, no credential pack, and the TTL that
-/// outlasts the deadline.
+/// network with the egress allowlist, the `ci` credential pack named
+/// explicitly (DC-283), and the TTL that outlasts the deadline.
 pub fn runner_request(image: &str, purpose: &str) -> Value {
     json!({
         "purpose": purpose,
         "image": image,
-        "env": "none",
+        "env": CI_PACK,
         "network": "internet",
         "egress": "allowlist",
         "ttl_hours": crate::decide::TTL_HOURS,
@@ -74,6 +102,7 @@ pub fn parse_capacity(value: &Value) -> Result<Capacity, String> {
             .or_else(|| number("macos_running"))
             .ok_or("the instance reports no macOS slots taken")?,
         foreign: number("foreign_macos_guests").unwrap_or(0),
+        running: number("macos_running").unwrap_or(0),
     })
 }
 
@@ -110,6 +139,10 @@ pub fn parse_lease(record: &Value) -> Option<Lease> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        env: record
+            .get("env")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -125,13 +158,14 @@ pub fn encode(text: &str) -> String {
         .collect()
 }
 
-/// The lab instance's HTTP API at `base`.
+/// An instance's HTTP API at `base`: production's, or a test
+/// environment's.
 pub struct Http {
     base: String,
 }
 
 impl Http {
-    /// The instance at `base`, such as `http://<address>:6272`.
+    /// The instance at `base`, such as [`PRODUCTION`].
     pub fn new(base: &str) -> Http {
         Http {
             base: base.trim_end_matches('/').to_string(),
@@ -151,7 +185,7 @@ impl Http {
         response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
         what: &str,
     ) -> Result<Value, String> {
-        let mut response = response.map_err(|error| format!("lab instance {what}: {error}"))?;
+        let mut response = response.map_err(|error| format!("machine-service {what}: {error}"))?;
         let status = response.status().as_u16();
         let text = response
             .body_mut()
@@ -165,7 +199,7 @@ impl Http {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or(text.trim());
-            return Err(format!("lab instance {what}: HTTP {status}: {error}"));
+            return Err(format!("machine-service {what}: HTTP {status}: {error}"));
         }
         Ok(value)
     }
@@ -186,7 +220,21 @@ impl Http {
     }
 }
 
-impl Instance for Http {
+impl Http {
+    /// The instance's `/health`, if it answers within a few seconds.
+    pub fn health(&self) -> Option<Value> {
+        let mut response = Http::agent(Duration::from_secs(5))
+            .get(format!("{}/health", self.base))
+            .call()
+            .ok()?;
+        if response.status().as_u16() != 200 {
+            return None;
+        }
+        serde_json::from_str(&response.body_mut().read_to_string().ok()?).ok()
+    }
+}
+
+impl Production for Http {
     fn capacity(&self) -> Result<Capacity, String> {
         parse_capacity(&self.get("/images")?)
     }
@@ -251,11 +299,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_runner_vm_is_an_egress_guest_without_a_pack() {
+    fn a_runner_vm_is_an_egress_guest_with_the_ci_pack() {
         let request = runner_request("macos26", "lab-42");
         assert_eq!(request["network"], "internet");
         assert_eq!(request["egress"], "allowlist");
-        assert_eq!(request["env"], "none");
+        assert_eq!(request["env"], "ci");
         assert_eq!(request["purpose"], "lab-42");
         assert_eq!(request["ttl_hours"], json!(7.0));
     }
@@ -269,7 +317,8 @@ mod tests {
             Capacity {
                 limit: 2,
                 taken: 1,
-                foreign: 1
+                foreign: 1,
+                running: 0
             }
         );
         let older = json!({"capacity": {"macos_running": 1, "macos_limit": 2}});
@@ -278,7 +327,8 @@ mod tests {
             Capacity {
                 limit: 2,
                 taken: 1,
-                foreign: 0
+                foreign: 0,
+                running: 1
             }
         );
         assert!(parse_capacity(&json!({})).is_err());
@@ -286,18 +336,34 @@ mod tests {
 
     #[test]
     fn leases_are_read_keyed_or_listed() {
-        let keyed = json!({"machines": {"si-lab-a": {"vm": "si-lab-a", "lease_id": "x", "purpose": "lab-1"},
+        let keyed = json!({"machines": {"pilot-a": {"vm": "pilot-a", "lease_id": "x", "purpose": "lab-1", "env": "ci"},
             "mac": {"kind": "durable", "name": "mac", "lease_id": null}}});
         assert_eq!(
             parse_leases(&keyed),
             vec![Lease {
-                vm: "si-lab-a".into(),
+                vm: "pilot-a".into(),
                 lease_id: "x".into(),
-                purpose: "lab-1".into()
+                purpose: "lab-1".into(),
+                env: Some("ci".into()),
             }]
         );
-        let listed = json!({"machines": [{"name": "si-lab-b", "purpose": "acc-x"}]});
-        assert_eq!(parse_leases(&listed)[0].vm, "si-lab-b");
+        let listed = json!({"machines": [{"name": "pilot-b", "purpose": "acc-x", "env": null}]});
+        assert_eq!(parse_leases(&listed)[0].vm, "pilot-b");
+        assert_eq!(parse_leases(&listed)[0].env, None);
         assert_eq!(encode("/tmp/a b"), "/tmp/a%20b");
+    }
+
+    #[test]
+    fn only_a_lease_whose_record_shows_the_ci_pack_gets_a_runner() {
+        let lease = |env: Option<&str>| Lease {
+            vm: "pilot-1".into(),
+            env: env.map(str::to_string),
+            ..Lease::default()
+        };
+        assert!(check_ci(&lease(Some("ci"))).is_ok());
+        for env in [Some("default"), Some("CI"), Some(""), None] {
+            let error = check_ci(&lease(env)).unwrap_err();
+            assert!(error.contains("gets no runner"), "{error}");
+        }
     }
 }

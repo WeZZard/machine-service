@@ -110,7 +110,9 @@ impl Instance {
         })
     }
 
-    /// `POST /acquire`, waiting until the lease runs.
+    /// `POST /acquire`, waiting until the lease runs. No credential pack:
+    /// a second instance has only its own packs, none of them `default`
+    /// (DC-247, DC-283), and the relay needs none.
     pub fn acquire(&self, image: &str, purpose: &str, ttl_hours: f64) -> Result<Value, String> {
         self.json(
             "POST",
@@ -118,6 +120,7 @@ impl Instance {
             Some(json!({
                 "purpose": purpose,
                 "image": image,
+                "env": "none",
                 "ttl_hours": ttl_hours,
                 "wait": true,
             })),

@@ -457,6 +457,7 @@ pub fn run(cli: &Cli, source: &Path, home: &Path) -> Result<(), InstallError> {
     // The old daemon is stopped, so no executable is replaced under it.
     install_executables(source, &deployed, &executables)?;
     install_release(source, &deployed, release.as_ref())?;
+    ensure_ci_pack(home)?;
     // The durable Mac's relay agent, from the installed release, with the
     // daemon stopped so its credential and authority are settled (IN-3).
     if exposed {
@@ -969,6 +970,23 @@ fn install_release(
 /// Copy `executables` from `source` into `deployed`, each through a
 /// temporary sibling and a rename with mode `0755`, so a reader never sees a
 /// partial executable (IN-2). Nothing is copied when the two are one folder.
+/// The lab's `ci` credential pack, the only pack production gives an
+/// ephemeral runner VM: created empty when missing, never changed when
+/// present, so a CI need is only ever added by hand (DC-283).
+fn ensure_ci_pack(home: &Path) -> Result<(), InstallError> {
+    let packs = home.join(".config/vm-credentials");
+    service_layout::test_build::owned_path("the credential packs", &packs)
+        .map_err(InstallError::refused)?;
+    let ci = packs.join(machine_service_core::packs::CI_PACK);
+    if ci.exists() {
+        return Ok(());
+    }
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(&ci)?;
+    println!("created the empty ci credential pack {}", ci.display());
+    Ok(())
+}
+
 fn install_executables(
     source: &Path,
     deployed: &Path,

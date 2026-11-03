@@ -456,7 +456,7 @@ pub const AGENT_CONFIG: &str = ".config/relay-agent/config.json";
 /// and the session port, so neither a rename nor a network change moves it.
 ///
 /// A second instance whose broker binds one address off loopback
-/// (`MACHINE_SERVICE_SESSION_HOST`), such as a durable Mac's lab instance,
+/// (`MACHINE_SERVICE_SESSION_HOST`), such as a durable Mac's test environment,
 /// is not reached at `localhost`, so its agent dials that address, which
 /// the broker's certificate names (BK-1, DC-273).
 pub fn durable_broker_url(session_port: u16) -> String {

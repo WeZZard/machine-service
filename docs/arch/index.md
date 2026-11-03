@@ -51,4 +51,4 @@ flowchart LR
 ## Tests
 
 1. TL: [Test layers](test-layers.md). Each behaviour is tested on the layer that owns it: unit, component integration, network lab, live VM, end to end, and live durable machine.
-2. LR: [Lab runners](lab-runners.md). Each lab job runs in a fresh VM with a one-job runner and a network limited to GitHub and the lab, leased from a long-lived lab instance; the durable Macs are only targets.
+2. LR: [Lab runners](lab-runners.md). Each lab job runs in an ephemeral runner, a fresh VM that production lends with the `ci` credential pack, a one-job runner and a network limited to GitHub and the run's test environments; the code under test is a test environment started from the run's own build for that run only, and a durable Mac has one only during a run its owner dispatched.
