@@ -1267,3 +1267,48 @@ fn m4_a_relay_clients_commands_run_as_the_leases_http_exec() {
     assert!(!tree_text(&relay_dir).contains(CLAUDE_KEY));
     assert!(alive(agent), "the relay agent survives the release");
 }
+
+/// RA-4, RP-3: a durable lease that lives on through a restart of its
+/// instance keeps its relay client credential, as a virtual machine's lease
+/// does: the restarted broker accepts the credential of the acquisition's
+/// answer, and refuses it once the lease is released.
+#[test]
+fn m4_a_durable_leases_client_credential_survives_a_restart() {
+    let mut lab = Lab::new(relay_agent_bin());
+    lab.start_agent();
+    let (name, lease, acquired) = lab.acquire("default");
+    lab.wait_for_relay(&name, &lease);
+    const WAIT: Duration = Duration::from_secs(60);
+
+    lab.restart_daemon();
+    lab.wait_for_relay(&name, &lease);
+    assert!(
+        lab.log().contains(&format!(
+            "durable lease {lease}: client credential admitted again"
+        )),
+        "{}",
+        lab.log()
+    );
+    let client = lease_client(&acquired);
+    client.call(1, "after-restart", relay_common::exec("echo back"), b"");
+    let answer = client.wait(1, WAIT);
+    assert_eq!(exit_rc(&answer), Some(0), "{answer:?}");
+    assert_eq!(String::from_utf8_lossy(&answer.bytes), "back\n");
+    drop(client);
+
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+    let relay = &acquired["relay"];
+    let mut refused = client_config_v2(
+        relay["url"].as_str().unwrap(),
+        relay["credential"].as_str().unwrap(),
+    );
+    refused.tls = Some(
+        remote_session::tls::client_config(&[relay["ca_pem"].as_str().unwrap().as_bytes()])
+            .unwrap(),
+    );
+    assert!(matches!(
+        TestClient::connect_with(refused),
+        Err(remote_session::Error::Rejected { .. })
+    ));
+}
