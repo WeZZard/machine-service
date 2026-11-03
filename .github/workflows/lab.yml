@@ -3,8 +3,10 @@ name: Lab
 # The relay acceptance (docs/arch/test-layers.md, TL-7) on the lab runners:
 # the two durable Macs, each a self-hosted runner labelled `lab` whose job
 # holds its Mac's durable lease while it runs (docs/arch/hygiene.md, HY-5).
-# Only the owner's changes run here: a push to a branch of this repository,
-# a dispatch, and never a pull request from a fork.
+# Only the owner's changes run here: a push to claude/relay-agent of this
+# repository and a dispatch; no pull request, not even from a branch here.
+# Only the relay acceptance runs here, never a test suite, and every command
+# runs in the job's own environment (rust/scripts/relay-lab.sh).
 
 on:
   push:
@@ -31,10 +33,9 @@ jobs:
   relay-acceptance:
     name: Relay acceptance (${{ inputs.profiles || 'N0' }})
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/claude/relay-agent') ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      github.repository == 'WeZZard/vm-service' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/claude/relay-agent') ||
+       github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, macOS, ARM64, lab]
     timeout-minutes: 4320
     permissions:
@@ -56,7 +57,7 @@ jobs:
           {
             echo "$HOME"
             id -un
-            machctl list --json | python3 -I -c '
+            env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" "$(command -v machctl)" list --json | python3 -I -c '
           import json, sys
           for instance in json.load(sys.stdin):
               print(instance["instance"])
@@ -86,8 +87,7 @@ jobs:
 
       - name: Build
         run: |
-          rustup target add aarch64-unknown-linux-musl
-          rustup component add llvm-tools
+          rust/scripts/relay-lab.sh toolchain 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
           rust/scripts/relay-lab.sh build "$RUNNER_TEMP/lab" 2>&1 | rust/scripts/relay-lab.sh redact "$RUNNER_TEMP/lab-names"
 
       - name: Start the lab instances on the targets

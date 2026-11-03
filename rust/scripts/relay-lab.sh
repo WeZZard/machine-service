@@ -15,6 +15,7 @@
 # the installed instance and any other agent's second instance.
 #
 # Usage: relay-lab.sh plan <dir>                write <dir>/plan.env, or fail fast
+#        relay-lab.sh toolchain                 install or update the job's own Rust
 #        relay-lab.sh build <dir>               build the host bundle and the clients
 #        relay-lab.sh deploy <dir>              start the lab instances on the targets
 #        relay-lab.sh run <dir> <cells> <profiles>
@@ -26,11 +27,35 @@
 #
 # <cells> is `all` or a comma-separated list of cell IDs; <profiles> a
 # comma-separated list of N0..N3. The SSH key is ~/.ssh/relay-lab_ed25519.
+#
+# Every command runs in the job's own environment, never the one it was
+# started in: this script starts itself again under `env -i` with a HOME,
+# TMPDIR, RUSTUP_HOME and CARGO_HOME of its own under the lab's folder,
+# <runner work folder>/_lab (outside a runner, ~/.cache/relay-lab), and a
+# PATH of the system's tools and that Rust only. So no VM_ENVIRONMENT_*,
+# MACHINE_SERVICE_*, CODESIGN_IDENTITY or ZDOTDIR reaches a child, nothing
+# reads the operator's configuration, and no global tool is changed; the
+# Rust toolchain the build needs is the job's own, kept between jobs.
 set -eu
+
+if [ -z "${RELAY_LAB_OWN_ENV:-}" ]; then
+    root="${RUNNER_TEMP:+$RUNNER_TEMP/../_lab}"
+    root="${root:-$HOME/.cache/relay-lab}"
+    mkdir -p "$root/home" "$root/tmp"
+    root="$(cd "$root" && pwd)"
+    exec env -i RELAY_LAB_OWN_ENV=1 RELAY_LAB_ROOT="$root" \
+        RELAY_LAB_KEY="$HOME/.ssh/relay-lab_ed25519" RELAY_LAB_HOMES="$(dirname "$HOME")" \
+        RELAY_LAB_MACHCTL="$(command -v machctl || echo machctl)" \
+        HOME="$root/home" TMPDIR="$root/tmp/" USER="$(id -un)" LOGNAME="$(id -un)" LANG=en_US.UTF-8 \
+        RUSTUP_HOME="$root/rustup" CARGO_HOME="$root/cargo" \
+        PATH="$root/cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        /bin/sh "$0" "$@"
+fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 rust="$(cd "$here/.." && pwd)"
-key="$HOME/.ssh/relay-lab_ed25519"
+key="$RELAY_LAB_KEY"
+machctl() { "$RELAY_LAB_MACHCTL" "$@"; }
 # The lab instance's HTTP, broker and agent-chain ports on every target.
 lab_ports="RELAY_HOST_PORT=6272 RELAY_HOST_SESSION_PORT=6273 RELAY_HOST_AGENT_PORT=6274"
 all_cells="macos-client.macos-vm macos-client.ubuntu-vm ubuntu-client.macos-vm ubuntu-client.ubuntu-vm macos-client.durable-mac ubuntu-client.durable-mac"
@@ -126,6 +151,26 @@ musl_env() {
     export CFLAGS_aarch64_unknown_linux_musl="--target=aarch64-unknown-linux-gnu"
     export AR_aarch64_unknown_linux_musl="$llvm_bin/llvm-ar"
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+}
+
+# toolchain: the job's own stable Rust, with the Linux target and llvm-tools
+# the musl builds need, installed by rustup-init checked against its
+# published SHA-256 the first time and updated after.
+toolchain() {
+    if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+        url=https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init
+        curl -fsSL -o "$TMPDIR/rustup-init" "$url"
+        want="$(curl -fsSL "$url.sha256" | cut -d' ' -f1)"
+        got="$(shasum -a 256 "$TMPDIR/rustup-init" | cut -d' ' -f1)"
+        [ -n "$want" ] && [ "$want" = "$got" ] || die "rustup-init: SHA-256 $got, not the published $want"
+        chmod +x "$TMPDIR/rustup-init"
+        "$TMPDIR/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+        rm -f "$TMPDIR/rustup-init"
+    fi
+    rustup toolchain install stable --profile minimal \
+        --component rustfmt,clippy,llvm-tools --target aarch64-unknown-linux-musl
+    rustup default stable
+    echo "toolchain: $(rustc --version), the job's own"
 }
 
 # build <dir>: <dir>/host, the bundle every target runs (the installation's
@@ -321,7 +366,7 @@ def redactor(names_file):
     login = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
     rules = [(re.compile(re.escape(v), re.IGNORECASE), f"<lab-{i}>") for i, v in enumerate(values)]
     rules += [
-        (re.compile(re.escape(os.path.dirname(os.path.expanduser("~"))) + r"/[^/\s\"']+"), "~"),
+        (re.compile(re.escape(os.environ.get("RELAY_LAB_HOMES") or os.path.dirname(os.path.expanduser("~"))) + r"/[^/\s\"']+"), "~"),
         (re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"), "<lan-address>"),
         (re.compile(re.escape(login) + "@"), "<user>@"),
     ]
@@ -369,6 +414,7 @@ print(f'scrubbed {kept} text files; left out {skipped} others (images, certifica
 
 case "${1:-}" in
 plan) plan "${2:?dir}" ;;
+toolchain) toolchain ;;
 build) build "${2:?dir}" ;;
 deploy) deploy "${2:?dir}" ;;
 run) run "${2:?dir}" "${3:-all}" "${4:-N0}" ;;
