@@ -1,6 +1,6 @@
 //! Where lab jobs come from: GitHub's documented REST API behind one
 //! interface, so a runner scale-set source could replace it (LR-2,
-//! DC-1xx-EPH-7).
+//! DC-265).
 
 use std::time::Duration;
 

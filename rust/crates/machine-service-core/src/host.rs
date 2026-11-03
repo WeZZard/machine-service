@@ -158,7 +158,7 @@ pub trait Host: Send + Sync {
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>>;
 
     /// Spawn `tart run` as [`Host::spawn_run`] does, letting Softnet pass
-    /// `softnet_allow`, the lab hosts of an egress guest (DC-1xx-EPH-9). A
+    /// `softnet_allow`, the lab hosts of an egress guest (DC-267). A
     /// host that cannot pass them boots without them.
     fn spawn_run_allowing(
         &self,

@@ -1,6 +1,6 @@
 //! The host's lab instance, kept running and current by `lab-host`, and the
-//! lab's endpoints, which runner VMs may reach (LR-6, DC-1xx-EPH-2,
-//! DC-1xx-EPH-12).
+//! lab's endpoints, which runner VMs may reach (LR-6, DC-260,
+//! DC-270).
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};

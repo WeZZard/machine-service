@@ -978,7 +978,7 @@ impl Fixture {
     }
 
     /// Acquire `ubuntu2404` with `env: none` on the `internet` network with
-    /// the egress allowlist (DC-1xx-EPH-9).
+    /// the egress allowlist (DC-267).
     pub fn try_acquire_egress(&self, purpose: &str) -> OpResult<Value> {
         self.service.acquire(
             purpose,

@@ -518,7 +518,7 @@ impl RealTarget {
     fn record_exposure(&mut self, cell: Cell, run_dir: &Path) -> Result<(), String> {
         let Some(control) = self.settings.host.as_ref() else {
             // A lab instance, which a job reaches without host control,
-            // says the same in its `/health` (DC-1xx-EPH-2).
+            // says the same in its `/health` (DC-260).
             let health = self
                 .discovery
                 .as_ref()
@@ -770,7 +770,7 @@ mod tests {
         let local = json!({"durable": true, "loopback": true, "durable_cell": null});
         assert!(exposure_admits(&local, "macos-client.durable-mac").is_ok());
         assert!(exposure_admits(&json!({"durable": false, "loopback": true}), "x").is_err());
-        // A lab instance serves both durable cells (DC-1xx-EPH-2).
+        // A lab instance serves both durable cells (DC-260).
         let lab = json!({"durable": true, "loopback": false,
             "durable_cell": "macos-client.durable-mac,ubuntu-client.durable-mac"});
         assert!(exposure_admits(&lab, "ubuntu-client.durable-mac").is_ok());

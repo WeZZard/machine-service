@@ -1,6 +1,6 @@
 //! Names resolved over DNS over TLS to the guests' own public resolvers,
 //! never through the host's resolver, whose network may answer with fake
-//! `198.18.x.x` addresses (LR-5, DC-1xx-EPH-10).
+//! `198.18.x.x` addresses (LR-5, DC-268).
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;

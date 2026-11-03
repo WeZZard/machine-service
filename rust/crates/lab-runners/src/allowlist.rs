@@ -1,6 +1,6 @@
 //! The egress allowlist: GitHub's published ranges, the addresses of the
 //! names a self-hosted runner reaches, and the guests' resolvers (LR-5,
-//! DC-1xx-EPH-4, DC-1xx-EPH-10).
+//! DC-262, DC-268).
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -129,7 +129,7 @@ pub fn write(path: &Path, entries: &[String], names: usize, ranges: usize) -> st
         &[
             format!("check: {CHECK_NAME}"),
             format!(
-                "egress allowlist of the lab runners (DC-1xx-EPH-9): {ranges} GitHub ranges, {names} runner names resolved over DNS over TLS, and the guests' resolvers; written by lab-host"
+                "egress allowlist of the lab runners (DC-267): {ranges} GitHub ranges, {names} runner names resolved over DNS over TLS, and the guests' resolvers; written by lab-host"
             ),
         ],
         entries,

@@ -51,7 +51,7 @@ pub fn validate_request(body: &Value) -> OpResult<RequestedNetwork> {
 }
 
 /// The one egress an acquisition may ask for: the host's egress allowlist
-/// (`docs/arch/lab-runners.md`, LR-5, DC-1xx-EPH-9).
+/// (`docs/arch/lab-runners.md`, LR-5, DC-267).
 pub const EGRESS_ALLOWLIST: &str = "allowlist";
 
 /// Validate an acquisition's `egress`: absent, or `"allowlist"` on the
@@ -87,7 +87,7 @@ pub fn run_args(vm: &str, network: GuestNetwork) -> Vec<String> {
 
 /// The arguments of `tart run` for a guest on `network` that Softnet must
 /// also let reach `allow`, each an address it would otherwise drop as
-/// private: an egress guest's lab hosts (DC-1xx-EPH-9). Each address is
+/// private: an egress guest's lab hosts (DC-267). Each address is
 /// passed as its own `/32`, a network as written.
 pub fn run_args_allowing(vm: &str, network: GuestNetwork, allow: &[String]) -> Vec<String> {
     let mut args = run_args(vm, network);

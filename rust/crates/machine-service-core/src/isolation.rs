@@ -292,13 +292,13 @@ pub struct GuestFirewall {
     /// The host port the anchor lets the guests reach, the broker's
     /// (DC-107); `None` for an anchor installed before it, or without it.
     pub broker_port: Option<u16>,
-    /// The anchor's egress section's files (DC-1xx-EPH-9); `None` for an
+    /// The anchor's egress section's files (DC-267); `None` for an
     /// anchor installed before it.
     pub egress: Option<guest_firewall::EgressFiles>,
 }
 
 /// What an egress guest's acquisition reads from the egress section's files
-/// (DC-1xx-EPH-9).
+/// (DC-267).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressPolicy {
     /// The section's files.
@@ -342,7 +342,7 @@ pub fn check_egress(
     let install = guest_firewall::install_command(&installer_path(), &firewall.table);
     let files = firewall.egress.clone().ok_or_else(|| {
         format!(
-            "guest firewall outdated: its anchor has no egress section (DC-1xx-EPH-9); reinstall it \
+            "guest firewall outdated: its anchor has no egress section (DC-267); reinstall it \
 with: {install}"
         )
     })?;
@@ -612,7 +612,7 @@ echo \"egress name={host} address=${{a:-none}} https=${{c:-000}}\"\n"
     )
 }
 
-/// Decide an egress guest's denied check (DC-1xx-EPH-9): HTTPS to
+/// Decide an egress guest's denied check (DC-267): HTTPS to
 /// [`EGRESS_HOST`], which no allowlist holds, must not answer at all. The
 /// name may still resolve, since the guest's resolvers are allowed.
 pub fn decide_denied(egress: Option<&Egress>) -> Result<(), String> {

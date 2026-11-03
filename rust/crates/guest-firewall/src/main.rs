@@ -143,7 +143,7 @@ fn install(table: &Path, owner: Option<u32>, broker_port: Option<u16>) -> Result
             .unwrap_or(false);
         if loaded.contains("block drop in quick") && enabled {
             println!(
-                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}, and limits the egress guests of {} (DC-1xx-EPH-9)",
+                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}, and limits the egress guests of {} (DC-267)",
                 table.display(),
                 guest_firewall::EgressFiles::beside(table).guests.display()
             );
@@ -206,7 +206,7 @@ fn prepare_table(table: &Path, uid: u32, gid: u32) -> Result<(), String> {
     chown(table, uid, gid)?;
     std::fs::set_permissions(table, std::fs::Permissions::from_mode(0o644))
         .map_err(|error| error.to_string())?;
-    // The egress section's files (DC-1xx-EPH-9): pf refuses an anchor whose
+    // The egress section's files (DC-267): pf refuses an anchor whose
     // table file is missing, so each exists, empty until it is written.
     let egress = guest_firewall::EgressFiles::beside(table);
     for file in egress.all() {
@@ -260,12 +260,12 @@ fn status() -> Result<(), String> {
                 );
                 match guest_firewall::parse_anchor_egress(&text) {
                     Some(files) => println!(
-                        "egress section: guests {}, allow {}, lab {} (DC-1xx-EPH-9)",
+                        "egress section: guests {}, allow {}, lab {} (DC-267)",
                         files.guests.display(),
                         files.allow.display(),
                         files.lab.display()
                     ),
-                    None => println!("egress section: none; egress leases are refused (reinstall for DC-1xx-EPH-9)"),
+                    None => println!("egress section: none; egress leases are refused (reinstall for DC-267)"),
                 }
                 match parse_anchor_broker_port(&text) {
                     Some(port) => println!("broker port internet guests may reach: {port} (DC-107)"),

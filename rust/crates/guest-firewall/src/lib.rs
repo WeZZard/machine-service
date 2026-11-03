@@ -49,7 +49,7 @@ pub const DEFAULT_BROKER_PORT: u16 = 6241;
 
 // ------------------------------------------------------------------ egress
 
-/// The pf table of the egress guests' addresses (DC-1xx-EPH-9).
+/// The pf table of the egress guests' addresses (DC-267).
 pub const EGRESS_TABLE: &str = "vm_service_egress";
 /// The pf table of the public addresses an egress guest may reach.
 pub const EGRESS_ALLOW_TABLE: &str = "vm_service_egress_allow";
@@ -62,7 +62,7 @@ pub const EGRESS_GUESTS_FILE: &str = "egress-guests";
 pub const EGRESS_ALLOW_FILE: &str = "egress-allow";
 /// The lab table's file, beside the `internet` table file.
 pub const EGRESS_LAB_FILE: &str = "egress-lab";
-/// The lab instance's ports: its HTTP API and its broker (DC-1xx-EPH-12).
+/// The lab instance's ports: its HTTP API and its broker (DC-270).
 pub const LAB_PORTS: [u16; 2] = [6272, 6273];
 /// The ports an egress guest may reach on the allow table's addresses:
 /// HTTPS and DNS over TLS (DC-16).
@@ -109,7 +109,7 @@ fn port_list(ports: &[u16]) -> String {
         .join(" ")
 }
 
-/// The egress section of the anchor (DC-1xx-EPH-9). It applies only to the
+/// The egress section of the anchor (DC-267). It applies only to the
 /// addresses in the egress table and comes before the `internet` rules, so
 /// an egress guest, which is an `internet` guest too, meets it first:
 ///
@@ -124,7 +124,7 @@ pub fn egress_rules(files: &EgressFiles) -> String {
     let lab = port_list(&LAB_PORTS);
     let allow = port_list(&ALLOW_PORTS);
     format!(
-        "# Egress guests (DC-1xx-EPH-9): the lab's ports, and HTTPS and DNS over TLS to the allow table.\n\
+        "# Egress guests (DC-267): the lab's ports, and HTTPS and DNS over TLS to the allow table.\n\
 table <{EGRESS_TABLE}> persist file \"{guests}\"\n\
 table <{EGRESS_ALLOW_TABLE}> persist file \"{allow_file}\"\n\
 table <{EGRESS_LAB_TABLE}> persist file \"{lab_file}\"\n\
@@ -142,7 +142,7 @@ block drop in quick inet from <{EGRESS_TABLE}> to any\n",
 }
 
 /// Read the egress section's files from an installed anchor's text; an
-/// anchor installed before DC-1xx-EPH-9 has none.
+/// anchor installed before DC-267 has none.
 pub fn parse_anchor_egress(text: &str) -> Option<EgressFiles> {
     let file_of = |table: &str| -> Option<PathBuf> {
         text.lines().find_map(|line| {
@@ -670,7 +670,7 @@ mod tests {
         );
     }
 
-    /// DC-1xx-EPH-9: the egress section passes only the lab's ports and the
+    /// DC-267: the egress section passes only the lab's ports and the
     /// allow table's HTTPS and DNS over TLS, and drops the rest, before any
     /// `internet` rule.
     #[test]
@@ -702,7 +702,7 @@ mod tests {
             Some(EgressFiles::beside(&default_table()))
         );
         assert_eq!(parse_anchor_egress("block drop all\n"), None);
-        // An anchor from before DC-1xx-EPH-9 has no egress section.
+        // An anchor from before DC-267 has no egress section.
         let old: String = rules
             .lines()
             .filter(|line| !line.contains(EGRESS_TABLE))

@@ -1,5 +1,5 @@
 //! The labels a lab job asks for, and what each needs (LR-3,
-//! DC-1xx-EPH-8).
+//! DC-266).
 
 /// Every self-hosted job carries it.
 pub const SELF_HOSTED: &str = "self-hosted";

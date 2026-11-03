@@ -143,7 +143,7 @@ impl Service {
             None
         };
         // An egress guest also needs the anchor's egress section and an
-        // allowlist that holds its resolvers (DC-1xx-EPH-9), checked before
+        // allowlist that holds its resolvers (DC-267), checked before
         // anything is reserved.
         if egress {
             let mut body = Map::new();
@@ -813,7 +813,7 @@ impl Service {
 
     /// The egress fence a lease asked for, read afresh from the egress
     /// section's files, or `None` for a lease that asked for none
-    /// (DC-1xx-EPH-9).
+    /// (DC-267).
     fn egress_policy(&self, record: &Value) -> OpResult<Option<crate::isolation::EgressPolicy>> {
         if record.get("egress").and_then(Value::as_str) != Some(crate::network::EGRESS_ALLOWLIST) {
             return Ok(None);
@@ -837,7 +837,7 @@ impl Service {
     }
 
     /// Add an egress guest's address to the egress guests' table and record
-    /// where, so release removes it (DC-1xx-EPH-9).
+    /// where, so release removes it (DC-267).
     fn add_to_egress(
         &self,
         vm: &str,
@@ -1084,7 +1084,7 @@ the next GC pass retries"
 
         // The egress check: a name resolves to a public address over DNS
         // over TLS, and HTTPS to it answers. An egress guest loads its
-        // allowlist's check name instead (DC-1xx-EPH-9).
+        // allowlist's check name instead (DC-267).
         let check_host = egress_policy
             .map(|policy| policy.check_name.clone())
             .unwrap_or_else(|| crate::isolation::EGRESS_HOST.to_string());

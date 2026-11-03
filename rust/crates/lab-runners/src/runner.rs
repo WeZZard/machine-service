@@ -1,5 +1,5 @@
 //! The pinned GitHub Actions runner, installed into each runner VM at lease
-//! time from a checksum-verified archive (LR-8, DC-1xx-EPH-14).
+//! time from a checksum-verified archive (LR-8, DC-272).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

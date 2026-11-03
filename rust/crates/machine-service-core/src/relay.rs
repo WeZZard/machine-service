@@ -458,7 +458,7 @@ pub const AGENT_CONFIG: &str = ".config/relay-agent/config.json";
 /// A second instance whose broker binds one address off loopback
 /// (`MACHINE_SERVICE_SESSION_HOST`), such as a durable Mac's lab instance,
 /// is not reached at `localhost`, so its agent dials that address, which
-/// the broker's certificate names (BK-1, DC-1xx-EPH-15).
+/// the broker's certificate names (BK-1, DC-273).
 pub fn durable_broker_url(session_port: u16) -> String {
     let host = std::env::var(second_instance::SESSION_HOST_VARIABLE).ok();
     durable_broker_url_for(session_port, host.as_deref())

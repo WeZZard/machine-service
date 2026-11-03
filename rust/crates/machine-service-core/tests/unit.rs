@@ -1959,7 +1959,7 @@ fn relay_credentials_end_within_one_ttl_of_the_lease() {
 }
 
 /// Write the egress section's allow and lab files beside the fake host's
-/// `internet` table, as `lab-host` does (DC-1xx-EPH-9).
+/// `internet` table, as `lab-host` does (DC-267).
 fn write_egress_lists(fixture: &common::Fixture, allow: &[&str], lab: &[&str]) {
     use machine_service_core::guest_firewall::{write_addresses, EgressFiles};
     use machine_service_core::host::Host as _;

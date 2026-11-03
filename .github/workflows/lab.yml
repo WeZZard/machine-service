@@ -8,7 +8,7 @@ name: Lab
 # anything in a runner VM: the build job runs on GitHub-hosted runners.
 # VM cells run on a push to claude/relay-agent of this repository and on a
 # dispatch; durable cells run only on the owner's dispatch, because they run
-# commands on a real Mac as the owner (DC-1xx-EPH-5). No pull request runs
+# commands on a real Mac as the owner (DC-263). No pull request runs
 # here, and no secret is used.
 
 on:
@@ -201,7 +201,7 @@ jobs:
   durable-cells:
     name: ${{ matrix.cell }}
     needs: [plan, build]
-    # The owner's dispatch only (DC-1xx-EPH-5); the plan names no durable
+    # The owner's dispatch only (DC-263); the plan names no durable
     # cell otherwise.
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.durable &&

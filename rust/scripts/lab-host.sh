@@ -21,7 +21,7 @@
 # Developer ID agent is never asked to downgrade it (DC-232).
 # --sign-developer-id signs the bundle's lab-host with the keychain's
 # Developer ID Application identity under com.wezzard.vm-service.lab, so a
-# local network grant survives later updates (DC-1xx-EPH-13).
+# local network grant survives later updates (DC-271).
 #
 # remove unloads the LaunchAgent, stops the lab instance (which releases its
 # leases and deletes its VMs), and removes the bundles and the LaunchAgent.

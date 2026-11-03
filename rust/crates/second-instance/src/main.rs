@@ -421,7 +421,7 @@ fn mkdir(path: &Path) -> Result<(), String> {
 }
 
 /// The ID `--id` asks for: 1 to 16 lower-case letters and digits, so a
-/// long-lived instance, such as the lab's (DC-1xx-EPH-2), has a stable ID
+/// long-lived instance, such as the lab's (DC-260), has a stable ID
 /// and clone prefix.
 fn requested_id(args: &[String]) -> Result<Option<String>, String> {
     match flags(args)?.values.get("id") {
@@ -953,7 +953,7 @@ mod tests {
         );
     }
 
-    /// DC-1xx-EPH-2: a long-lived instance asks for its ID, and the cells
+    /// DC-260: a long-lived instance asks for its ID, and the cells
     /// its durable exposure is for reach the daemon.
     #[test]
     fn a_requested_id_and_durable_cells_reach_the_daemon() {

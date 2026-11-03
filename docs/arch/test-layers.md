@@ -149,7 +149,7 @@ The profiles are JSON files in `rust/crates/network-rig/profiles/`.
 - AC-65 does not reboot a durable Mac, nor log its operator out: it is the operator's machine, its CI runner is never paused (DC-25), and a logout would end the runner too. On a durable Mac AC-65 restarts the agent's LaunchAgent job as a new desktop session starts it (`launchctl kickstart -k gui/<uid>/<label>`), and the agent must register again by itself and pass AC-55's checks (DC-216).
 - AC-66's expired credential is a second lease of the shortest TTL, 0.1 hours: its credential is accepted before the end its lease gives it and refused after it. On a durable Mac, AC-60 checks that the agent credential outlives the lease instead of its refusal, because it is the machine's (RA-4).
 - An Ubuntu client cell runs in a leased ubuntu2404 VM: `scripts/relay-acceptance-ubuntu-client.sh` leases it, puts the static Linux build in it, runs the cell there and brings the evidence home.
-- The lab workflow runs the cells in the lab's ephemeral runner VMs against long-lived lab instances, without host control and with `--agent-rig external` ([LR-9](lab-runners.md#lr-9-the-workflow)); a durable cell then reads its instance's exposure from `/health` (DC-1xx-EPH-15).
+- The lab workflow runs the cells in the lab's ephemeral runner VMs against long-lived lab instances, without host control and with `--agent-rig external` ([LR-9](lab-runners.md#lr-9-the-workflow)); a durable cell then reads its instance's exposure from `/health` (DC-273).
 - Each scenario reports named checks. A check that waits for something not built yet or not in the images yet is `blocked`, with the reason, and is not a failure (DC-187).
 
 ### Coverage of the contract
