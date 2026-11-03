@@ -392,7 +392,7 @@ pub fn fingerprint(team: &str) -> String {
 
 /// `text` with each team ID of `teams` shown as its [`fingerprint`]
 /// instead, for a message that leaves the operator's terminal, such as a
-/// lease's `link_reason` or `/health` (DC-1xx-TRUST2-3).
+/// lease's `link_reason` or `/health` (DC-238).
 pub fn redact<'a>(text: &str, teams: impl IntoIterator<Item = &'a str>) -> String {
     teams
         .into_iter()
@@ -821,7 +821,7 @@ mod tests {
         assert!(Anchor::resolve(state.path(), None).is_err());
     }
 
-    /// DC-1xx-TRUST2-3: a refusal that leaves the operator's terminal names
+    /// DC-238: a refusal that leaves the operator's terminal names
     /// every team by its fingerprint; anything that is not a team ID, such
     /// as `SHA256SUMS`, is left as it is.
     #[test]

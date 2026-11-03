@@ -217,10 +217,10 @@ impl HeldRelease {
 /// `state_dir` holds against the instance's trust, with the operator's
 /// `configured` team, exactly as the installer checks a release
 /// ([`crate::durable::relay_agent::release_executable`], DC-231,
-/// DC-1xx-TRUST2-1). A Developer ID team the record does not name yet is
-/// recorded, as an installation records it (DC-1xx-TRUST2-2). A refusal
+/// DC-236). A Developer ID team the record does not name yet is
+/// recorded, as an installation records it (DC-237). A refusal
 /// names every team by its fingerprint, because it reaches a lease's
-/// `link_reason` and `/health` (DC-1xx-TRUST2-3).
+/// `link_reason` and `/health` (DC-238).
 pub fn check_release(
     release_dir: &Path,
     state_dir: &Path,
@@ -335,7 +335,7 @@ impl Relay {
             state_dir: state_dir.to_path_buf(),
             release_check: Mutex::new(Value::Null),
         });
-        // DC-1xx-TRUST2-1: the held release is checked at startup, whatever
+        // DC-236: the held release is checked at startup, whatever
         // else this instance offers.
         match relay.held_release() {
             Ok(held) => log(&format!(
@@ -353,7 +353,7 @@ impl Relay {
     /// Check the relay agent release this instance holds against its trust
     /// ([`held_release`]): at startup, and before every upload or
     /// replacement of a guest's relay agent, so the release in place when
-    /// a build is sent is the one checked (DC-1xx-TRUST2-1). A release
+    /// a build is sent is the one checked (DC-236). A release
     /// that fails serves leases over SSH with the reason (RA-8).
     pub fn held_release(&self) -> Result<HeldRelease, String> {
         let mut shown = self.release_check.lock().unwrap_or_else(|e| e.into_inner());
@@ -512,7 +512,7 @@ const NO_CODESIGN: &str = "machine-service-relay: no codesign";
 
 /// The `codesign` a guest's signature check runs: macOS's only system
 /// `codesign`, never one found on the guest's `PATH`, which the guest's
-/// account controls (DC-1xx-TRUST2-4).
+/// account controls (DC-239).
 pub const GUEST_CODESIGN: &str = "/usr/bin/codesign";
 
 /// Print what [`GUEST_CODESIGN`] shows of the guest's relay agent's
@@ -912,7 +912,7 @@ impl Service {
             return;
         };
         let kind = crate::ops::record_kind(&record).to_string();
-        // DC-1xx-TRUST2-1: the release is checked against the instance's
+        // DC-236: the release is checked against the instance's
         // trust before its build is compared, let alone written.
         let build = match relay.held_release().and_then(|held| held.build(&kind)) {
             Ok(build) => build,
@@ -1222,7 +1222,7 @@ impl Service {
 
         // The build: the image's when it is the release's, else the
         // release's executable, uploaded (RA-6, DC-140), from a release
-        // checked against the instance's trust now (DC-1xx-TRUST2-1).
+        // checked against the instance's trust now (DC-236).
         let build = relay
             .held_release()
             .map_err(|e| format!("the relay agent release is not trusted: {e}"))?
@@ -1717,7 +1717,7 @@ mod tests {
         assert!(signature_command().contains(GUEST_EXECUTABLE));
     }
 
-    /// DC-1xx-TRUST2-4: a guest's signature check runs `/usr/bin/codesign`;
+    /// DC-239: a guest's signature check runs `/usr/bin/codesign`;
     /// a `codesign` that the guest's `PATH` finds first, which would claim
     /// any signature, is never run, at bootstrap or through the relay.
     #[cfg(target_os = "macos")]

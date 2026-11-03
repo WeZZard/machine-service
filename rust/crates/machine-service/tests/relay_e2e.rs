@@ -837,7 +837,7 @@ fn recorded_codesign(fixture: &str) -> String {
 /// the guest, runs it wherever a command names `/usr/bin/codesign`, so the
 /// guest's relay agent reads as signed as `fixture` shows. The daemon's
 /// command is the production one; only the guest is fake
-/// (DC-1xx-TRUST2-4).
+/// (DC-239).
 fn guest_codesign(lab: &Lab, fixture: &str) {
     write_exec(
         &lab.fixture.tart_home,
@@ -1025,7 +1025,7 @@ fn a_long_lived_lease_never_downgrades_a_developer_id_agent() {
     signed.shutdown(Duration::from_secs(1));
 }
 
-/// DC-1xx-TRUST2-4: the guest's signature check runs `/usr/bin/codesign`;
+/// DC-239: the guest's signature check runs `/usr/bin/codesign`;
 /// a `codesign` that the guest's `PATH` finds first, claiming Developer ID,
 /// is never run. The guest's agent reads as the unsigned file it is, so the
 /// instance's build replaces it and the lease runs over the relay.
@@ -1074,7 +1074,7 @@ fn health(lab: &Lab) -> Value {
     http(lab.fixture.port(), "GET", "/health", None, None).body
 }
 
-/// DC-1xx-TRUST2-1 at startup: an instance that runs the relay link
+/// DC-236 at startup: an instance that runs the relay link
 /// without durable exposure checks its release against its trust as the
 /// installer would. A release that fails is never sent: `/health` says so
 /// with the reason, and every lease is served over SSH with it (RA-8),
@@ -1113,7 +1113,7 @@ fn an_untrusted_release_serves_every_lease_over_ssh() {
     assert_eq!(released.status, 200, "{}", released.body);
 }
 
-/// DC-1xx-TRUST2-1 before every upload: a release trusted at startup and
+/// DC-236 before every upload: a release trusted at startup and
 /// then replaced in place by one that fails is checked again at the next
 /// acquisition, which is served over SSH, and `/health` follows.
 #[test]
@@ -1146,7 +1146,7 @@ fn a_release_is_checked_again_before_every_upload() {
     assert_eq!(released.status, 200, "{}", released.body);
 }
 
-/// DC-1xx-TRUST2-1 before every replacement: an instance that restarts
+/// DC-236 before every replacement: an instance that restarts
 /// with a release that fails its trust never writes that release's build
 /// over a long-lived lease's agent; the lease keeps the agent it has.
 #[test]

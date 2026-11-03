@@ -54,7 +54,7 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
             &format!("WARN: relay: no durable agent credential: {error}"),
         ),
     }
-    // DC-1xx-TRUST2-1: only a release that the instance trusts names the
+    // DC-236: only a release that the instance trusts names the
     // build its agent must run for the lease's calls to take it.
     let expected_build = relay
         .held_release()

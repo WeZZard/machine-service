@@ -578,7 +578,7 @@ fn an_exposed_instance_brings_up_its_own_relay_agent() {
     // shows in `/health` as a fingerprint, never as the team.
     let health = lab.request("GET", "/health", None).body;
     assert_eq!(health["relay_agent_team"], Value::Null, "{health}");
-    // DC-1xx-TRUST2-1: the daemon checked the release it holds itself.
+    // DC-236: the daemon checked the release it holds itself.
     assert_eq!(health["relay_agent_release"]["trusted"], true, "{health}");
     let record = lab
         .state

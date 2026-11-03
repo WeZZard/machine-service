@@ -194,7 +194,7 @@ pub fn plist(identity: &Identity, paths: &Paths) -> Vec<u8> {
 /// (`anchor`, or on first use any), or, for a pre-release only, ad hoc
 /// (DC-135, DC-140, DC-224, DC-231). A `SIGNING.json` that disagrees with
 /// the executable is refused. The one check of a release's trust, for the
-/// installer and for the daemon's guests alike (DC-1xx-TRUST2-1).
+/// installer and for the daemon's guests alike (DC-236).
 pub fn release_executable(release_dir: &Path, anchor: &Anchor) -> Result<Trusted, String> {
     let platform = release::platform_for("macos");
     let release = Release::open(release_dir)?;
@@ -753,7 +753,7 @@ mod tests {
         );
     }
 
-    /// DC-1xx-TRUST2-1: the daemon's check of the release it holds is the
+    /// DC-236: the daemon's check of the release it holds is the
     /// installer's: an ad hoc pre-release with the identifier is trusted
     /// and records no team; an ad hoc release that is not a pre-release,
     /// an executable without the identifier and a damaged trust record are
