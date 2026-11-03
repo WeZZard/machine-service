@@ -1,5 +1,5 @@
-//! The macOS relay agent's code signature (DC-135, DC-224, DC-1xx-SIGN2-2
-//! to DC-1xx-SIGN2-4).
+//! The macOS relay agent's code signature (DC-135, DC-224, DC-227
+//! to DC-229).
 //!
 //! A release's macOS executable carries the identifier [`IDENTIFIER`], and
 //! one of two signatures:

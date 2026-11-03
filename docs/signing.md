@@ -83,7 +83,7 @@ This page is for two readers:
 
 ## Notarization
 
-The release is not notarized (DC-1xx-SIGN2-3):
+The release is not notarized (DC-228):
 
 - Gatekeeper assesses only files that carry the quarantine attribute. A
   browser, or another app that quarantines its downloads, sets that attribute.
