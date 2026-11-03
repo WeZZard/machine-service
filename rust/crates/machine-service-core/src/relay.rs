@@ -454,11 +454,27 @@ pub const AGENT_CONFIG: &str = ".config/relay-agent/config.json";
 
 /// The broker URL a durable Mac's own relay agent dials: the loopback name
 /// and the session port, so neither a rename nor a network change moves it.
+///
+/// A second instance whose broker binds one address off loopback
+/// (`MACHINE_SERVICE_SESSION_HOST`), such as a durable Mac's lab instance,
+/// is not reached at `localhost`, so its agent dials that address, which
+/// the broker's certificate names (BK-1, DC-1xx-EPH-15).
 pub fn durable_broker_url(session_port: u16) -> String {
-    format!(
-        "wss://localhost:{session_port}{}",
-        remote_session::RELAY_PATH
-    )
+    let host = std::env::var(second_instance::SESSION_HOST_VARIABLE).ok();
+    durable_broker_url_for(session_port, host.as_deref())
+}
+
+/// [`durable_broker_url`] for the broker's bind address `session_host`.
+pub fn durable_broker_url_for(session_port: u16, session_host: Option<&str>) -> String {
+    let address = session_host
+        .and_then(|host| host.trim().parse::<std::net::IpAddr>().ok())
+        .filter(|address| !address.is_loopback() && !address.is_unspecified());
+    let host = match address {
+        Some(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Some(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+        None => "localhost".to_string(),
+    };
+    format!("wss://{host}:{session_port}{}", remote_session::RELAY_PATH)
 }
 
 /// The durable machine's agent credential: read it, or make it mode 600;
@@ -1716,6 +1732,30 @@ fn place_pulled_tree(scratch: &Path, archive: &Path, destination: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_durable_agent_dials_localhost_unless_its_broker_binds_one_lan_address() {
+        assert_eq!(
+            durable_broker_url_for(6241, None),
+            "wss://localhost:6241/relay"
+        );
+        assert_eq!(
+            durable_broker_url_for(6250, Some("127.0.0.1")),
+            "wss://localhost:6250/relay"
+        );
+        assert_eq!(
+            durable_broker_url_for(6250, Some("0.0.0.0")),
+            "wss://localhost:6250/relay"
+        );
+        assert_eq!(
+            durable_broker_url_for(6273, Some("192.0.2.4")),
+            "wss://192.0.2.4:6273/relay"
+        );
+        assert_eq!(
+            durable_broker_url_for(6273, Some("fd00::4")),
+            "wss://[fd00::4]:6273/relay"
+        );
+    }
 
     #[test]
     fn bootstrap_commands_are_marked_and_atomic() {

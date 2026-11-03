@@ -750,9 +750,9 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let table = directory.path().join("internet-guests");
-        add_guest(&table, guest("192.168.2.9", "/state", "pilot-a")).unwrap();
+        add_guest(&table, guest("192.0.2.9", "/state", "pilot-a")).unwrap();
         let files = EgressFiles::beside(&table);
-        add_guest(&files.guests, guest("192.168.2.10", "/state", "si-lab-a")).unwrap();
+        add_guest(&files.guests, guest("192.0.2.10", "/state", "si-lab-a")).unwrap();
         write_addresses(
             &files.allow,
             &["check: api.github.com".into()],

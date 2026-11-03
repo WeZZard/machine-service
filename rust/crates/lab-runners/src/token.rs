@@ -90,8 +90,8 @@ mod tests {
 
     #[test]
     fn a_token_never_shows() {
-        let token = Token::new(" github_pat_x \n").unwrap();
-        assert_eq!(token.reveal(), "github_pat_x");
+        let token = Token::new(" not-a-real-token \n").unwrap();
+        assert_eq!(token.reveal(), "not-a-real-token");
         assert_eq!(format!("{token:?}"), "Token([redacted])");
         assert!(Token::new("  \n").is_none());
     }
