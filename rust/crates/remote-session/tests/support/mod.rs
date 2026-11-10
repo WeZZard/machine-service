@@ -262,18 +262,50 @@ fn wait_due(state: &State, killed: &AtomicBool, due: Instant) -> bool {
     }
 }
 
-/// Write `bytes` at the bandwidth cap.
-fn write_shaped(state: &State, to: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+/// One forwarding loop's pacing schedule (DC-303): when its next byte may
+/// go out at the bandwidth cap. Each write is due when the bytes sent since
+/// the schedule started would take that long at the cap, so a sleep that
+/// overshoots is made up by the next write instead of slowing the link, and
+/// the link carries its cap whatever the host's sleep granularity. After an
+/// idle gap the schedule starts again, so an idle link earns no burst.
+#[derive(Default)]
+struct Pacer {
+    next: Option<Instant>,
+}
+
+impl Pacer {
+    /// The longest idle gap after which the schedule starts again.
+    const RESTART: Duration = Duration::from_millis(100);
+
+    /// When a write of `bytes` that starts now is due to end at `rate`.
+    fn due(&mut self, bytes: usize, rate: u64) -> Instant {
+        let now = Instant::now();
+        let start = match self.next {
+            Some(next) if next + Self::RESTART >= now => next,
+            _ => now,
+        };
+        let next = start + Duration::from_secs_f64(bytes as f64 / rate as f64);
+        self.next = Some(next);
+        next
+    }
+}
+
+/// Write `bytes` at the bandwidth cap, on `pacer`'s schedule.
+fn write_shaped(
+    state: &State,
+    pacer: &mut Pacer,
+    to: &mut TcpStream,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     let rate = state.bandwidth.load(Ordering::SeqCst);
     if rate == 0 {
         return to.write_all(bytes);
     }
     let step = (rate / 100).max(1) as usize;
     for piece in bytes.chunks(step) {
-        let started = Instant::now();
         to.write_all(piece)?;
-        let take = Duration::from_secs_f64(piece.len() as f64 / rate as f64);
-        if let Some(rest) = take.checked_sub(started.elapsed()) {
+        let due = pacer.due(piece.len(), rate);
+        if let Some(rest) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(rest);
         }
     }
@@ -323,6 +355,7 @@ fn one_queue(state: Arc<State>, killed: Arc<AtomicBool>, client: TcpStream, upst
     }
     drop(tx);
     let (mut to_client, mut to_upstream) = (client, upstream);
+    let mut pacer = Pacer::default();
     while let Ok((toward_client, due, bytes)) = rx.recv() {
         if !wait_due(&state, &killed, due) {
             return;
@@ -332,7 +365,7 @@ fn one_queue(state: Arc<State>, killed: Arc<AtomicBool>, client: TcpStream, upst
         } else {
             &mut to_upstream
         };
-        if write_shaped(&state, to, &bytes).is_err() {
+        if write_shaped(&state, &mut pacer, to, &bytes).is_err() {
             return;
         }
     }
@@ -345,11 +378,12 @@ fn pump(state: Arc<State>, killed: Arc<AtomicBool>, from: TcpStream, mut to: Tcp
     let (ws, wk) = (state.clone(), killed.clone());
     let mut writer_to = to.try_clone().unwrap();
     let writer = std::thread::spawn(move || {
+        let mut pacer = Pacer::default();
         while let Ok((_, due, bytes)) = rx.recv() {
             if !wait_due(&ws, &wk, due) {
                 return;
             }
-            if write_shaped(&ws, &mut writer_to, &bytes).is_err() {
+            if write_shaped(&ws, &mut pacer, &mut writer_to, &bytes).is_err() {
                 return;
             }
         }
