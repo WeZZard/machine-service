@@ -9,6 +9,14 @@
 #   <binary>           relay-acceptance built for aarch64-unknown-linux-musl
 #   <run args>         the arguments of `relay-acceptance run`, without --evidence
 #
+# RELAY_ACCEPTANCE_HOST_KEY, when set, names a private key that the target
+# Macs authorize only with a forced command for the host script (DC-307).
+# The key is copied into the client VM's home, mode 600, and every
+# @HOST_KEY@ in the run arguments becomes its path there, so a
+# --host-shell such as "ssh -i @HOST_KEY@ ..." gives the client VM the host
+# control that AC-61 and AC-64 need. The VM is deleted with the key at
+# release.
+#
 # The client VM resolves host names with its own resolver. A NAT guest has no
 # multicast DNS beyond its host, so the names the run uses (the target
 # instance's and its relay_url's) are looked up here, at run time, and written
@@ -58,6 +66,16 @@ sha=$(shasum -a 256 "$binary" | cut -d' ' -f1)
 curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=relay-acceptance" \
     -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $sha" --data-binary "@$binary" >/dev/null
 
+key_path=""
+if [ -n "${RELAY_ACCEPTANCE_HOST_KEY:-}" ]; then
+    key_sha=$(shasum -a 256 "$RELAY_ACCEPTANCE_HOST_KEY" | cut -d' ' -f1)
+    curl -fsS -m 60 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=acc-host-key" \
+        -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $key_sha" \
+        --data-binary "@$RELAY_ACCEPTANCE_HOST_KEY" >/dev/null
+    key_path=$(exec_script "$vm" 'chmod 600 ~/acc-host-key && printf %s "$HOME/acc-host-key"' 60 | json 'd.get("output","")')
+    [ -n "$key_path" ] || { echo "could not place the host-control key in $vm" >&2; exit 1; }
+fi
+
 # The names the run reaches: the target instance's host and, from its
 # discovery, the broker's.
 instance=""
@@ -78,6 +96,9 @@ done
 
 quoted=""
 for arg in "$@"; do
+    if [ -n "$key_path" ]; then
+        arg=$(printf %s "$arg" | sed "s#@HOST_KEY@#$key_path#g")
+    fi
     quoted="$quoted '$(printf %s "$arg" | sed "s/'/'\\\\''/g")'"
 done
 
