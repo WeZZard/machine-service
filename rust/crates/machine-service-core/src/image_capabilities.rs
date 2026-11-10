@@ -12,7 +12,7 @@
 //!   Linux guest has no Metal device.
 //! - `software` comes from the image's validated application inventory
 //!   (`GET /applications`); without one it is `null` with the reason.
-//! - The facts a running guest would have to answer (display, permissions,
+//! - The facts a running guest would have to answer (display,
 //!   CI runner) are `null`, each with its reason under `unknown`. The
 //!   instance never guesses a fact.
 
@@ -66,7 +66,7 @@ pub fn report(kind: &str, defaults: &Value, inventory: Result<&Value, &str>) -> 
             Value::Null
         }
     };
-    for section in ["display", "permissions", "ci_runner", "agents"] {
+    for section in ["display", "ci_runner", "agents"] {
         unknown.insert(section.to_string(), json!(GUEST_FACT));
     }
     json!({
@@ -84,7 +84,6 @@ pub fn report(kind: &str, defaults: &Value, inventory: Result<&Value, &str>) -> 
         "gpu": gpu,
         "display": null,
         "software": software,
-        "permissions": null,
         "agents": null,
         "ci_runner": null,
         "observed_at": {},
@@ -206,7 +205,7 @@ mod tests {
         assert_eq!(software["xcode"][0]["version"], "26.6");
         assert_eq!(software["unity"][0]["version"], "6000.3.26f1");
         assert_eq!(software["unreal"], json!([]));
-        for section in ["display", "permissions", "ci_runner"] {
+        for section in ["display", "ci_runner"] {
             assert_eq!(report[section], Value::Null);
             assert!(report["unknown"].get(section).is_some(), "{section}");
         }
