@@ -454,6 +454,12 @@ impl Lab {
 
     /// The leases whose purge is pending, as the machine record and
     /// `/health` both show them (DC-177).
+    ///
+    /// The two are separate requests, and a purge the agent confirms
+    /// between them shows in one and not the other. So the lists are
+    /// compared only on a stable reading, the record read before and after
+    /// `/health` the same, and a reading that changed under the requests is
+    /// taken again.
     fn pending_purges(&self, name: &str) -> Vec<String> {
         let ids = |list: &Value| -> Vec<String> {
             list.as_array()
@@ -462,11 +468,24 @@ impl Lab {
                 .map(|purge| purge["lease_id"].as_str().unwrap().to_string())
                 .collect()
         };
-        let record = self.request("GET", &format!("/machines/{name}"), None);
-        let health = self.request("GET", "/health", None);
-        let from_record = ids(&record.body["relay_purges_pending"]);
-        assert_eq!(from_record, ids(&health.body["relay_purges_pending"]));
-        from_record
+        let from_record = || {
+            let record = self.request("GET", &format!("/machines/{name}"), None);
+            ids(&record.body["relay_purges_pending"])
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let before = from_record();
+            let health = self.request("GET", "/health", None);
+            let after = from_record();
+            if before == after {
+                assert_eq!(after, ids(&health.body["relay_purges_pending"]));
+                return after;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pending purges never held still: {before:?}, then {after:?}"
+            );
+        }
     }
 
     /// Wait until the broker logged `count` registrations of an agent.
