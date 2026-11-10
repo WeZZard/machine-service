@@ -146,10 +146,18 @@ fn is_own_fork(row: &Row, own: i32) -> bool {
 /// `handle`, as a process started on it does. The test that owns the
 /// lifeline holds its write end too, and is never one: a watcher must never
 /// end the test that is still alive.
+///
+/// Whether `row` is this test's own copy is asked before whether it holds
+/// the pipe (DC-304). A copy that calls `exec` between the two looks holds
+/// the pipe at the first and shows its new program at the second, so the
+/// other order took it for a holder after `exec` had closed the pipe, and
+/// `kill`, which `exec` does not tell apart, ended another test's child.
+/// In this order, a process judged not a copy is judged on what it holds
+/// after that.
 fn holds(row: &Row, own: i32, fd: i32, handle: u64) -> bool {
     row.pid != own
-        && pipe_handle(row.pid, fd) == Some(handle)
         && !is_own_fork(row, own)
+        && pipe_handle(row.pid, fd) == Some(handle)
         && !pipe_ends(row.pid, fd).is_some_and(|(_, write)| holds_anywhere(row.pid, write))
 }
 
