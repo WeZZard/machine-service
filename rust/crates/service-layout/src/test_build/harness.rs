@@ -353,6 +353,47 @@ pub fn living(rows: &[processes::Row]) -> Vec<processes::Row> {
         .collect()
 }
 
+// ------------------------------------------------------------ fake launchd
+
+/// The fake `launchctl` that runs a test's launchd jobs (RA-10, DC-254):
+/// it starts a job's program with its redirections in a group of its own,
+/// and never touches the Mac's launchd.
+pub const FAKE_LAUNCHCTL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/launchd/launchctl"
+);
+
+/// The variable naming the fake's state folder.
+pub const FAKE_LAUNCHD_STATE: &str = "FAKE_LAUNCHD_STATE";
+
+/// Link the fake `launchctl` into the tool folder `tools`, making the
+/// folder when it is missing.
+pub fn link_fake_launchctl(tools: &std::path::Path) -> io::Result<()> {
+    std::fs::create_dir_all(tools)?;
+    let link = tools.join("launchctl");
+    match std::os::unix::fs::symlink(FAKE_LAUNCHCTL, &link) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
+}
+
+/// A tool folder under `root` holding the fake `launchctl` and the
+/// read-only system tools a test may run, as a test build without a tool
+/// folder would ([`super::READ_ONLY_TOOLS`]), and the fake's state folder
+/// beside it: the two variables a test child needs to run its commands as
+/// fake launchd jobs.
+pub fn fake_launchd(root: &std::path::Path) -> io::Result<[(&'static str, std::path::PathBuf); 2]> {
+    let tools = root.join("tools");
+    super::link_system_tools(&tools, &super::READ_ONLY_TOOLS)?;
+    link_fake_launchctl(&tools)?;
+    let state = root.join("launchd");
+    std::fs::create_dir_all(&state)?;
+    Ok([
+        (crate::tools::TEST_VARIABLE, tools),
+        (FAKE_LAUNCHD_STATE, state),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

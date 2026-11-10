@@ -152,6 +152,12 @@ impl Store {
         self.directory(execution).join("output")
     }
 
+    /// The folder of the FIFOs of the launchd job that runs `execution`
+    /// (RA-10), inside its record's folder; the job removes it when it ends.
+    pub fn job_dir(&self, execution: &str) -> PathBuf {
+        self.directory(execution).join("job")
+    }
+
     /// Record that `execution` passed its commit point. This reaches the
     /// disk before the operation may take effect.
     pub fn begin(&mut self, execution: &str, op: OpKind, lease: Option<&str>) -> io::Result<()> {

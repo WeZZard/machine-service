@@ -66,6 +66,9 @@ pub fn tool_table(tools: &Path, shims: Option<&Path>) {
         .filter(|tool| std::fs::symlink_metadata(tools.join(tool.name())).is_err())
         .collect();
     link_system_tools(tools, &missing).expect("link system tools");
+    // RA-10: a relay agent this daemon brings up runs its commands as
+    // (fake) launchd jobs.
+    service_layout::test_build::harness::link_fake_launchctl(tools).expect("fake launchctl");
     for (name, script) in FAKE_SYSTEM_TOOLS {
         if std::fs::symlink_metadata(tools.join(name)).is_err() {
             write_exec(tools, name, script);

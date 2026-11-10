@@ -25,4 +25,6 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 
 [dev-dependencies]
 tempfile.workspace = true
+# The in-process agent of the tests runs its commands on the fake launchctl (RA-10, DC-254).
+service-layout = { path = "../service-layout", features = ["test-build"] }
 byte-transfer = { path = "../byte-transfer" }

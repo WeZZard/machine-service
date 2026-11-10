@@ -377,6 +377,11 @@ impl Lab {
             .arg("run")
             .env("HOME", &self.agent_home)
             .env("SHELL", "/bin/sh")
+            // RA-10: the agent runs each command as a (fake) launchd job.
+            .envs(
+                service_layout::test_build::harness::fake_launchd(&self.root.join("agent-launchd"))
+                    .unwrap(),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.root.join("agent.log")).unwrap(),
@@ -673,17 +678,23 @@ fn a_test_daemon_never_runs_a_launchctl_it_is_not_given() {
     assert!(!lab.state.join("relay/agent/Library/LaunchAgents").exists());
 }
 
-/// Everything under `root`, as text.
+/// Every regular file under `root`, as text. A running job's FIFOs (RA-10)
+/// are never opened: opening a FIFO waits for its peer, which may never come.
 fn tree_text(root: &Path) -> String {
     let mut out = String::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        if path.is_dir() {
+        let Ok(kind) = std::fs::symlink_metadata(&path).map(|meta| meta.file_type()) else {
+            continue;
+        };
+        if kind.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&path) {
                 stack.extend(entries.flatten().map(|entry| entry.path()));
             }
-        } else if let Ok(bytes) = std::fs::read(&path) {
-            out.push_str(&String::from_utf8_lossy(&bytes));
+        } else if kind.is_file() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                out.push_str(&String::from_utf8_lossy(&bytes));
+            }
         }
     }
     out

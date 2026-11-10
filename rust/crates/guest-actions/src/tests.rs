@@ -227,12 +227,16 @@ fn dc139_ownership_names_a_scope_per_command_or_says_why_not() {
     assert_eq!(groups.describe(), "process-group (why)");
     let detected = ownership::Ownership::detect();
     if cfg!(target_os = "macos") {
-        assert!(
-            matches!(detected, ownership::Ownership::Groups { reason } if reason.contains("no cgroups"))
-        );
+        // RA-10: on macOS every command is a launchd job of its own.
+        assert_eq!(detected, ownership::Ownership::Jobs);
+        assert_eq!(detected.scope_for("abc"), None);
+        assert_eq!(detected.describe(), "launchd-job");
     }
     // Records survive encoding.
     for owner in [
+        ownership::Owner::Job {
+            label: "com.wezzard.relay-agent.job.a.k.1-2-3".into(),
+        },
         ownership::Owner::Scope {
             unit: "relay-agent-k.scope".into(),
         },

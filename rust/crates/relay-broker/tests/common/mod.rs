@@ -161,7 +161,21 @@ pub struct TestAgent {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Run this process's launchd jobs on the fake `launchctl` (RA-10,
+/// DC-254): the in-process agent reads the tool table from this process.
+fn fake_launchd() {
+    static SETUP: std::sync::Once = std::sync::Once::new();
+    SETUP.call_once(|| {
+        let root = std::env::temp_dir().join(format!("relay-broker-tests-{}", std::process::id()));
+        for (name, value) in service_layout::test_build::harness::fake_launchd(&root).unwrap() {
+            // SAFETY: set once, before any agent of this process starts a job.
+            unsafe { std::env::set_var(name, value) };
+        }
+    });
+}
+
 pub fn agent_options(home: &Path) -> AgentOptions {
+    fake_launchd();
     AgentOptions {
         shell: PathBuf::from("/bin/sh"),
         home: home.to_path_buf(),

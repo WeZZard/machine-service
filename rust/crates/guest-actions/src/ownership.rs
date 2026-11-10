@@ -7,7 +7,11 @@
 //!   holds every process the command starts, a daemon that double-forks
 //!   included, and outlives the agent. Stopping the scope by name stops all
 //!   of them.
-//! - Elsewhere (macOS, or Linux without a user manager), each command leads
+//! - On macOS, each command is a launchd job of its own (RA-10), never a
+//!   child of the agent, and the record names its label before the job is
+//!   registered; `launchctl bootout` stops it and every process left in its
+//!   group.
+//! - On Linux without a user manager, each command leads
 //!   its own process group, and the agent records the group with the start
 //!   time the operating system reports for its leader. A restarted agent
 //!   stops a group only while its leader still has that start time, so a
@@ -31,6 +35,8 @@ pub const SCOPE_PREFIX: &str = "relay-agent-";
 pub enum Ownership {
     /// Each command in a transient systemd user scope.
     Scopes,
+    /// Each command a launchd job of its own (macOS, RA-10).
+    Jobs,
     /// Each command's process group, recorded with its start time; `reason`
     /// says why scopes are not used.
     Groups {
@@ -43,6 +49,9 @@ impl Ownership {
     /// The ownership this machine supports. On Linux it starts one
     /// throw-away scope to prove that the user manager takes them.
     pub fn detect() -> Ownership {
+        if cfg!(target_os = "macos") {
+            return Ownership::Jobs;
+        }
         if !cfg!(target_os = "linux") {
             return Ownership::Groups {
                 reason: format!("{} has no cgroups", std::env::consts::OS),
@@ -78,6 +87,7 @@ impl Ownership {
     pub fn describe(&self) -> String {
         match self {
             Ownership::Scopes => "scope".into(),
+            Ownership::Jobs => "launchd-job".into(),
             Ownership::Groups { reason } => format!("process-group ({reason})"),
         }
     }
@@ -88,7 +98,7 @@ impl Ownership {
     pub fn scope_for(&self, key: &str) -> Option<String> {
         match self {
             Ownership::Scopes => Some(format!("{}.scope", unique_unit(key))),
-            Ownership::Groups { .. } => None,
+            Ownership::Jobs | Ownership::Groups { .. } => None,
         }
     }
 }
@@ -117,6 +127,11 @@ pub enum Owner {
     Scope {
         /// The unit, `relay-agent-<hash>.scope`.
         unit: String,
+    },
+    /// A launchd job of its own, stopped by its label.
+    Job {
+        /// The label, `com.wezzard.relay-agent.job.<agent>.<hash>.<n>`.
+        label: String,
     },
     /// A process group and the start time of its leader.
     Group {
@@ -151,6 +166,13 @@ impl Owner {
                 Ok(()) => Stopped::Killed,
                 Err(error) => Stopped::Failed(error),
             },
+            Owner::Job { label } => match crate::launchd::Launchd::resolve() {
+                Ok(launchd) => {
+                    launchd.bootout(label);
+                    Stopped::Killed
+                }
+                Err(error) => Stopped::Failed(error),
+            },
             Owner::Group { group, started } => stop_group(*group, started),
         }
     }
@@ -159,6 +181,7 @@ impl Owner {
     pub fn describe(&self) -> String {
         match self {
             Owner::Scope { unit } => format!("scope {unit}"),
+            Owner::Job { label } => format!("launchd job {label}"),
             Owner::Group { group, .. } => format!("process group {group}"),
         }
     }

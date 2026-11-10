@@ -37,6 +37,9 @@ fn start_on(home: &Path, lifeline: &service_layout::test_build::harness::Lifelin
     let mut child = service_layout::test_build::harness::command_on(AGENT, lifeline)
         .arg("stdio")
         .env("HOME", home)
+        .envs(
+            service_layout::test_build::harness::fake_launchd(&home.join(".fake-launchd")).unwrap(),
+        )
         .env("SHELL", "/bin/sh")
         .current_dir(home)
         .stdin(Stdio::piped())
@@ -343,7 +346,8 @@ fn dc139_a_restarted_agent_stops_what_a_killed_agent_left_running() {
             wait_gone(daemon);
             eprintln!("the double-forked daemon {daemon} is gone with its scope");
         }
-        guest_actions::ownership::Ownership::Groups { .. } => {
+        guest_actions::ownership::Ownership::Groups { .. }
+        | guest_actions::ownership::Ownership::Jobs => {
             // A process that leaves its group escapes; the lease boundary
             // stops it (DC-139). The test stops it.
             assert!(alive(daemon), "a group cannot follow a daemon out of it");
@@ -463,6 +467,10 @@ fn run_waits_for_a_private_configuration() {
     let mut child = service_layout::test_build::harness::command(AGENT)
         .arg("run")
         .env("HOME", home.path())
+        .envs(
+            service_layout::test_build::harness::fake_launchd(&home.path().join(".fake-launchd"))
+                .unwrap(),
+        )
         .env("SHELL", "/bin/sh")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -530,6 +538,10 @@ fn a_restart_runs_the_build_written_over_the_executable() {
     let mut child = service_layout::test_build::harness::command(&installed)
         .arg("stdio")
         .env("HOME", home.path())
+        .envs(
+            service_layout::test_build::harness::fake_launchd(&home.path().join(".fake-launchd"))
+                .unwrap(),
+        )
         .env("SHELL", "/bin/sh")
         .current_dir(home.path())
         .stdin(Stdio::piped())

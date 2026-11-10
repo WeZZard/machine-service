@@ -17,7 +17,21 @@ use crate::protocol::*;
 
 const LONG: f64 = 30.0;
 
+/// Run this process's launchd jobs on the fake `launchctl` (RA-10,
+/// DC-254): the in-process agent reads the tool table from this process.
+fn fake_launchd() {
+    static SETUP: std::sync::Once = std::sync::Once::new();
+    SETUP.call_once(|| {
+        let root = std::env::temp_dir().join(format!("relay-agent-tests-{}", std::process::id()));
+        for (name, value) in service_layout::test_build::harness::fake_launchd(&root).unwrap() {
+            // SAFETY: set once, before any agent of this process starts a job.
+            unsafe { std::env::set_var(name, value) };
+        }
+    });
+}
+
 fn options(home: &Path) -> AgentOptions {
+    fake_launchd();
     AgentOptions {
         shell: PathBuf::from("/bin/sh"),
         home: home.to_path_buf(),
@@ -1999,6 +2013,18 @@ fn dc139_a_command_records_its_owner_and_status_names_the_ownership() {
         // The command runs in that scope.
         let cgroup = std::fs::read_to_string(format!("/proc/{group}/cgroup")).unwrap();
         assert!(cgroup.contains(unit), "{cgroup}");
+    } else if expected == "launchd-job" {
+        // RA-10: a launchd job of its own, named before it started; the
+        // command is not this agent's descendant.
+        let label = record["owner"]["job"]["label"].as_str().unwrap();
+        assert!(
+            label.starts_with(guest_actions::launchd::LABEL_PREFIX),
+            "{label}"
+        );
+        assert!(
+            !is_descendant(group, std::process::id() as i32),
+            "the command {group} descends from the agent"
+        );
     } else {
         assert_eq!(record["owner"]["group"]["group"], group);
         assert_eq!(
@@ -2678,4 +2704,29 @@ fn a_tree_of_ten_thousand_files_moves_each_way() {
         std::fs::read(rig.path("back/d042/f017.txt")).unwrap(),
         std::fs::read(source.join("d042/f017.txt")).unwrap()
     );
+}
+
+/// Whether `pid` descends from `ancestor`, by its parents' chain.
+fn is_descendant(pid: i32, ancestor: i32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "ppid=", "-p", &current.to_string()])
+            .output()
+            .unwrap();
+        let Ok(parent) = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<i32>()
+        else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
+        if parent <= 1 {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }

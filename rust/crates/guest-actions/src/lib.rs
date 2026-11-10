@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+pub mod launchd;
 pub mod ownership;
 
 #[cfg(test)]
@@ -169,14 +170,70 @@ impl Tally {
 // ------------------------------------------------------------------ commands
 
 /// A command line started in its own process group, with its standard
-/// output and standard error combined on one pipe in the order written.
+/// output and standard error combined in the order written: a child of
+/// this process, or on macOS a launchd job of its own (RA-10).
 pub struct Spawned {
-    child: Child,
-    output: PipeReader,
-    /// The command's process group, which is also the shell's process ID.
+    backend: Backend,
+    /// The command's process group, which is also the shell's process ID;
+    /// 0 for a job until its prelude reports it.
     pub group: i32,
     /// The systemd scope the command runs in, when it runs in one.
     pub scope: Option<String>,
+}
+
+enum Backend {
+    Child { child: Child, output: PipeReader },
+    Job(Box<launchd::Job>),
+}
+
+/// What ends a running command: its process group and, when it has one,
+/// its scope; or its launchd job.
+#[derive(Clone, Debug)]
+pub enum Killer {
+    /// A process group, and the scope it runs in.
+    Group {
+        /// The group.
+        group: i32,
+        /// The scope, on Linux.
+        scope: Option<String>,
+    },
+    /// A launchd job, stopped with `launchctl bootout`.
+    Job {
+        /// The launchd that runs it.
+        launchd: launchd::Launchd,
+        /// Its label.
+        label: String,
+    },
+}
+
+impl Killer {
+    /// End the command and everything it started.
+    pub fn kill(&self) {
+        match self {
+            Killer::Group { group, scope } => kill_command(*group, scope.as_deref()),
+            Killer::Job { launchd, label } => launchd.bootout(label),
+        }
+    }
+}
+
+/// Start `command` through `shell -c` as the launchd job `label`, its FIFO
+/// set in `dir`, the way [`spawn_shell`] starts it as a child; `writer`
+/// says who writes its environment (RA-10).
+pub fn spawn_job(
+    launchd: &launchd::Launchd,
+    label: &str,
+    shell: &Path,
+    dir: &Path,
+    command: &str,
+    stdin: bool,
+    writer: launchd::EnvWriter<'_>,
+) -> io::Result<Spawned> {
+    let job = launchd::start(launchd, label, shell, dir, command, stdin, writer)?;
+    Ok(Spawned {
+        backend: Backend::Job(Box::new(job)),
+        group: 0,
+        scope: None,
+    })
 }
 
 /// How a command ended.
@@ -237,15 +294,40 @@ pub fn spawn_shell_in(
     Ok(Spawned {
         group: child.id() as i32,
         scope: scope.map(str::to_string),
-        child,
-        output,
+        backend: Backend::Child { child, output },
     })
 }
 
 impl Spawned {
-    /// The process ID of the command's shell, which leads its group.
+    /// The process ID of the command's shell, which leads its group; 0 for
+    /// a launchd job, whose shell launchd started.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        match &self.backend {
+            Backend::Child { child, .. } => child.id(),
+            Backend::Job(_) => 0,
+        }
+    }
+
+    /// What ends this command.
+    pub fn killer(&self) -> Killer {
+        match &self.backend {
+            Backend::Child { .. } => Killer::Group {
+                group: self.group,
+                scope: self.scope.clone(),
+            },
+            Backend::Job(job) => Killer::Job {
+                launchd: job.launchd.clone(),
+                label: job.label.clone(),
+            },
+        }
+    }
+
+    /// The launchd job's label, when the command runs as one.
+    pub fn job_label(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Child { .. } => None,
+            Backend::Job(job) => Some(&job.label),
+        }
     }
 
     /// Feed `stdin` to the command, pass its output to `on_output` until the
@@ -265,12 +347,31 @@ impl Spawned {
     /// [`Self::supervise`], with standard input read from `stdin`, such as
     /// a spooled upload, so the input never has to fit in memory.
     pub fn supervise_from(
-        mut self,
+        self,
         stdin: Option<Box<dyn Read + Send>>,
         timeout: Duration,
-        mut on_output: impl FnMut(&[u8]) -> bool,
+        on_output: impl FnMut(&[u8]) -> bool,
     ) -> Exit {
-        if let (Some(mut reader), Some(mut input)) = (stdin, self.child.stdin.take()) {
+        let killer = self.killer();
+        match self.backend {
+            Backend::Child { child, output } => {
+                supervise_child(child, output, killer, stdin, timeout, on_output)
+            }
+            Backend::Job(job) => supervise_job(*job, killer, stdin, timeout, on_output),
+        }
+    }
+}
+
+fn supervise_child(
+    mut child: Child,
+    mut output: PipeReader,
+    killer: Killer,
+    stdin: Option<Box<dyn Read + Send>>,
+    timeout: Duration,
+    mut on_output: impl FnMut(&[u8]) -> bool,
+) -> Exit {
+    {
+        if let (Some(mut reader), Some(mut input)) = (stdin, child.stdin.take()) {
             thread::spawn(move || {
                 let _ = io::copy(&mut reader, &mut input);
             });
@@ -279,29 +380,28 @@ impl Spawned {
         let timed_out = Arc::new(AtomicBool::new(false));
         let watchdog = {
             let timed_out = Arc::clone(&timed_out);
-            let group = self.group;
-            let scope = self.scope.clone();
+            let killer = killer.clone();
             thread::spawn(move || {
                 if let Err(mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(timeout) {
                     timed_out.store(true, Ordering::SeqCst);
-                    kill_command(group, scope.as_deref());
+                    killer.kill();
                 }
             })
         };
         let mut buffer = vec![0u8; 64 << 10];
         loop {
-            match self.output.read(&mut buffer) {
+            match output.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
                     if !on_output(&buffer[..count]) {
-                        kill_command(self.group, self.scope.as_deref());
+                        killer.kill();
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
-        let status = self.child.wait();
+        let status = child.wait();
         let _ = finished.send(());
         let _ = watchdog.join();
         let (rc, signal) = match status {
@@ -314,6 +414,108 @@ impl Spawned {
             timed_out: timed_out.load(Ordering::SeqCst),
         }
     }
+}
+
+/// Supervise a launchd job (RA-10): feed its standard input through the
+/// held `in` FIFO, pass `out` to `on_output` until the prelude reports the
+/// exit status on `status`, and stop the job with `bootout` after
+/// `timeout`, when `on_output` returns false, or when it ends without a
+/// report. The job and its files are removed at the end.
+fn supervise_job(
+    mut job: launchd::Job,
+    killer: Killer,
+    stdin: Option<Box<dyn Read + Send>>,
+    timeout: Duration,
+    mut on_output: impl FnMut(&[u8]) -> bool,
+) -> Exit {
+    if let Some(input) = job.input.take() {
+        match stdin {
+            Some(mut reader) => {
+                thread::spawn(move || {
+                    let mut input = input;
+                    let _ = launchd_blocking(&input);
+                    let _ = io::copy(&mut reader, &mut input);
+                    // Dropping the only writer gives the command end of file.
+                });
+            }
+            None => drop(input),
+        }
+    }
+    let started = std::time::Instant::now();
+    let mut reports = launchd::Reports::default();
+    let mut buffer = vec![0u8; 64 << 10];
+    let mut timed_out = false;
+    let mut stopped = false;
+    let mut last_check = started;
+    loop {
+        launchd::wait_readable(&job.out, &job.status, Duration::from_millis(100));
+        let mut keep = true;
+        launchd::drain(&mut job.out, &mut buffer, |bytes| {
+            if keep && !on_output(bytes) {
+                keep = false;
+            }
+        });
+        if !keep && !stopped {
+            killer.kill();
+            stopped = true;
+        }
+        launchd::drain(&mut job.status, &mut buffer, |bytes| reports.take(bytes));
+        if reports.exit.is_some() || stopped {
+            break;
+        }
+        if started.elapsed() > timeout {
+            timed_out = true;
+            killer.kill();
+            stopped = true;
+            continue;
+        }
+        // A job killed from outside never reports; ask launchd now and then.
+        if last_check.elapsed() > Duration::from_secs(1) {
+            last_check = std::time::Instant::now();
+            if !job.launchd.is_running(&job.label) {
+                launchd::drain(&mut job.status, &mut buffer, |bytes| reports.take(bytes));
+                break;
+            }
+        }
+    }
+    // What the command wrote before it ended.
+    launchd::drain(&mut job.out, &mut buffer, |bytes| {
+        let _ = on_output(bytes);
+    });
+    // A job that ended without the prelude's report was stopped: by this
+    // supervisor, by its killer or from outside. launchd's record of it is a
+    // best effort (`launchctl print` is not an interface); without one it
+    // reads as SIGKILL, which is what `bootout` sends, as a killed child's
+    // group reads.
+    let (rc, signal) = match reports.exit {
+        Some(status) => launchd::exit_of(status),
+        None => match job.launchd.last_end(&job.label) {
+            (None, None) => (None, Some(libc::SIGKILL)),
+            found => found,
+        },
+    };
+    job.launchd.bootout(&job.label);
+    job.files.remove();
+    Exit {
+        rc: if timed_out { None } else { rc },
+        signal: if timed_out {
+            Some(libc::SIGKILL)
+        } else {
+            signal
+        },
+        timed_out,
+    }
+}
+
+fn launchd_blocking(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fcntl` on a descriptor the caller holds.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------------- files

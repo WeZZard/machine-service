@@ -57,10 +57,13 @@ pub enum Tool {
     SwVers,
     /// The system configuration, which names the Mac.
     Scutil,
+    /// launchd's control tool, which runs a relayed command as a job of its
+    /// own (RA-10).
+    Launchctl,
 }
 
 /// Every tool.
-pub const ALL: [Tool; 16] = [
+pub const ALL: [Tool; 17] = [
     Tool::Tart,
     Tool::Ssh,
     Tool::Scp,
@@ -77,6 +80,7 @@ pub const ALL: [Tool; 16] = [
     Tool::Ioreg,
     Tool::SwVers,
     Tool::Scutil,
+    Tool::Launchctl,
 ];
 
 impl Tool {
@@ -99,6 +103,7 @@ impl Tool {
             Tool::Ioreg => "ioreg",
             Tool::SwVers => "sw_vers",
             Tool::Scutil => "scutil",
+            Tool::Launchctl => "launchctl",
         }
     }
 
@@ -122,6 +127,7 @@ impl Tool {
             Tool::Ioreg => Some("/usr/sbin/ioreg"),
             Tool::SwVers => Some("/usr/bin/sw_vers"),
             Tool::Scutil => Some("/usr/sbin/scutil"),
+            Tool::Launchctl => Some("/bin/launchctl"),
         }
     }
 
@@ -316,6 +322,7 @@ mod tests {
             Tool::Osascript,
             Tool::Scutil,
             Tool::Crontab,
+            Tool::Launchctl,
         ] {
             assert!(test_entry(tool, None).is_err(), "{tool:?}");
         }

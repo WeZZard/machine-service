@@ -75,6 +75,11 @@ impl AgentProcess {
             .arg("run")
             .env("HOME", home)
             .env("SHELL", "/bin/sh")
+            // RA-10: the agent runs each command as a (fake) launchd job.
+            .envs(
+                service_layout::test_build::harness::fake_launchd(&home.join(".fake-launchd"))
+                    .unwrap(),
+            )
             .envs(env.iter().cloned())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())

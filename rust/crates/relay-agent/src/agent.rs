@@ -82,6 +82,15 @@ pub struct AgentOptions {
 }
 
 impl AgentOptions {
+    /// This agent's part of its job labels: the first 12 hex digits of the
+    /// SHA-256 of its state folder, so two agents on one Mac (the installed
+    /// one and a second instance's) never share a label.
+    pub fn agent_id(&self) -> String {
+        let mut tally = Tally::default();
+        tally.update(self.state.as_os_str().as_encoded_bytes());
+        tally.finish().sha256[..12].to_string()
+    }
+
     /// Options from the process environment: `$SHELL`, `$HOME`, the state
     /// directory `.local/state/relay-agent` under the agent's root
     /// (`RELAY_AGENT_ROOT`, else `$HOME`), the hash of the running
@@ -159,6 +168,9 @@ struct Live {
     group: AtomicI32,
     /// The systemd scope of a command that runs in one.
     scope: Option<String>,
+    /// What ends a command that runs as a launchd job (RA-10); it wins
+    /// over the group and the scope.
+    job: Option<guest_actions::Killer>,
     cancelled: AtomicBool,
     progress: Mutex<Progress>,
     changed: Condvar,
@@ -1181,6 +1193,11 @@ impl Session {
         // it before anything can run in it; a group is known only once the
         // command has started, and is recorded at once (DC-139).
         let scope = options.ownership.scope_for(&Store::key(execution));
+        // On macOS the command is a launchd job of its own, never this
+        // agent's child (RA-10); its label is recorded before it starts.
+        let job_label = (options.ownership == Ownership::Jobs).then(|| {
+            guest_actions::launchd::label_for(&options.agent_id(), &Store::key(execution))
+        });
         let output = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -1188,24 +1205,53 @@ impl Session {
             .open(state.store.output(execution));
         let started = output
             .map_err(|error| ("record_failed", error.to_string()))
-            .and_then(|output| match &scope {
-                Some(unit) => state
-                    .store
-                    .set_owner(execution, Owner::Scope { unit: unit.clone() })
-                    .map(|()| output)
-                    .map_err(|error| ("record_failed", error.to_string())),
-                None => Ok(output),
+            .and_then(|output| {
+                let owner = match (&scope, &job_label) {
+                    (Some(unit), _) => Some(Owner::Scope { unit: unit.clone() }),
+                    (None, Some(label)) => Some(Owner::Job {
+                        label: label.clone(),
+                    }),
+                    (None, None) => None,
+                };
+                match owner {
+                    Some(owner) => state
+                        .store
+                        .set_owner(execution, owner)
+                        .map(|()| output)
+                        .map_err(|error| ("record_failed", error.to_string())),
+                    None => Ok(output),
+                }
             })
             .and_then(|output| {
-                guest_actions::spawn_shell_in(
-                    &options.shell,
-                    &options.home,
-                    command,
-                    stdin.is_some(),
-                    scope.as_deref(),
-                )
-                .map(|spawned| (output, spawned))
-                .map_err(|error| ("spawn_failed", error.to_string()))
+                let spawned = match &job_label {
+                    Some(label) => guest_actions::launchd::Launchd::resolve()
+                        .map_err(std::io::Error::other)
+                        .and_then(|launchd| {
+                            let environment: Vec<_> = std::env::vars_os().collect();
+                            guest_actions::spawn_job(
+                                &launchd,
+                                label,
+                                &options.shell,
+                                &state.store.job_dir(execution),
+                                command,
+                                stdin.is_some(),
+                                guest_actions::launchd::EnvWriter::Here {
+                                    environment: &environment,
+                                    cwd: &options.home,
+                                },
+                            )
+                        }),
+                    None => guest_actions::spawn_shell_in(
+                        &options.shell,
+                        &options.home,
+                        command,
+                        stdin.is_some(),
+                        scope.as_deref(),
+                    ),
+                };
+                spawned
+                    .map(|spawned| (output, spawned))
+                    .map_err(|error| ("spawn_failed", error.to_string()))
             });
         let (mut output, spawned) = match started {
             Ok(started) => started,
@@ -1215,7 +1261,7 @@ impl Session {
                 return Known::Completed(kind, outcome);
             }
         };
-        if scope.is_none() {
+        if scope.is_none() && job_label.is_none() {
             let started = guest_actions::ownership::process_start(spawned.group);
             let _ = state.store.set_owner(
                 execution,
@@ -1225,7 +1271,8 @@ impl Session {
                 },
             );
         }
-        let live = new_live_command(kind, spawned.group, scope);
+        let killer = job_label.as_ref().map(|_| spawned.killer());
+        let live = new_live_command(kind, spawned.group, scope, killer);
         state.live.insert(execution.to_string(), Arc::clone(&live));
         let inner = Arc::clone(&self.inner);
         let execution = execution.to_string();
@@ -1441,14 +1488,20 @@ fn purge(state: &mut State, lease: &str, caller: Option<&str>) -> Outcome {
 }
 
 fn new_live(op: OpKind) -> Arc<Live> {
-    new_live_command(op, 0, None)
+    new_live_command(op, 0, None, None)
 }
 
-fn new_live_command(op: OpKind, group: i32, scope: Option<String>) -> Arc<Live> {
+fn new_live_command(
+    op: OpKind,
+    group: i32,
+    scope: Option<String>,
+    job: Option<guest_actions::Killer>,
+) -> Arc<Live> {
     Arc::new(Live {
         op,
         group: AtomicI32::new(group),
         scope,
+        job,
         cancelled: AtomicBool::new(false),
         progress: Mutex::new(Progress::default()),
         changed: Condvar::new(),
@@ -1456,9 +1509,13 @@ fn new_live_command(op: OpKind, group: i32, scope: Option<String>) -> Arc<Live> 
 }
 
 impl Live {
-    /// Kill a command's processes: its group, and its scope when it has one.
+    /// Kill a command's processes: its launchd job, or its group and its
+    /// scope when it has one.
     fn kill(&self) {
-        kill_command(self.group.load(Ordering::SeqCst), self.scope.as_deref());
+        match &self.job {
+            Some(job) => job.kill(),
+            None => kill_command(self.group.load(Ordering::SeqCst), self.scope.as_deref()),
+        }
     }
 }
 
