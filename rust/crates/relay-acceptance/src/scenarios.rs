@@ -259,7 +259,6 @@ fn ac68(ctx: &mut Ctx<'_>) -> Verdict {
 fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
-    let durable = ctx.target.durable();
     let name = |what: &str| format!("{prefix}{what}");
     match os {
         Os::Macos => {
@@ -304,73 +303,40 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                     ))),
                 },
             );
-            // An Apple Event that only reads Finder's state, never one that
-            // changes anything.
-            let finder = client.exec(
-                "osascript -e 'tell application \"Finder\" to get name of startup disk'",
-                90.0,
+            // The command is not a descendant of any program of this
+            // project (DC-308, DC-315): it walks its own parents, so a
+            // relay agent or a machine-service launcher in the chain fails
+            // it. It sends no Apple Event and needs no privacy permission
+            // (DC-309).
+            let chain = client.exec(
+                "p=$$; while [ \"$p\" -gt 1 ]; do \
+                 c=$(ps -o comm= -p \"$p\"); echo \"$p $c\"; \
+                 p=$(ps -o ppid= -p \"$p\" | tr -d ' '); [ -n \"$p\" ] || break; done",
+                60.0,
                 Duration::from_secs(300),
             )?;
-            // The privacy database is read only in a VM, whose grants are the
-            // base image's; a durable Mac's are its operator's, which the
-            // suite never reads (DC-249).
-            let grants = if durable {
-                String::new()
-            } else {
-                client
-                    .exec(
-                        "for db in \"$HOME/Library/Application Support/com.apple.TCC/TCC.db\" \"/Library/Application Support/com.apple.TCC/TCC.db\"; do \
-                         sqlite3 \"$db\" \"select service || ' ' || client from access where client like '%sshd-keygen-wrapper%' or client = 'com.wezzard.relay-agent'\" 2>/dev/null; done",
-                        60.0,
-                        Duration::from_secs(300),
-                    )?
-                    .text()
-            };
-            if !durable {
-                ctx.record(&name("tcc"), json!(grants.lines().collect::<Vec<_>>()));
-            }
-            let agent_events = grants.lines().any(|l| {
-                l.contains("kTCCServiceAppleEvents") && l.contains("com.wezzard.relay-agent")
-            });
-            ctx.record(&name("finder"), json!(finder.text().trim()));
+            let ancestors: Vec<String> = chain.text().lines().map(str::to_string).collect();
+            ctx.record(&name("ancestors"), json!(ancestors));
+            let ours: Vec<&String> = ancestors
+                .iter()
+                .filter(|line| line.contains("relay-agent") || line.contains("machine-service"))
+                .collect();
             ctx.check(
-                &name("Finder answers osascript without a consent dialog"),
-                match finder.rc()? {
-                    Some(0) => Ok(()),
-                    _ if durable => Err(Stop::Blocked(format!(
-                        "blocked by the Mac's own grants: its operator has not granted Apple \
-                         Events to com.wezzard.relay-agent, so macOS asks for consent on the \
-                         Mac's display ({}); the operator grants it once, as for CuaDriver (CN-3)",
-                        finder.text().trim()
-                    ))),
-                    _ if !agent_events => Err(Stop::Blocked(format!(
-                        "blocked by the base image: it grants no Apple Events permission to \
-                         com.wezzard.relay-agent, so macOS asks for consent ({}); pilot-images M5 \
-                         adds the grant, and the bases are not rebuilt yet",
-                        finder.text().trim()
+                &name("the command is not a descendant of the relay agent or machine-service"),
+                match chain.rc()? {
+                    Some(0) if !ancestors.is_empty() && ours.is_empty() => Ok(()),
+                    Some(0) if ancestors.is_empty() => {
+                        Err(Stop::Failed("the command listed no parents".into()))
+                    }
+                    Some(0) => Err(Stop::Failed(format!(
+                        "a program of this project is in the command's chain: {ours:?}"
                     ))),
                     rc => Err(Stop::Failed(format!(
-                        "osascript exited {rc:?}: {}",
-                        finder.text().trim()
+                        "the parent walk exited {rc:?}: {}",
+                        chain.text().trim()
                     ))),
                 },
             );
-            // A base image's property, which a durable Mac does not have.
-            if !durable {
-                ctx.check(
-                    &name("no TCC grant for sshd-keygen-wrapper"),
-                    if grants.contains("sshd-keygen-wrapper") {
-                        Err(Stop::Blocked(
-                            "blocked by the base image: it still grants privacy permissions to \
-                         sshd-keygen-wrapper (pilot-images phase 65), so the run cannot show that \
-                         none is needed; a base built with M5 drops them"
-                                .into(),
-                        ))
-                    } else {
-                        Ok(())
-                    },
-                );
-            }
             // `/tmp` is a link on macOS, and cua-driver refuses an output
             // path whose existing ancestor is not a folder; only the output
             // file is named, which every cua-driver release takes.
