@@ -626,7 +626,12 @@ fn terminate(m: &Manifest) -> Option<i32> {
     // SAFETY: plain signals to a PID this manifest's daemon holds.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let started = Instant::now();
-    while owned_pid(m).is_some() {
+    // The daemon is gone only when its process no longer exists and its
+    // state lock is free (DC-311), because that lock is what the next
+    // daemon needs. Waiting only until the `ps` line stopped naming the
+    // executable started the next daemon within half a second of the old
+    // one leaving `ps`, and a busy daemon's lock was then still held.
+    while owned_pid(m).is_some() || process_exists(pid) || state_lock_held(m) {
         if started.elapsed() > Duration::from_secs(60) {
             // `stop` reports a daemon that outlives SIGKILL as left.
             return Some(pid);
@@ -639,6 +644,28 @@ fn terminate(m: &Manifest) -> Option<i32> {
     }
     let _ = std::fs::remove_file(pid_file(m));
     Some(pid)
+}
+
+/// Whether a process with `pid` still exists, exiting or not.
+fn process_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the PID exists.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether another process holds the daemon's state lock, which the next
+/// daemon must take (`machine-service` refuses to start without it).
+fn state_lock_held(m: &Manifest) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .open(m.state().join("daemon.lock"))
+    else {
+        return false;
+    };
+    // SAFETY: a non-blocking flock on a descriptor this function owns; it
+    // is released when `file` closes at the end of the function.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
 }
 
 fn read_json(path: &Path) -> Value {
