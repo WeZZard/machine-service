@@ -254,6 +254,9 @@ pub fn plist(label: &str, shell: &Path, files: &JobFiles, stdin: bool) -> Vec<u8
             xml(&files.input.to_string_lossy())
         ));
     }
+    // A command's background processes outlive it, as they did before; the
+    // job's stop kills its group itself (DC-316).
+    body.push_str("<key>AbandonProcessGroup</key><true/>\n");
     body.push_str("<key>RunAtLoad</key><true/>\n</dict></plist>\n");
     body.into_bytes()
 }
@@ -390,10 +393,17 @@ pub struct Job {
     pub label: String,
     /// Its files.
     pub files: JobFiles,
+    /// The job's process group, which its shell leads, as the prelude
+    /// reported it; 0 when it never did.
+    pub group: i32,
     pub(crate) out: File,
     pub(crate) status: File,
     pub(crate) input: Option<File>,
+    pub(crate) reports: Reports,
 }
+
+/// How long the prelude may take to report its group.
+pub const GROUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Which side writes the job's `env`.
 pub enum EnvWriter<'a> {
@@ -459,14 +469,38 @@ pub fn start(
             return Err(error);
         }
     }
+    // The prelude reports its group before it reads `env`, so the group is
+    // known by now, or soon: wait for it, so that a stop can kill it.
+    let mut status = status;
+    let mut reports = Reports::default();
+    let mut buffer = [0u8; 256];
+    let started = Instant::now();
+    while reports.group.is_none() && reports.exit.is_none() && started.elapsed() < GROUP_DEADLINE {
+        drain(&mut status, &mut buffer, |bytes| reports.take(bytes));
+        if reports.group.is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     Ok(Job {
         launchd: launchd.clone(),
         label: label.to_string(),
         files,
+        group: reports.group.unwrap_or(0),
         out,
         status,
         input,
+        reports,
     })
+}
+
+/// Stop a job: kill its process group, which `AbandonProcessGroup` leaves
+/// to its owner, then remove the job, which on its own ends only its shell
+/// (DC-316).
+pub fn stop(launchd: &Launchd, label: &str, group: i32) {
+    if group > 1 {
+        crate::kill_group(group);
+    }
+    launchd.bootout(label);
 }
 
 /// What the prelude reported on `status`.
@@ -671,6 +705,73 @@ mod tests {
         assert!(!exit.timed_out);
         assert_eq!(exit.rc, None, "{exit:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the PID exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn wait_gone(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// DC-316: a process a command leaves in the background outlives the
+    /// command, as a server started with `nohup … &` must.
+    #[test]
+    fn a_background_child_outlives_its_command() {
+        let (exit, output, _) = run(
+            "nohup sleep 60 >/dev/null 2>&1 & echo $!",
+            None,
+            Duration::from_secs(20),
+        );
+        assert_eq!(exit.rc, Some(0), "{output}");
+        let child: i32 = output.trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let survived = alive(child);
+        crate::kill_group(child);
+        // SAFETY: plain signal to the test's own leftover.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        assert!(survived, "the background child {child} died with its command");
+    }
+
+    /// DC-316: stopping a running job kills its whole process group, which
+    /// `bootout` alone would not.
+    #[test]
+    fn a_stopped_job_ends_its_whole_tree() {
+        let launchd = fake_launchd();
+        let base = tempfile::tempdir().unwrap();
+        let label = label_for("test", "tree");
+        let environment = Vec::new();
+        let pid_file = base.path().join("child.pid");
+        let spawned = spawn_job(
+            &launchd,
+            &label,
+            Path::new("/bin/zsh"),
+            &base.path().join("job"),
+            &format!("sleep 61 & echo $! > {}; sleep 62; wait", pid_file.display()),
+            false,
+            EnvWriter::Here { environment: &environment, cwd: base.path() },
+        )
+        .unwrap();
+        assert!(spawned.group > 1, "the prelude reported no group");
+        let killer = spawned.killer();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            killer.kill();
+        });
+        let exit = spawned.supervise_from(None, Duration::from_secs(60), |_| true);
+        stopper.join().unwrap();
+        let child: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert!(wait_gone(child), "the background sleep {child} survived the stop");
+        assert_eq!(exit.signal, Some(libc::SIGKILL), "{exit:?}");
     }
 
     #[test]

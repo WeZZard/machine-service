@@ -128,10 +128,17 @@ pub enum Owner {
         /// The unit, `relay-agent-<hash>.scope`.
         unit: String,
     },
-    /// A launchd job of its own, stopped by its label.
+    /// A launchd job of its own, stopped by its process group and its
+    /// label (DC-316).
     Job {
         /// The label, `com.wezzard.relay-agent.job.<agent>.<hash>.<n>`.
         label: String,
+        /// The job's process group, which its shell leads; 0 until known.
+        #[serde(default)]
+        group: i32,
+        /// The group leader's start time, as [`process_start`] reports it.
+        #[serde(default)]
+        started: String,
     },
     /// A process group and the start time of its leader.
     Group {
@@ -166,13 +173,28 @@ impl Owner {
                 Ok(()) => Stopped::Killed,
                 Err(error) => Stopped::Failed(error),
             },
-            Owner::Job { label } => match crate::launchd::Launchd::resolve() {
-                Ok(launchd) => {
-                    launchd.bootout(label);
-                    Stopped::Killed
+            Owner::Job {
+                label,
+                group,
+                started,
+            } => {
+                // The group only while its leader is still the one recorded.
+                let stopped = if *group > 1 && !started.is_empty() {
+                    stop_group(*group, started)
+                } else {
+                    Stopped::Gone
+                };
+                match crate::launchd::Launchd::resolve() {
+                    Ok(launchd) => {
+                        launchd.bootout(label);
+                        match stopped {
+                            Stopped::Gone | Stopped::Reused => Stopped::Killed,
+                            other => other,
+                        }
+                    }
+                    Err(error) => Stopped::Failed(error),
                 }
-                Err(error) => Stopped::Failed(error),
-            },
+            }
             Owner::Group { group, started } => stop_group(*group, started),
         }
     }
@@ -181,7 +203,7 @@ impl Owner {
     pub fn describe(&self) -> String {
         match self {
             Owner::Scope { unit } => format!("scope {unit}"),
-            Owner::Job { label } => format!("launchd job {label}"),
+            Owner::Job { label, group, .. } => format!("launchd job {label} (group {group})"),
             Owner::Group { group, .. } => format!("process group {group}"),
         }
     }

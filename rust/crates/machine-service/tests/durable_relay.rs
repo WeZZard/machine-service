@@ -700,8 +700,9 @@ fn tree_text(root: &Path) -> String {
     out
 }
 
-/// RA-2, DM-4: through the relay agent a lease's command is the agent's
-/// child, with the lease's session environment and working directory, its
+/// RA-2, RA-10, DM-4: through the relay agent a lease's command runs as a
+/// launchd job, never the agent's descendant (DC-308, DC-310), with the
+/// lease's session environment and working directory, its
 /// loaded keys redacted from the answer and never left on disk by the
 /// launcher; a file push and pull go through it too, and a folder by the
 /// service.
@@ -715,17 +716,21 @@ fn m4_exec_push_and_pull_run_through_the_relay_agent() {
 
     let answer = lab.exec(
         &name,
-        json!({"lease_id": lease, "script": "ps -o ppid= -p $PPID | tr -d ' '\necho $MACHINE_SERVICE_LEASE_ID\npwd\necho \"owner=${ANTHROPIC_AUTH_TOKEN:-none}\"\necho \"key=$ANTHROPIC_API_KEY\"\n"}),
+        json!({"lease_id": lease, "script": "p=$PPID; c=''; while [ \"$p\" -gt 1 ]; do c=\"$c $p\"; p=$(ps -o ppid= -p \"$p\" | tr -d ' '); [ -n \"$p\" ] || break; done; echo \"chain:$c\"\necho $MACHINE_SERVICE_LEASE_ID\npwd\necho \"owner=${ANTHROPIC_AUTH_TOKEN:-none}\"\necho \"key=$ANTHROPIC_API_KEY\"\n"}),
     );
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(answer.body["link"], "relay");
     assert!(answer.body["execution_id"].as_str().is_some());
     let output = answer.body["output"].as_str().unwrap();
     let lines: Vec<&str> = output.lines().collect();
-    assert_eq!(
-        lines[0],
-        agent.to_string(),
-        "with keys loaded the command is the child of the launcher, the agent's child (DC-221)"
+    let chain: Vec<&str> = lines[0]
+        .strip_prefix("chain:")
+        .unwrap_or_else(|| panic!("{output}"))
+        .split_whitespace()
+        .collect();
+    assert!(
+        !chain.contains(&agent.to_string().as_str()),
+        "the command descends from the relay agent {agent}: {chain:?}"
     );
     assert_eq!(lines[1], lease);
     assert!(

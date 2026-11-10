@@ -197,12 +197,14 @@ pub enum Killer {
         /// The scope, on Linux.
         scope: Option<String>,
     },
-    /// A launchd job, stopped with `launchctl bootout`.
+    /// A launchd job: its process group is killed, then the job removed.
     Job {
         /// The launchd that runs it.
         launchd: launchd::Launchd,
         /// Its label.
         label: String,
+        /// Its process group, as its prelude reported it.
+        group: i32,
     },
 }
 
@@ -211,7 +213,11 @@ impl Killer {
     pub fn kill(&self) {
         match self {
             Killer::Group { group, scope } => kill_command(*group, scope.as_deref()),
-            Killer::Job { launchd, label } => launchd.bootout(label),
+            Killer::Job {
+                launchd,
+                label,
+                group,
+            } => launchd::stop(launchd, label, *group),
         }
     }
 }
@@ -230,8 +236,8 @@ pub fn spawn_job(
 ) -> io::Result<Spawned> {
     let job = launchd::start(launchd, label, shell, dir, command, stdin, writer)?;
     Ok(Spawned {
+        group: job.group,
         backend: Backend::Job(Box::new(job)),
-        group: 0,
         scope: None,
     })
 }
@@ -318,6 +324,7 @@ impl Spawned {
             Backend::Job(job) => Killer::Job {
                 launchd: job.launchd.clone(),
                 label: job.label.clone(),
+                group: job.group,
             },
         }
     }
@@ -442,7 +449,7 @@ fn supervise_job(
         }
     }
     let started = std::time::Instant::now();
-    let mut reports = launchd::Reports::default();
+    let mut reports = std::mem::take(&mut job.reports);
     let mut buffer = vec![0u8; 64 << 10];
     let mut timed_out = false;
     let mut stopped = false;
@@ -494,6 +501,8 @@ fn supervise_job(
             found => found,
         },
     };
+    // Background processes the command left outlive it by design (DC-316);
+    // only the finished job is removed.
     job.launchd.bootout(&job.label);
     job.files.remove();
     Exit {

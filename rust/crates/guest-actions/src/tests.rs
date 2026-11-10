@@ -236,6 +236,8 @@ fn dc139_ownership_names_a_scope_per_command_or_says_why_not() {
     for owner in [
         ownership::Owner::Job {
             label: "com.wezzard.relay-agent.job.a.k.1-2-3".into(),
+            group: 42,
+            started: "1700000000000000".into(),
         },
         ownership::Owner::Scope {
             unit: "relay-agent-k.scope".into(),

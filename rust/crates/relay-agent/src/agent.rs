@@ -1210,6 +1210,8 @@ impl Session {
                     (Some(unit), _) => Some(Owner::Scope { unit: unit.clone() }),
                     (None, Some(label)) => Some(Owner::Job {
                         label: label.clone(),
+                        group: 0,
+                        started: String::new(),
                     }),
                     (None, None) => None,
                 };
@@ -1261,6 +1263,19 @@ impl Session {
                 return Known::Completed(kind, outcome);
             }
         };
+        if let (Some(label), true) = (&job_label, spawned.group > 1) {
+            // The job's group, now that its prelude reported it, so that a
+            // restarted agent can stop what the command left (DC-316).
+            let started = guest_actions::ownership::process_start(spawned.group);
+            let _ = state.store.set_owner(
+                execution,
+                Owner::Job {
+                    label: label.clone(),
+                    group: spawned.group,
+                    started: started.unwrap_or_default(),
+                },
+            );
+        }
         if scope.is_none() && job_label.is_none() {
             let started = guest_actions::ownership::process_start(spawned.group);
             let _ = state.store.set_owner(

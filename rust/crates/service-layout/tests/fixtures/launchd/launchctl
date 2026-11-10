@@ -27,6 +27,10 @@ bootstrap)
     out=$("$plutil" -extract StandardOutPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
     err=$("$plutil" -extract StandardErrorPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
     in=$("$plutil" -extract StandardInPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
+    # launchd kills a job's leftover group when its shell exits, unless
+    # AbandonProcessGroup is set (measured on macOS 26, DC-316).
+    abandon=$("$plutil" -extract AbandonProcessGroup raw -o - "$plist" 2>/dev/null || echo false)
+    printf %s "$abandon" > "$state/$label.abandon"
     i=0; set --
     while [ "$i" -lt "$count" ]; do
         set -- "$@" "$("$plutil" -extract "ProgramArguments.$i" raw -o - "$plist")"
@@ -36,7 +40,7 @@ bootstrap)
     # A supervisor that, like launchd, belongs to no caller: it leaves the
     # caller's session, gives the job its own process group, records its PID,
     # waits for it, and records how it ended.
-    PIDF="$state/$label.pid" ENDF="$state/$label.end" \
+    PIDF="$state/$label.pid" ENDF="$state/$label.end" ABANDON="$abandon" \
     /usr/bin/perl -MPOSIX -e '
         POSIX::setsid();
         my $pid = fork();
@@ -44,6 +48,7 @@ bootstrap)
         open(my $f, ">", $ENV{PIDF}); print $f $pid; close($f);
         waitpid($pid, 0);
         my $status = $?;
+        kill("KILL", -$pid) unless $ENV{ABANDON} eq "true";
         open(my $e, ">", $ENV{ENDF});
         if ($status & 127) { print $e "signal " . ($status & 127); } else { print $e "exit " . ($status >> 8); }
         close($e);
@@ -75,11 +80,17 @@ bootout)
     [ -e "$state/$label.label" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
     pid=$(cat "$state/$label.pid" 2>/dev/null)
     if [ -n "$pid" ] && [ ! -s "$state/$label.end" ]; then
-        kill -KILL -- "-$pid" 2>/dev/null
+        # With AbandonProcessGroup, bootout ends only the job's own process
+        # (measured on macOS 26); without it, the whole group.
+        if [ "$(cat "$state/$label.abandon" 2>/dev/null)" = true ]; then
+            kill -KILL "$pid" 2>/dev/null
+        else
+            kill -KILL -- "-$pid" 2>/dev/null
+        fi
         i=0
         while [ ! -s "$state/$label.end" ] && [ "$i" -lt 300 ]; do sleep 0.01; i=$((i + 1)); done
     fi
-    rm -f "$state/$label.label" "$state/$label.pid" "$state/$label.end"
+    rm -f "$state/$label.label" "$state/$label.pid" "$state/$label.end" "$state/$label.abandon"
     ;;
 list)
     echo "PID	Status	Label"
