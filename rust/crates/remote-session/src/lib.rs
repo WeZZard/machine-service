@@ -33,7 +33,7 @@ pub mod tls;
 mod wire;
 
 pub use client::{connect, fixed_resolver, ClientConfig, Resolver};
-pub use flow::{Rtt, INITIAL_WINDOW, MIN_WINDOW};
+pub use flow::{Rtt, MIN_WINDOW};
 pub use server::{
     AuthRequest, Authenticator, Listening, Rejection, ServerConfig, SessionServer, StaticToken,
     DEFAULT_GRACE, DEFAULT_SESSION_PORT, RELAY_PATH, SESSION_PORT_ENV,

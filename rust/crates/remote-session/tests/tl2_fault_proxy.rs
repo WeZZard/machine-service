@@ -582,6 +582,35 @@ fn a_bulk_transfer_on_a_healthy_slow_link_never_reconnects() {
     session.close();
 }
 
+/// RS-4, DC-302: a connection's first window drains within a third of the
+/// bound too. At 1 MB/s with a 1.5 s bound, a first window of 4 MiB would
+/// take 4 s to drain, the peer's acknowledgements would wait behind it in
+/// the one queue, and every new connection would be declared dead before
+/// its window measured the link. Starting at 1 MiB, the transfer never
+/// reconnects.
+#[test]
+fn a_link_slower_than_four_mib_per_drain_never_reconnects() {
+    let (_server, proxy, session, remote, timing) = slow_shared_link();
+    proxy.set_bandwidth(1_000_000);
+    let (client_events, server_events) = (
+        session.take_events().unwrap(),
+        remote.take_events().unwrap(),
+    );
+    let n = 8;
+    let sender = bulk(remote, n, MAX_BODY);
+    receive_bulk(&session, n);
+    let remote = sender.join().unwrap();
+    remote.flush(Duration::from_secs(20)).unwrap();
+    let lost = [disconnects(&client_events), disconnects(&server_events)].concat();
+    assert!(
+        lost.is_empty(),
+        "a link slower than the first window reconnected: {lost:?}"
+    );
+    assert_eq!(remote.counters().connections, 1);
+    assert!(timing.dead_after < Duration::from_secs(2));
+    session.close();
+}
+
 #[test]
 fn a_stall_on_a_slow_link_is_still_detected_within_the_bound() {
     let (_server, proxy, session, remote, timing) = slow_shared_link();

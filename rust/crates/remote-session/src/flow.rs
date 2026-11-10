@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 
 use crate::wire::MAX_MESSAGE;
 
-/// The window before the first measurement: enough to fill a link of 4 MB/s
-/// with a 1 s round trip, small enough to drain within 1 s on it.
-pub const INITIAL_WINDOW: usize = 4 << 20;
-
-/// The smallest window: one largest message, so a body always goes out.
+/// The smallest window: one largest message, so a body always goes out. It
+/// is also every connection's first window (DC-302): before a connection
+/// has measured its link, only the smallest window keeps the drain promise
+/// on every link this session serves (down to DC-212's floor), and the
+/// round-trip term grows it within a few measurements on a fast one.
 pub const MIN_WINDOW: usize = MAX_MESSAGE;
 
 /// The shortest span a throughput measurement covers; it also covers at
@@ -66,7 +66,7 @@ impl FlowWindow {
             drain,
             span: drain * 2,
             ceiling,
-            window: INITIAL_WINDOW.clamp(MIN_WINDOW, ceiling),
+            window: MIN_WINDOW,
             points: VecDeque::new(),
         }
     }
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn the_window_drains_within_a_third_of_the_bound_at_the_measured_rate() {
         let mut w = FlowWindow::new(Duration::from_secs(15), 64 << 20);
-        assert_eq!(w.window(), INITIAL_WINDOW);
+        assert_eq!(w.window(), MIN_WINDOW);
         settle(&mut w, Instant::now(), 4.0 * MB, 10);
         let drain = w.window() as f64 / (4.0 * MB);
         assert!((4.5..=5.5).contains(&drain), "drains in {drain} s");
@@ -261,7 +261,7 @@ mod tests {
         w.observe(t, 0, true, rtt);
         // At 1 s only the first round trip's bytes are back: too early.
         w.observe(t + MIN_SPAN, 1_000_000, true, rtt);
-        assert_eq!(w.window(), INITIAL_WINDOW);
+        assert_eq!(w.window(), MIN_WINDOW);
         w.observe(t + Duration::from_millis(3400), 13_600_000, true, rtt);
         // 4 MB/s for the 1.7 s round trip and 5 s of queue.
         assert!(
