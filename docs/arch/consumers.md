@@ -47,4 +47,4 @@
 | Tart and images | not installed | not needed for durable machines |
 | Durable exposure | not installed | `machine-service-install --expose-durable on` |
 
-- The owner's grants must be repeated only when an executable's signing identity changes. machine-service is therefore signed with one stable identity on every Mac ([DM-4](durable-machine.md#dm-4-exec)).
+- The owner's grants must be repeated only when an executable's signing identity changes. They go to the tools that hold them, such as CuaDriver, never to machine-service or the relay agent, which hold none (DC-309, [DM-4](durable-machine.md#dm-4-exec)).

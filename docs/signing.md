@@ -1,8 +1,8 @@
 # Signing the macOS relay agent
 
 The macOS relay agent is signed with an Apple Developer ID Application
-certificate, so a privacy permission that an operator grants on a durable Mac
-holds for every later release (DC-224). The signing key stays in the owner's
+certificate, so every release carries one stable code identity that the
+installer and the daemon trust (DC-224, DC-313). The signing key stays in the owner's
 keychain. No key, certificate or password goes to GitHub. The owner signs each
 release on their own Mac with `rust/scripts/sign-release.sh`, which then
 publishes it.
@@ -10,15 +10,17 @@ publishes it.
 This page is for two readers:
 
 - the owner, who sets up the certificate once and signs each release;
-- the operator of a durable Mac, who grants the permissions once.
+- the operator of a durable Mac, who checks the team that the Mac trusts.
 
 ## Why a Developer ID signature
 
-- A privacy grant (Accessibility, Automation, Reminders and others) stores the
-  designated requirement of the code it was given to. An ad hoc signature's
-  requirement is the build's code hash, so every new build loses every grant.
-  On a Mac with System Integrity Protection on, nothing but the operator can
-  grant again.
+- The installer and the daemon trust a relay agent release by its code
+  identity: the identifier, signed by the team that the Mac trusts
+  (DC-227, DC-231, DC-232). An ad hoc signature's identity is the build's
+  code hash, so it names one build and no team.
+- The signature is not for privacy permissions. The relay agent holds none:
+  a relayed command runs as a launchd job of its own, and a task that needs a
+  permission arranges it itself (DC-309, DC-310, DC-313).
 - A Developer ID signature's designated requirement names the identifier and
   the team:
 
@@ -112,8 +114,8 @@ This page is for two readers:
     (DC-237).
 - Signing never downgrades (DC-232). machine-service never replaces a relay
   agent signed with Developer ID by a build that is not, on a guest or on a
-  Mac, because the grants given to the Developer ID agent would no longer
-  match:
+  Mac, so a Mac that trusts a team never runs an agent that the team did not
+  sign:
   - The installer and the daemon read the installed agent's signature
     before they replace it, and refuse with the reason.
   - At a lease's bootstrap, machine-service reads the guest's agent's
@@ -140,8 +142,8 @@ The release is not notarized (DC-228):
   - The installer copies a release folder.
 - `/usr/bin/tar` then unpacks the archive. Neither path sets the attribute, and
   launchd starts the executable without an assessment.
-- A privacy grant matches the designated requirement, and notarization does not
-  change that requirement.
+- Notarization does not change the designated requirement that the trust
+  check reads.
 - A bare executable in a tar archive cannot be stapled. Its ticket could only
   be looked up online.
 - If notarization is ever needed, `sign-release.sh` would submit the signed
@@ -193,7 +195,7 @@ Holder of a team can create a Developer ID certificate.
    ```
 
 When the certificate is renewed, make the new one the same way. The team does
-not change, so the designated requirement and every grant stay valid.
+not change, so the designated requirement stays the same.
 
 ## The owner: sign each release
 
@@ -226,7 +228,7 @@ To sign a local build with the same identity:
 rust/scripts/build-relay-agent.sh --sign-developer-id
 ```
 
-## The operator of a durable Mac: grant the permissions once
+## The operator of a durable Mac: check the trusted team
 
 1. **Install, and check the team that the Mac trusts.** The first Developer
    ID release that you install sets the team that this Mac trusts, and the
@@ -239,8 +241,7 @@ rust/scripts/build-relay-agent.sh --sign-developer-id
    The installer prints `relay agent release signed Developer ID, team
    <TEAM_ID>, trusted as this Mac's first Developer ID team and recorded in
    …/relay/relay-agent-team.json`. Check that `<TEAM_ID>` is the owner's
-   team. A pre-release that is signed ad hoc installs too, records no team,
-   and its grants end with the next build.
+   team. A pre-release that is signed ad hoc installs too and records no team.
 
    To name the team before the first installation, set
    `MACHINE_SERVICE_RELAY_AGENT_TEAM_ID=<TEAM_ID>` for the install. A later
@@ -261,33 +262,6 @@ rust/scripts/build-relay-agent.sh --sign-developer-id
    ```
 
    The output must name `com.wezzard.relay-agent` and your team.
-3. **Grant the permissions that you add by hand.**
-   1. Open System Settings > Privacy & Security.
-   2. In Accessibility, and in any other list that a lease needs and that has
-      a + button, such as Full Disk Access, click +.
-   3. Press Command-Shift-G, enter `~/.local/libexec/relay-agent/relay-agent`,
-      and switch the entry on.
 
-   Screen Recording stays with the cua-driver daemon (DC-82).
-4. **Answer the prompts that come on first use.** macOS asks for Automation
-   (one prompt for each app that a script controls) and for Reminders,
-   Contacts, Calendar and Photos the first time that a command needs them.
-   Each prompt names `relay-agent`, because every command of a lease is the
-   relay agent's child (DM-4).
-   1. Sit at the Mac's display, or connect with Screen Sharing.
-   2. Run each kind of command once through a lease:
-
-      ```zsh
-      machctl acquire --purpose grants --machine <machine>
-      machctl exec <machine> -- osascript -e 'tell application "System Events" to get name of every process'
-      machctl exec <machine> -- osascript -e 'tell application "Reminders" to get name of every list'
-      machctl release <machine>
-      ```
-
-   3. Click Allow in each prompt.
-5. **Done.** Every later Developer ID release by the same team keeps these
-   grants, including the build that the installer or the daemon puts in place.
-   An ad hoc pre-release is never installed over the Developer ID agent,
-   because that would drop these grants (DC-232). To try one, remove the
-   relay agent first (`machine-service-install remove-relay-agent`); its
-   grants are not the release's, and you may need to grant again after it.
+The operator grants the relay agent nothing. Privacy permissions belong to the
+tasks that need them (DC-309).

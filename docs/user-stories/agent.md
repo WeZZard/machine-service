@@ -134,7 +134,8 @@ The agent's contract with the service is **lease-based**: it asks for a VM, work
 
 ## US36 — My actions run as the person at the desktop
 
-- As an agent, I want every action to run in the desktop session of the machine's logged-in user, so that the keychain, the window server and the privacy permissions behave as they do for a person at that machine (DC-97).
+- As an agent, I want every action to run in the desktop session of the machine's logged-in user, so that the keychain and the window server behave as they do for a person at that machine (DC-97).
+- My action runs as a process of its own, never as a descendant of the relay agent, so it never inherits the agent's privacy permissions. Any privacy permission my task needs is my task's to arrange (DC-308, DC-309, DC-310).
 - This holds on macOS virtual machines, durable Macs and Ubuntu virtual machines (DC-98). See [relay agent](../arch/relay-agent.md).
 
 **Tests:** AC-55 to AC-60 and AC-65 in [relay.acceptance](../acceptance/relay.acceptance).

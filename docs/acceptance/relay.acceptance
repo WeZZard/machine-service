@@ -7,7 +7,7 @@ Feature: Actions through the relay agent and the broker
     Given a lease whose relay agent has registered with the broker
     When the client runs an action on a macOS target
     Then the action reads a test item from the login keychain without unlocking it
-    And the action drives Finder with osascript without a consent dialog and without a TCC grant for sshd-keygen-wrapper
+    And the action's process is not a descendant of the relay agent, so it holds none of the agent's privacy permissions
     And the action captures the screen through cua-driver
     When the client runs an action on an Ubuntu target
     Then the action sees the desktop session's display and session bus

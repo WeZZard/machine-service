@@ -7,7 +7,8 @@ The owner's goals, taste and standing defaults for machine-service. This page ov
 - Agents get machines to work on through leases and never drive Tart or a Mac directly: disposable virtual machines, and the Macs themselves as durable machines (DC-19, DC-22).
 - Any Mac that installs `machctl` finds every instance on the network with nothing else installed, and sees every machine they offer (DC-21, DC-84).
 - Renaming a Mac breaks nothing that consumes machine-service (DC-86).
-- An agent's action runs as the person at the desktop would run it: in the logged-in user's desktop session, with its keychain, window server and privacy permissions, not over SSH (DC-97, DC-98).
+- An agent's action runs as the person at the desktop would run it: in the logged-in user's desktop session, with its keychain and window server, not over SSH (DC-97, DC-98).
+- The service and relay layer know nothing about privacy permissions. A task that needs one arranges it itself, and a relayed command never inherits the relay agent's (DC-308, DC-309).
 - Machines may sit in other sites behind NAT. Both sides dial out, and any network that meets the transport contract works. Only the intranet is built and tested (DC-100, DC-101).
 - Durable Macs run Claude Code and Codex through the in-house gateway with a key per machine per agent, so usage is tracked per machine (DC-24).
 

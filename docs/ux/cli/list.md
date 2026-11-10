@@ -39,7 +39,7 @@ mac-c            -                               -        unreachable  connectio
 ## CL-2: Acquire by capability
 
 - `machctl acquire --purpose <slug> --require metal3 --require unreal` asks for any machine that has every listed capability.
-- The capabilities a client can require are names over the capability report: `metal3`, `durable`, `virtual`, `unity`, `unreal`, `xcode`, `cua-driver`, `claude-code`, `codex`, `screen-recording` and `ci-idle`.
+- The capabilities a client can require are names over the capability report: `metal3`, `durable`, `virtual`, `unity`, `unreal`, `xcode`, `cua-driver`, `claude-code`, `codex` and `ci-idle`. There is no `screen-recording` requirement: the report holds no privacy permissions (DC-309).
 - A requirement over a fact the report does not know never matches. `claude-code` and `codex` need the program and, where the record reports agent keys, a present key and gateway endpoint. `ci-idle` matches a Mac without a CI runner or with an idle one (DC-63).
 - The CLI lists the machines, keeps those that match, and prefers in order: an available durable machine whose CI runner is idle, then any available durable machine, then a virtual machine offer that is acquirable. It acquires from the instance that owns the first candidate and tries the next candidate when that acquisition is refused for capacity.
 - `--machine <name>` acquires a named durable machine, and `--image <image>` acquires a virtual machine. `--instance <ID>` chooses the instance for an image, and narrows the instances `--require` chooses among. Without any of the three forms the image is `macos26`.
