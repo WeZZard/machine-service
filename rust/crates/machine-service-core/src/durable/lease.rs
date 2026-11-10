@@ -245,16 +245,19 @@ impl DurableMachine {
         self.current_id().and_then(|id| self.read_record(&id))
     }
 
-    /// Keep the SHA-256 of a lease's relay client credential in its record,
-    /// as a virtual machine's record keeps it, so that a restarted instance
-    /// accepts the credential again while the lease lives on (RA-4, RP-3).
-    /// It is written before the acquisition answers, so no heartbeat of the
-    /// lease can interleave.
+    /// Keep the SHA-256 of the relay client credential issued for the
+    /// current lease `lease_id` in its record, as a virtual machine's record
+    /// keeps `relay_client_sha256`, so that the broker accepts it again
+    /// after a restart of the instance (DM-8, RP-3).
     pub fn record_relay_client(&self, lease_id: &str, sha256: &str) -> Result<(), String> {
+        let _gate = self.gate.read().map_err(|_| "durable gate poisoned")?;
         let _store = self.store.lock().map_err(|_| "durable state poisoned")?;
         let mut record = self
-            .read_record(lease_id)
-            .ok_or_else(|| format!("no record of durable lease {lease_id}"))?;
+            .current_id()
+            .filter(|id| id == lease_id)
+            .and_then(|id| self.read_record(&id))
+            .filter(|record| record["state"] != "released")
+            .ok_or_else(|| format!("{lease_id} is not the current lease"))?;
         record["relay_client_sha256"] = json!(sha256);
         self.write_record(&record)
     }

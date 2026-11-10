@@ -88,15 +88,21 @@ mkdir -p ~/evidence ~/rig-cache; systemd-run --user --unit relay-acceptance-run 
 sh -c 'exec ~/relay-acceptance run$quoted --evidence ~/evidence > ~/evidence/run.log 2>&1'; echo started" >/dev/null
 echo "running $cell under $profile in $vm"
 
+# Only an answer from the VM ends the wait: a poll that does not reach it,
+# as when the client instance is slow to answer, says nothing of the run.
 while :; do
     sleep 60
     state=$(exec_script "$vm" "systemctl --user is-active relay-acceptance-run 2>/dev/null || true; tail -1 ~/evidence/run.log" 120 \
         | json 'd.get("output","")' || true)
+    if [ -z "$state" ]; then
+        echo "the client VM did not answer; waiting"
+        continue
+    fi
     echo "$state" | tail -1
     case "$state" in active*|activating*) ;; *) break ;; esac
 done
 
 # Bring the evidence home as a tar stream.
-curl -fsS -m 1800 "$client_instance/machines/$vm/files?lease_id=$lease&path=evidence" -o "$evidence/ubuntu-client-evidence.tar"
+curl -fsS -m 1800 --retry 5 --retry-delay 30 --retry-all-errors "$client_instance/machines/$vm/files?lease_id=$lease&path=evidence" -o "$evidence/ubuntu-client-evidence.tar"
 tar -xf "$evidence/ubuntu-client-evidence.tar" -C "$evidence" && rm -f "$evidence/ubuntu-client-evidence.tar"
 echo "evidence in $evidence"
