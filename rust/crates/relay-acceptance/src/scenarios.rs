@@ -1293,6 +1293,21 @@ fn ac62(ctx: &mut Ctx<'_>) -> Verdict {
     }
     let after = first_disconnect_after(&client, at).map(|d| d.saturating_sub(at));
     ctx.record("detected_after_s", json!(after.map(|d| d.as_secs_f64())));
+    // The link's events from a minute before the blackhole, relative to it,
+    // so a run that sees no disconnect shows what the connection was doing:
+    // under N3 the chaos schedule may have cut it just before.
+    let links: Vec<Value> = client
+        .links()
+        .into_iter()
+        .filter(|(when, _)| *when + Duration::from_secs(60) >= at)
+        .map(|(when, event)| {
+            json!({
+                "at_s": when.as_secs_f64() - at.as_secs_f64(),
+                "event": format!("{event:?}"),
+            })
+        })
+        .collect();
+    ctx.record("links_around_blackhole", json!(links));
     detected.map_err(|_| Stop::Failed("the dead connection was not detected in 40 s".into()))?;
     ctx.check(
         "the dead connection is detected within 15 seconds",
