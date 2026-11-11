@@ -24,7 +24,7 @@
 # bridges' guests (`--admit guests`, DC-248).
 #
 # With durable exposure on, the instance brings up its own relay agent
-# (IN-3), whose label and home derive from the instance's state folder, so
+# (IN-3), which dials the broker through the agent chain (DC-327), whose label and home derive from the instance's state folder, so
 # it never touches the installed instance's agent, and whose LaunchAgent
 # lies under the state folder, so launchd never loads it at a later login.
 # Durable exposure off loopback is for a durable acceptance cell only, named
@@ -97,7 +97,10 @@ start_instance() {
         set -- "$@" --env "PILOT_REPO=$PILOT_REPO"
     fi
     if [ -n "${RELAY_HOST_DURABLE:-}" ]; then
-        set -- "$@" --durable
+        # The instance's own relay agent dials the broker through the agent
+        # chain, as a guest's does, so a cell can fault its connection
+        # (DC-327).
+        set -- "$@" --durable --env "MACHINE_SERVICE_RELAY_DURABLE_AGENT_PORT=$agent_port"
         if [ -n "${RELAY_HOST_DURABLE_CELL:-}" ]; then
             set -- "$@" --durable-cell "$RELAY_HOST_DURABLE_CELL"
         fi

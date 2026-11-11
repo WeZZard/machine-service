@@ -61,6 +61,11 @@ pub const GUEST_URL_VARIABLE: &str = "MACHINE_SERVICE_RELAY_GUEST_URL";
 /// the guest's network, instead of the session port: a test rig's chain in
 /// front of the broker listens there (TL-7).
 pub const GUEST_PORT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_GUEST_PORT";
+/// The port the instance's own durable relay agent dials, on the broker's
+/// address, instead of the session port: a durable acceptance cell's rig
+/// chain listens there, so a fault on the agent's connection can be made
+/// (TL-7, DC-327). An installed instance never sets it.
+pub const DURABLE_AGENT_PORT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_DURABLE_AGENT_PORT";
 /// Seconds a new clone's relay agent gets to register (RA-8).
 pub const REGISTER_TIMEOUT_VARIABLE: &str = "MACHINE_SERVICE_RELAY_REGISTER_TIMEOUT";
 /// Seconds a call waits for a relay agent that has no session (RP-8).
@@ -99,6 +104,8 @@ pub struct RelaySettings {
     /// The port of the URL derived from the guest's network, when not the
     /// session port.
     pub guest_port: Option<u16>,
+    /// The port the durable relay agent dials, when not the session port.
+    pub durable_agent_port: Option<u16>,
     /// How long a new clone's relay agent gets to register.
     pub register_timeout: Duration,
     /// How long a call waits for a relay agent without a session.
@@ -166,23 +173,25 @@ impl RelaySettings {
             }
             _ => None,
         };
-        let guest_port = match std::env::var(GUEST_PORT_VARIABLE) {
-            Ok(value) if !value.trim().is_empty() => Some(
-                value
-                    .trim()
-                    .parse::<u16>()
-                    .ok()
-                    .filter(|port| *port > 0)
-                    .ok_or_else(|| format!("{GUEST_PORT_VARIABLE}={value:?} is not a port"))?,
-            ),
-            _ => None,
+        let port_of = |variable: &str| match std::env::var(variable) {
+            Ok(value) if !value.trim().is_empty() => value
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .map(Some)
+                .ok_or_else(|| format!("{variable}={value:?} is not a port")),
+            _ => Ok(None),
         };
+        let guest_port = port_of(GUEST_PORT_VARIABLE)?;
+        let durable_agent_port = port_of(DURABLE_AGENT_PORT_VARIABLE)?;
         Ok(RelaySettings {
             session_port,
             session_host,
             relay_url,
             guest_url,
             guest_port,
+            durable_agent_port,
             register_timeout: seconds(REGISTER_TIMEOUT_VARIABLE, 120)?,
             agent_wait: seconds(AGENT_WAIT_VARIABLE, 600)?,
         })
@@ -1905,6 +1914,7 @@ mod tests {
             relay_url: "wss://h:6241/relay".into(),
             guest_url: Some("wss://o:1/relay".into()),
             guest_port: None,
+            durable_agent_port: None,
             register_timeout: Duration::from_secs(1),
             agent_wait: Duration::from_secs(1),
         };

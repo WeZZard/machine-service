@@ -4,9 +4,11 @@
 //! A relay agent's chain on a VM host must be reached by the host's guests
 //! on their network's host address, a vmnet bridge that exists only while a
 //! VM runs, so it cannot bind that one address before its first guest
-//! boots. It listens on every interface and admits only loopback peers and
-//! peers on the subnet of one of the host's bridge interfaces, so the LAN
-//! is never served.
+//! boots. It listens on every interface and admits only loopback peers,
+//! peers on the subnet of one of the host's bridge interfaces, and the host
+//! itself on one of its own addresses, so the LAN is never served. The
+//! last is a durable Mac's own relay agent, which dials the chain on the
+//! address its broker binds (DC-327).
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -16,7 +18,7 @@ pub enum Admit {
     /// Anyone who reaches the listener.
     #[default]
     Any,
-    /// Loopback peers and the host's guests.
+    /// Loopback peers, the host's guests, and the host itself.
     Guests,
 }
 
@@ -34,7 +36,11 @@ impl Admit {
     pub fn admits(self, peer: IpAddr) -> bool {
         match self {
             Admit::Any => true,
-            Admit::Guests => peer.is_loopback() || guest_admitted(peer, &bridge_subnets()),
+            Admit::Guests => {
+                peer.is_loopback()
+                    || guest_admitted(peer, &bridge_subnets())
+                    || own_addresses().contains(&peer)
+            }
         }
     }
 }
@@ -48,6 +54,36 @@ pub fn guest_admitted(peer: IpAddr, subnets: &[(Ipv4Addr, Ipv4Addr)]) -> bool {
         let mask = u32::from(*mask);
         mask != 0 && u32::from(*address) & mask == u32::from(peer) & mask
     })
+}
+
+/// Every IPv4 address of this host's interfaces that are up.
+pub fn own_addresses() -> Vec<IpAddr> {
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: as in `bridge_subnets`: the list is read before it is freed,
+    // and each sockaddr is read as the family it names.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return found;
+        }
+        let mut cursor = list;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            let up = entry.ifa_flags & libc::IFF_UP as libc::c_uint != 0;
+            if up
+                && !entry.ifa_addr.is_null()
+                && i32::from((*entry.ifa_addr).sa_family) == libc::AF_INET
+            {
+                let address = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                found.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    address.sin_addr.s_addr,
+                ))));
+            }
+            cursor = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    found
 }
 
 /// The IPv4 address and mask of every bridge interface that is up, the
@@ -108,5 +144,17 @@ mod tests {
         assert!(Admit::Any.admits("203.0.113.7".parse().unwrap()));
         assert_eq!(Admit::parse("guests"), Ok(Admit::Guests));
         assert!(Admit::parse("lan").is_err());
+    }
+
+    /// DC-327: the host itself, on one of its own addresses, is admitted;
+    /// an address that is no interface's is not.
+    #[test]
+    fn the_host_itself_is_admitted_on_its_own_addresses() {
+        let own = own_addresses();
+        let lan = own.iter().find(|address| !address.is_loopback());
+        if let Some(address) = lan {
+            assert!(Admit::Guests.admits(*address), "{address}");
+        }
+        assert!(!Admit::Guests.admits("203.0.113.7".parse().unwrap()));
     }
 }

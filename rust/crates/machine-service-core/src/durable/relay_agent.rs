@@ -408,6 +408,9 @@ pub struct Spec {
     pub state_dir: PathBuf,
     /// The instance's session port, where its broker listens (BK-1).
     pub session_port: u16,
+    /// The port the agent dials instead, on the broker's address: a
+    /// durable acceptance cell's rig chain (DC-327).
+    pub agent_port: Option<u16>,
     /// The release folder to install from.
     pub release_dir: PathBuf,
     /// Make a new agent credential first (RA-4).
@@ -420,9 +423,10 @@ pub struct Spec {
 
 impl Spec {
     /// The broker URL the agent dials: the loopback name and the session
-    /// port, which neither a rename nor a network change moves (DC-163).
+    /// port, which neither a rename nor a network change moves (DC-163);
+    /// in a durable acceptance cell, the rig chain's port (DC-327).
     pub fn broker_url(&self) -> String {
-        crate::relay::durable_broker_url(self.session_port)
+        crate::relay::durable_broker_url(self.agent_port.unwrap_or(self.session_port))
     }
 }
 
@@ -727,6 +731,7 @@ mod tests {
             identity: identity(&home.join(DEFAULT_STATE), &home),
             state_dir: home.join(DEFAULT_STATE),
             session_port: 1,
+            agent_port: None,
             release_dir,
             rotate: false,
             team: team.map(str::to_string),
@@ -892,5 +897,25 @@ mod tests {
         assert!(!durable_lease_current(state.path()));
         std::fs::write(state.path().join("durable.json"), r#"{"current": "abc"}"#).unwrap();
         assert!(durable_lease_current(state.path()));
+    }
+
+    /// DC-327: with an agent port, the agent dials the rig chain on it, on
+    /// the same address; without, the broker's own session port.
+    #[test]
+    fn the_agent_dials_the_rig_chain_port_when_one_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = spec_in(root.path(), root.path().join("release"), None);
+        spec.session_port = 6263;
+        assert!(
+            spec.broker_url().ends_with(":6263/relay"),
+            "{}",
+            spec.broker_url()
+        );
+        spec.agent_port = Some(6264);
+        assert!(
+            spec.broker_url().ends_with(":6264/relay"),
+            "{}",
+            spec.broker_url()
+        );
     }
 }

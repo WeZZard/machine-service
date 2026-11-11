@@ -685,15 +685,16 @@ impl Target for RealTarget {
             .as_ref()
             .filter(|_| self.settings.manage_agent_rig)
         {
-            if cell.target != TargetKind::DurableMac {
-                let seed = self.settings.seed.wrapping_add(1).to_string();
-                let started = control
-                    .run(&["rig-start", &self.settings.profile, &seed])
-                    .map_err(fail)?;
-                std::fs::write(run_dir.join("agent-rig.json"), &started)
-                    .map_err(|e| fail(e.to_string()))?;
-                self.note("agent chain started", json!(started.trim()));
-            }
+            // A durable Mac's own relay agent dials the broker through the
+            // same chain as a guest's, so its connection can be faulted
+            // too (DC-327).
+            let seed = self.settings.seed.wrapping_add(1).to_string();
+            let started = control
+                .run(&["rig-start", &self.settings.profile, &seed])
+                .map_err(fail)?;
+            std::fs::write(run_dir.join("agent-rig.json"), &started)
+                .map_err(|e| fail(e.to_string()))?;
+            self.note("agent chain started", json!(started.trim()));
         }
         self.broker_addr = Some(addr);
         let endpoint = Endpoint {
@@ -720,10 +721,8 @@ impl Target for RealTarget {
             .as_ref()
             .filter(|_| self.settings.manage_agent_rig)
         {
-            if self.kind != Some(TargetKind::DurableMac) {
-                let stopped = control.run(&["rig-stop"]);
-                self.note("agent chain stopped", json!(format!("{stopped:?}")));
-            }
+            let stopped = control.run(&["rig-stop"]);
+            self.note("agent chain stopped", json!(format!("{stopped:?}")));
         }
         json!({
             "instance": self.instance.base(),

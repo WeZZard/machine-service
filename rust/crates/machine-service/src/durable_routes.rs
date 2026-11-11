@@ -126,6 +126,7 @@ fn provision_agent(
         identity: agent,
         state_dir: state_dir.to_path_buf(),
         session_port: relay.settings.session_port,
+        agent_port: relay.settings.durable_agent_port,
         release_dir,
         rotate: false,
         team,

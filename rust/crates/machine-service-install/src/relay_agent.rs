@@ -43,6 +43,8 @@ impl Spec {
             identity,
             state_dir: self.state_dir.clone(),
             session_port: self.session_port,
+            // The installed agent dials its broker directly (DC-327).
+            agent_port: None,
             release_dir: self.release_dir.clone(),
             rotate: self.rotate,
             team: self.team.clone(),
