@@ -452,6 +452,16 @@ impl Lab {
         self.start_daemon(&config);
     }
 
+    /// End the daemon at once, as a crash would, and start the next.
+    fn crash_daemon(&mut self) {
+        if let Some(mut daemon) = self.daemon.take() {
+            daemon.signal(libc::SIGKILL, Duration::from_secs(30));
+            self.retired.push(daemon);
+        }
+        let config = self.root.join("config");
+        self.start_daemon(&config);
+    }
+
     /// The service's log.
     fn log(&self) -> String {
         std::fs::read_to_string(self.state.join("service.log")).unwrap_or_default()
@@ -1319,6 +1329,56 @@ fn try_lease_client(acquired: &Value) -> Result<TestClient, remote_session::Erro
 /// instance, and so does its relay client credential: the record keeps its
 /// hash, never the credential, and the restarted broker accepts it again
 /// until the lease is released.
+/// DM-4, AC-64: a redacted command that runs while the daemon crashes and
+/// starts again keeps its redacted output and its exit status, because its feeder is a
+/// process of its own (DC-319); the same execution ID sent again after the
+/// restart names the same job and runs nothing twice.
+#[test]
+fn m4_a_redacted_command_outlives_a_daemon_crash() {
+    let mut lab = Lab::new(relay_agent_bin());
+    lab.start_agent();
+    let (name, lease, acquired) = lab.acquire("default");
+    lab.wait_for_relay(&name, &lease);
+    let marker = lab.root.join("spans-restart.txt");
+    let started = lab.root.join("spans-restart.started");
+    let command = format!(
+        "echo started > '{}'; sleep 4; echo \"key=$ANTHROPIC_API_KEY\"; echo done >> '{}'; echo done",
+        started.display(),
+        marker.display()
+    );
+    let client = lease_client(&acquired);
+    client.call(1, "spans-restart", relay_common::exec(&command), b"");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "the command never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(client);
+
+    let registered = lab.log().matches("agent registered").count();
+    lab.crash_daemon();
+    lab.wait_for_registrations(registered + 1);
+    let client = try_lease_client(&acquired).expect("the restarted broker refuses the lease");
+    client.call(2, "spans-restart", relay_common::exec(&command), b"");
+    let answer = client.wait(2, Duration::from_secs(60));
+    assert_eq!(exit_rc(&answer), Some(0), "{answer:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&answer.bytes),
+        "key=[redacted]\ndone\n"
+    );
+    assert!(!format!("{answer:?}").contains(CLAUDE_KEY));
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        ran,
+        "done\n",
+        "the command ran {} times",
+        ran.lines().count()
+    );
+    drop(client);
+    let released = lab.release_lease(&name, &lease);
+    assert_eq!(released.status, 200, "{}", released.body);
+}
+
 #[test]
 fn m4_a_durable_leases_client_credential_outlives_a_restart() {
     let mut lab = Lab::new(relay_agent_bin());

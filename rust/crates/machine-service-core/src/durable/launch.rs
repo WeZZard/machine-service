@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use guest_actions::launchd::{self, JobFiles};
 use relay_agent::protocol::JobRef;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::agents::Redactor;
@@ -150,15 +151,89 @@ impl Extra {
     }
 }
 
+/// The daemon's argument that runs one job's feeder as a process of its
+/// own ([`FeedBy::Process`]).
+pub const FEED_ARGUMENT: &str = "--durable-feed";
+
+/// Who feeds a job.
+pub enum FeedBy<'a> {
+    /// A thread of this process, which ends with it, and what takes what
+    /// it has to say: for a test.
+    Thread(Box<dyn Fn(&str) + Send>),
+    /// A process of its own, `<executable> --durable-feed`, which outlives
+    /// a restart of the daemon, so a running job keeps its redacted output
+    /// and its exit report (AC-64). It is never in the job's chain of
+    /// processes (DC-315). Its errors go to `log`.
+    Process {
+        /// The daemon's own executable.
+        executable: &'a Path,
+        /// The daemon's log.
+        log: &'a Path,
+    },
+}
+
+/// What a feeder process reads on its standard input.
+#[derive(Serialize, Deserialize)]
+struct FeedRequest {
+    job: PathBuf,
+    claim: PathBuf,
+    group: PathBuf,
+    first: Vec<u8>,
+    second: Vec<u8>,
+    /// The values to redact; with them, descriptors 3 and 4 are the
+    /// readers of `raw` and `exit`.
+    values: Vec<String>,
+}
+
+/// The feeder process: feed the job its standard input describes.
+pub fn feed_main() -> i32 {
+    let mut text = Vec::new();
+    if let Err(error) = std::io::stdin().read_to_end(&mut text) {
+        eprintln!("machine-service: durable feeder: {error}");
+        return 1;
+    }
+    let request: FeedRequest = match serde_json::from_slice(&text) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("machine-service: durable feeder: {error}");
+            return 1;
+        }
+    };
+    let job = JobFiles::at(&request.job);
+    let feeder = Feeder {
+        files: Files {
+            job: request.job.clone(),
+            claim: request.claim,
+            group: request.group,
+        },
+        extra: Extra::at(&job),
+        job,
+    };
+    let redacted = (!request.values.is_empty()).then(|| {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the daemon handed this process the two readers under
+        // these numbers, and nothing else here owns them.
+        let (raw, exit) = unsafe { (File::from_raw_fd(3), File::from_raw_fd(4)) };
+        (request.values, raw, exit)
+    });
+    match feeder.feed(&request.first, &request.second, redacted) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("WARN: durable job {}: {error}", request.job.display());
+            1
+        }
+    }
+}
+
 /// Make the job for `launch` in the lease's `session`, start the feeder
 /// that writes its environment, and answer what the relay agent needs to
-/// run it. `log` takes what the feeder has to say.
+/// run it.
 pub fn prepare(
     files: &Files,
     launch: Launch<'_>,
     session: &SessionEnv,
     cwd: &Path,
-    log: impl Fn(&str) + Send + 'static,
+    by: FeedBy<'_>,
 ) -> Result<JobRef, String> {
     // The job runs the shell the service resolved here, through its tool
     // table (DC-254).
@@ -260,23 +335,118 @@ pub fn prepare(
         dir: job.dir.to_string_lossy().into_owned(),
         redacted: redacted.is_some(),
     };
-    let feeder = Feeder {
-        files: files.clone(),
-        job,
-        extra,
+    let started = match by {
+        FeedBy::Thread(log) => {
+            let feeder = Feeder {
+                files: files.clone(),
+                job: job.clone(),
+                extra,
+            };
+            std::thread::Builder::new()
+                .name("durable-job-feeder".into())
+                .spawn(move || {
+                    if let Err(error) = feeder.feed(first.as_bytes(), &second, redacted) {
+                        log(&format!(
+                            "WARN: durable job {}: {error}",
+                            feeder.job.dir.display()
+                        ));
+                    }
+                })
+                .map(|_| ())
+                .map_err(|error| format!("cannot start the job's feeder: {error}"))
+        }
+        FeedBy::Process { executable, log } => {
+            spawn_feeder(executable, log, files, first.into_bytes(), second, redacted)
+        }
     };
-    std::thread::Builder::new()
-        .name("durable-job-feeder".into())
-        .spawn(move || {
-            if let Err(error) = feeder.feed(first.as_bytes(), &second, redacted) {
-                log(&format!(
-                    "WARN: durable job {}: {error}",
-                    feeder.job.dir.display()
-                ));
-            }
-        })
-        .map_err(|error| format!("cannot start the job's feeder: {error}"))?;
+    if let Err(error) = started {
+        job.remove();
+        let _ = std::fs::remove_file(&files.claim);
+        return Err(error);
+    }
     Ok(reference)
+}
+
+/// Start `<executable> --durable-feed` in a process group of its own, with
+/// its request on standard input and, for a redacted job, the readers of
+/// `raw` and `exit` as descriptors 3 and 4.
+fn spawn_feeder(
+    executable: &Path,
+    log: &Path,
+    files: &Files,
+    first: Vec<u8>,
+    second: Vec<u8>,
+    redacted: Option<(Vec<String>, File, File)>,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let (values, readers) = match redacted {
+        Some((values, raw, exit)) => (values, Some((raw, exit))),
+        None => (Vec::new(), None),
+    };
+    let request = FeedRequest {
+        job: files.job.clone(),
+        claim: files.claim.clone(),
+        group: files.group.clone(),
+        first,
+        second,
+        values,
+    };
+    let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let errors = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(FEED_ARGUMENT)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(errors)
+        .process_group(0);
+    if let Some((raw, exit)) = &readers {
+        let (raw, exit) = (raw.as_raw_fd(), exit.as_raw_fd());
+        // SAFETY: only async-signal-safe calls between fork and exec. Each
+        // reader is first copied above 4, so neither move overwrites the
+        // other and none is a `dup2` onto itself, which would keep
+        // close-on-exec; the copies under 3 and 4 have it cleared.
+        unsafe {
+            command.pre_exec(move || {
+                let high = |fd: i32| libc::fcntl(fd, libc::F_DUPFD, 10);
+                let (raw, exit) = (high(raw), high(exit));
+                if raw < 0
+                    || exit < 0
+                    || libc::dup2(raw, 3) < 0
+                    || libc::dup2(exit, 4) < 0
+                    || libc::fcntl(3, libc::F_SETFD, 0) < 0
+                    || libc::fcntl(4, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start the job's feeder: {error}"))?;
+    // This process's copies of the readers go once the feeder holds its own.
+    drop(readers);
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("the feeder has no standard input")?;
+    stdin
+        .write_all(&bytes)
+        .map_err(|error| format!("cannot hand the feeder its job: {error}"))?;
+    drop(stdin);
+    // The feeder is reaped by a thread, so it never lingers as a zombie of
+    // the daemon; after a restart of the daemon, launchd reaps it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn open_reader(path: &Path) -> Result<File, String> {
@@ -564,7 +734,7 @@ mod tests {
             Launch::Program(&program),
             &session(),
             lease.path(),
-            |_| {},
+            FeedBy::Thread(Box::new(|_| {})),
         )
         .unwrap();
         assert!(job.redacted);
@@ -594,7 +764,14 @@ mod tests {
             secrets: Vec::new(),
         };
         for files in [&one, &two] {
-            let job = prepare(files, Launch::ScriptOnInput, &plain, lease.path(), |_| {}).unwrap();
+            let job = prepare(
+                files,
+                Launch::ScriptOnInput,
+                &plain,
+                lease.path(),
+                FeedBy::Thread(Box::new(|_| {})),
+            )
+            .unwrap();
             assert!(!job.redacted);
         }
         std::fs::write(&one.group, b"{}").unwrap();

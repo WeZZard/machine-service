@@ -2,6 +2,8 @@
 //! as the relay agent runs it: a (fake) launchd job whose files another
 //! process made (RA-10, DM-4, DC-220, DC-221, DC-314).
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Once;
@@ -30,6 +32,15 @@ fn fake_launchd() -> Launchd {
         }
     });
     Launchd::resolve().unwrap()
+}
+
+/// The feeder as the daemon starts it: a process of the daemon's
+/// executable, with errors on this test's standard error.
+fn feed_by() -> launch::FeedBy<'static> {
+    launch::FeedBy::Process {
+        executable: Path::new(common::DAEMON),
+        log: Path::new("/dev/stderr"),
+    }
 }
 
 fn session(keys: bool) -> SessionEnv {
@@ -65,10 +76,7 @@ fn run(
 ) -> (Exit, String, i32, launch::Files) {
     let launchd = fake_launchd();
     let files = launch::files(lease, execution);
-    let job = launch::prepare(&files, launch, &session(keys), lease, |message| {
-        eprintln!("{message}")
-    })
-    .unwrap();
+    let job = launch::prepare(&files, launch, &session(keys), lease, feed_by()).unwrap();
     assert!(!job.dir.contains(KEY));
     assert_eq!(job.redacted, keys);
     before(&files);
@@ -201,7 +209,7 @@ fn a_repeated_execution_names_the_same_job() {
                 Launch::Program(&line("echo twice")),
                 &session(true),
                 &lease,
-                |message| eprintln!("{message}"),
+                feed_by(),
             )
             .unwrap();
             assert_eq!(Path::new(&again.dir), files.job.as_path());

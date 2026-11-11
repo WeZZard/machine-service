@@ -68,11 +68,15 @@ pub fn install_relay(relay: &Arc<Relay>, state_dir: &std::path::Path) {
             &format!("WARN: relay: durable exec stays in the service's session: {reason}"),
         );
     }
+    let feeder = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .unwrap_or_else(|_| std::path::PathBuf::from("machine-service"));
     let agent = relay_agent::identity(state_dir, &machine.config.home);
     machine.attach_relay(DurableRelay {
         broker: relay.broker.clone(),
         target: durable_target(machine),
         expected_build,
+        feeder,
         agent_wait: relay.settings.agent_wait,
         // An instance told to wait less for its agents waits less for a
         // purge too (MACHINE_SERVICE_RELAY_AGENT_WAIT).

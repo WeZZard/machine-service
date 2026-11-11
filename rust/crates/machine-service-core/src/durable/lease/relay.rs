@@ -17,7 +17,7 @@
 //! travels in the relay protocol (DC-219, DC-314).
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Weak};
@@ -51,6 +51,8 @@ pub struct DurableRelay {
     /// The SHA-256 of the installed release's macOS relay agent, or why
     /// there is none (DC-140).
     pub expected_build: Result<String, String>,
+    /// The daemon's own executable, which feeds each job (DC-319).
+    pub feeder: PathBuf,
     /// How long a call waits for an agent without a session (RP-8).
     pub agent_wait: Duration,
     /// How long release waits for the agent to confirm the purge of the
@@ -169,12 +171,6 @@ fn failure(outcome: &Outcome) -> String {
 }
 
 impl DurableMachine {
-    /// Where a job's feeder writes what it has to say: the daemon's log.
-    fn feeder_log(&self) -> impl Fn(&str) + Send + 'static {
-        let file = self.config.log_file.clone();
-        move |message: &str| super::log_to_file(&file, message)
-    }
-
     /// Attach this instance's broker, once (M4). A lease that is current
     /// across a restart is bound again; its calls may have reached the
     /// agent before the restart, so its release purges (DM-8, DC-173).
@@ -445,7 +441,10 @@ impl DurableMachine {
             Launch::Program(&request.program),
             &runtime.env,
             &request.cwd,
-            self.feeder_log(),
+            launch::FeedBy::Process {
+                executable: &relay.feeder,
+                log: &self.config.log_file,
+            },
         )
         .map_err(|error| Reply::error(409, error))?;
         let events = relay.broker.submit(
@@ -486,7 +485,7 @@ impl DurableMachine {
     /// feeds it. Under the release gate, like any start, so a release
     /// withdraws what this writes (DM-7).
     fn launch_client_call(&self, lease: &str, execution: &str, op: &Op) -> Result<Op, String> {
-        self.relay.get().ok_or("this instance runs no broker")?;
+        let relay = self.relay.get().ok_or("this instance runs no broker")?;
         let _gate = self
             .gate
             .read()
@@ -504,12 +503,20 @@ impl DurableMachine {
         let cwd = exec::resolve_cwd(&self.config.workspace(lease).join("work"), None)?;
         let files = launch::files(&self.config.lease_dir(lease), execution);
         let launched = |launch: Launch<'_>, stdin: bool, timeout_s: f64| {
-            launch::prepare(&files, launch, &runtime.env, &cwd, self.feeder_log()).map(|job| {
-                Op::Job {
-                    job,
-                    stdin,
-                    timeout_s,
-                }
+            launch::prepare(
+                &files,
+                launch,
+                &runtime.env,
+                &cwd,
+                launch::FeedBy::Process {
+                    executable: &relay.feeder,
+                    log: &self.config.log_file,
+                },
+            )
+            .map(|job| Op::Job {
+                job,
+                stdin,
+                timeout_s,
             })
         };
         match op {

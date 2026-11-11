@@ -27,6 +27,12 @@ fn main() {
         probe::run();
         return;
     }
+    // One durable job's feeder, which the daemon starts (DM-4, DC-319).
+    if arguments.first().map(String::as_str)
+        == Some(machine_service_core::durable::launch::FEED_ARGUMENT)
+    {
+        std::process::exit(machine_service_core::durable::launch::feed_main());
+    }
     if let Err(message) = run(&arguments) {
         eprintln!("machine-service: {message}");
         std::process::exit(1);
