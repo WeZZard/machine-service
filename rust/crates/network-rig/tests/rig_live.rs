@@ -315,8 +315,12 @@ fn an_idle_connection_closes_at_the_default_100_s() {
     let end = quiet.wait_for_end(Duration::from_secs(130));
     let after = start.elapsed();
     assert!(matches!(end, Outcome::Closed | Outcome::Reset), "{end:?}");
+    // mitmproxy 12.3.1 times idleness with the wall clock (`time.time()`
+    // in its `TimeoutWatchdog`), this test with a monotonic one, so a clock
+    // adjustment on the runner moves the close by a fraction of a second:
+    // it closed at 99.97 s on a hosted macOS runner.
     assert!(
-        after >= Duration::from_secs(100) && after <= Duration::from_secs(102),
+        after >= Duration::from_secs(99) && after <= Duration::from_secs(102),
         "{after:?}"
     );
     assert_eq!(heartbeats.join().unwrap(), Outcome::Ok);
