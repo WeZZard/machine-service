@@ -359,7 +359,18 @@ impl RealTarget {
             agent,
         });
         let options = self.options(rig)?;
-        let client = RelayClient::connect(&options)?;
+        let mut client = RelayClient::connect(&options)?;
+        // A durable Mac's agent was up before the cell started its chain,
+        // and dials it again on its own backoff, at most 5 s (DC-327): it
+        // gets a minute to have its session before its absence counts.
+        if durable {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while client.ready.agent.is_none() && Instant::now() < deadline {
+                drop(client);
+                std::thread::sleep(Duration::from_secs(2));
+                client = RelayClient::connect(&options)?;
+            }
+        }
         let agent = client.ready.agent.clone();
         self.facts.insert("ready_agent".into(), json!(agent));
         let client = Arc::new(client);
