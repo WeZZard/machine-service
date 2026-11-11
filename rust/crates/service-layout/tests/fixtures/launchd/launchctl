@@ -22,7 +22,7 @@ bootstrap)
     plist="${3:?plist}"
     label=$("$plutil" -extract Label raw -o - "$plist" 2>/dev/null) || {
         echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
-    [ -e "$state/$label.pid" ] && { echo "Bootstrap failed: 37: Operation already in progress" >&2; exit 37; }
+    [ -e "$state/$label.label" ] && { echo "Bootstrap failed: 37: Operation already in progress" >&2; exit 37; }
     count=$("$plutil" -extract ProgramArguments raw -o - "$plist") || exit 5
     out=$("$plutil" -extract StandardOutPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
     err=$("$plutil" -extract StandardErrorPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
@@ -38,13 +38,22 @@ bootstrap)
     done
     : > "$state/$label.label"
     # A supervisor that, like launchd, belongs to no caller: it leaves the
-    # caller's session, gives the job its own process group, records its PID,
-    # waits for it, and records how it ended.
+    # caller's session, waits until this script is gone and reaped so that
+    # the job never descends from the caller, gives the job its own process
+    # group, records its PID, waits for it, and records how it ended.
     PIDF="$state/$label.pid" ENDF="$state/$label.end" ABANDON="$abandon" \
-    /usr/bin/perl -MPOSIX -e '
+    /usr/bin/perl -MPOSIX -MTime::HiRes=sleep -e '
         POSIX::setsid();
+        my $waited = 0;
+        while (getppid() != 1 && $waited < 10) { sleep(0.005); $waited += 0.005; }
         my $pid = fork();
-        if ($pid == 0) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; exit 127; }
+        if ($pid == 0) {
+            setpgrp(0, 0);
+            # A job gets its domain'"'"'s environment, not its caller'"'"'s.
+            my %keep = map { $_ => $ENV{$_} } grep { defined $ENV{$_} } qw(HOME USER LOGNAME SHELL TMPDIR);
+            %ENV = (%keep, PATH => "/usr/bin:/bin:/usr/sbin:/sbin");
+            exec { $ARGV[0] } @ARGV; exit 127;
+        }
         open(my $f, ">", $ENV{PIDF}); print $f $pid; close($f);
         waitpid($pid, 0);
         my $status = $?;
@@ -53,8 +62,6 @@ bootstrap)
         if ($status & 127) { print $e "signal " . ($status & 127); } else { print $e "exit " . ($status >> 8); }
         close($e);
     ' "$@" < "$in" > "$out" 2> "$err" &
-    i=0
-    while [ ! -s "$state/$label.pid" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done
     exit 0
     ;;
 print)
@@ -78,6 +85,9 @@ print)
 bootout)
     label=$(label_of "${2:?target}")
     [ -e "$state/$label.label" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+    # A job registered a moment ago may not have started yet.
+    i=0
+    while [ ! -s "$state/$label.pid" ] && [ ! -s "$state/$label.end" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done
     pid=$(cat "$state/$label.pid" 2>/dev/null)
     if [ -n "$pid" ] && [ ! -s "$state/$label.end" ]; then
         # With AbandonProcessGroup, bootout ends only the job's own process

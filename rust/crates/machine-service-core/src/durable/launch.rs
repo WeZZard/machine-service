@@ -1,39 +1,50 @@
-//! A durable lease's command through the relay agent (DM-4, RA-2, RA-8),
+//! A durable lease's command through the relay agent (DM-4, RA-2, RA-10),
 //! whatever its entry: machine-service's own HTTP exec, or a relay client's
 //! exec or script that the broker hands to this launcher (DC-219).
 //!
-//! The relay agent runs a command line in the desktop session as its own
-//! child, in a new process group, with the agent's environment and home.
-//! A lease's command needs more: the session environment of DM-4, which
-//! holds the loaded agent keys, the lease's working directory, and a record
-//! of its process group before it can start anything, so release can stop
-//! it and the sweep can find what it left (DM-7, HY-3).
+//! On macOS the relay agent runs a command as a launchd job of its own
+//! (RA-10), so the command's chain holds no process of ours, neither the
+//! agent nor machine-service (DC-308, DC-315). A lease's command needs
+//! more than the agent's own environment: the session environment of DM-4,
+//! which holds the loaded agent keys, the lease's working directory, and a
+//! record of its process group before it can start anything, so release can
+//! stop it and the sweep can find what it left (DM-7, HY-3).
 //!
-//! machine-service therefore writes a request into the lease's state folder
-//! (mode 600 in a mode-700 folder) and asks the relay agent to run
-//! `exec <machine-service> --durable-launch <request>`. The launcher is the
-//! daemon's own executable: it reads the request, records its process
-//! group with the leader's start time, and only then claims the request by
-//! removing it. A release withdraws every request first and reads the
-//! recorded groups after, so a command either is recorded before release
-//! stops the lease's groups or never starts (DC-220). The launcher
-//! then replaces itself with the lease's shell, so the command keeps the
-//! relay agent as its parent and the agent's responsibility for privacy
-//! permissions, and the agent sees its exit status and output as its own
-//! command's. When the lease has loaded agent keys, it runs the shell as its
-//! child instead and passes the output on with every key redacted, so no
-//! relay message and no record of the relay agent carries one
-//! (DC-221). The keys reach the command through its environment
-//! only, never through the relay protocol or a process's arguments (AK-5).
+//! machine-service therefore makes the job's folder and FIFOs in the lease's
+//! state folder, and asks the agent to run the job ([`Op::Job`]); the agent
+//! registers it and relays its output, and never sees its keys (DC-314).
+//! A feeder thread here writes the job's `env` in two stages:
+//!
+//! 1. The first names no key: the job's shell writes its PID, the leader
+//!    of the job's process group, to a file. The feeder records the group
+//!    with the leader's start time, and only then claims the execution by
+//!    removing its claim file. A release withdraws every claim first and
+//!    reads the recorded groups after, so a command either is recorded
+//!    before release stops the lease's groups or never starts (DC-220).
+//! 2. The second, after the claim, holds the environment, the working
+//!    directory and the command; a withdrawn execution gets `return 125`
+//!    instead, and runs nothing.
+//!
+//! When the lease has loaded agent keys, the job writes its output to the
+//! FIFO `raw` and its prelude's exit report to `exit`; the feeder passes the
+//! output on to `out` with every key redacted, and the report to `status`
+//! after the output it follows, so no relay message and no record of the
+//! relay agent carries a key (DC-221). The keys reach the command through
+//! its environment only, never through the relay protocol or a process's
+//! arguments (AK-5).
+//!
+//! [`Op::Job`]: relay_agent::protocol::Op::Job
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use guest_actions::launchd::{self, JobFiles};
+use relay_agent::protocol::JobRef;
 use serde_json::Value;
 
 use super::agents::Redactor;
@@ -41,37 +52,24 @@ use super::exec::Program;
 use super::process::{self, LeaseSession};
 use super::session_env::SessionEnv;
 
-/// The daemon's argument that runs the launcher.
-pub const ARGUMENT: &str = "--durable-launch";
-/// The lease state's folder of relay requests and process-group records.
+/// The lease state's folder of relay jobs and process-group records.
 pub const FOLDER: &str = "relay";
-/// The launcher's exit status when it cannot start the command; a shell
+/// The status a job ends with when it cannot start its command; a shell
 /// uses 126 and 127 for its own failures.
-pub const FAILED: i32 = 125;
+pub const FAILED: i32 = launchd::PRELUDE_FAILED;
+/// How long the feeder waits at most for the relay agent to start the job:
+/// a call's upload may come first, however slowly. A settled call removes
+/// the job's folder, which ends the wait sooner.
+pub const START_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long the feeder waits for the job's shell to report its PID.
+const PID_DEADLINE: Duration = Duration::from_secs(10);
 
-/// One command for the launcher.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Request {
-    /// `$SHELL -c <line>`; or `zsh -s` with `script` as standard input, or
-    /// with the launcher's own standard input when neither is set.
-    shell: String,
-    line: Option<String>,
-    script: Option<PathBuf>,
-    env: BTreeMap<String, String>,
-    cwd: PathBuf,
-    /// Where the launcher records its process group.
-    group: PathBuf,
-    /// The values the command's output never carries (AK-5).
-    #[serde(default)]
-    redact: Vec<String>,
-}
-
-/// What the launcher runs.
+/// What the job runs.
 #[derive(Debug, Clone, Copy)]
 pub enum Launch<'a> {
     /// A command line or a script, as machine-service's own exec has it.
     Program(&'a Program),
-    /// A script that arrives on the launcher's standard input, as the relay
+    /// A script that arrives on the job's standard input, as the relay
     /// agent feeds a client's script to the command it runs.
     ScriptOnInput,
 }
@@ -79,11 +77,12 @@ pub enum Launch<'a> {
 /// The files of one relay execution in a lease's state folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Files {
-    /// The request the launcher reads and removes.
-    pub request: PathBuf,
-    /// The script, when the command is one.
-    pub script: PathBuf,
-    /// The launcher's record of its process group.
+    /// The job's folder of FIFOs, which the relay agent removes.
+    pub job: PathBuf,
+    /// The claim, which the feeder removes before the command can start,
+    /// and a release removes to stop it from starting.
+    pub claim: PathBuf,
+    /// The record of the job's process group.
     pub group: PathBuf,
 }
 
@@ -93,25 +92,29 @@ pub fn files(lease_dir: &Path, execution: &str) -> Files {
     let key = service_layout::release::sha256_hex(execution.as_bytes());
     let folder = lease_dir.join(FOLDER);
     Files {
-        request: folder.join(format!("{key}.request.json")),
-        script: folder.join(format!("{key}.script")),
+        job: folder.join(format!("{}.job", &key[..32])),
+        claim: folder.join(format!("{key}.claim")),
         group: folder.join(format!("{key}.group.json")),
     }
 }
 
-fn private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let folder = path.parent().unwrap_or(Path::new("."));
+fn private_folder(folder: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(folder)
-        .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
+        .map_err(|error| format!("cannot create {}: {error}", folder.display()))
+}
+
+fn private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let folder = path.parent().unwrap_or(Path::new("."));
+    private_folder(folder)?;
     let temporary = folder.join(format!(
         ".{}.{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    let written = std::fs::OpenOptions::new()
+    let written = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -124,59 +127,372 @@ fn private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-/// Write the request for `launch` in the lease's `session`, and answer the
-/// command line the relay agent runs: the launcher of `launcher` on that
-/// request. The line names only the two paths.
+/// `bytes` in single quotes for a shell.
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The second stage's FIFO, the shell's PID file, and the redacted job's
+/// own output and exit report, in the job's folder.
+struct Extra {
+    env2: PathBuf,
+    pid: PathBuf,
+    exit: PathBuf,
+}
+
+impl Extra {
+    fn at(job: &JobFiles) -> Extra {
+        Extra {
+            env2: job.dir.join("env2"),
+            pid: job.dir.join("pid"),
+            exit: job.dir.join("exit"),
+        }
+    }
+}
+
+/// Make the job for `launch` in the lease's `session`, start the feeder
+/// that writes its environment, and answer what the relay agent needs to
+/// run it. `log` takes what the feeder has to say.
 pub fn prepare(
     files: &Files,
-    launcher: &Path,
     launch: Launch<'_>,
     session: &SessionEnv,
     cwd: &Path,
-) -> Result<String, String> {
-    // The launcher runs the shell the service resolved here, through its
-    // tool table (DC-254).
+    log: impl Fn(&str) + Send + 'static,
+) -> Result<JobRef, String> {
+    // The job runs the shell the service resolved here, through its tool
+    // table (DC-254).
     let zsh = || {
         service_layout::tools::path(service_layout::tools::Tool::Zsh)
             .map(|path| path.to_string_lossy().into_owned())
     };
-    let (shell, line, script) = match launch {
-        Launch::Program(Program::Line { shell, line }) => (
-            service_layout::tools::program(shell)?
-                .to_string_lossy()
-                .into_owned(),
-            Some(line.clone()),
-            None,
-        ),
-        Launch::Program(Program::Script(bytes)) => {
-            private_file(&files.script, bytes)?;
-            (zsh()?, None, Some(files.script.clone()))
-        }
-        Launch::ScriptOnInput => (zsh()?, None, None),
+    let folder = files.job.parent().unwrap_or(Path::new("."));
+    private_folder(folder)?;
+    let redacted = !session.secrets.is_empty();
+    // A folder that exists belongs to this execution's job, made by an
+    // earlier call with the same ID that may still run: it is the job
+    // this call names too, and it gets no second feeder.
+    let existing = || JobRef {
+        dir: files.job.to_string_lossy().into_owned(),
+        redacted,
     };
-    let request = Request {
-        shell,
-        line,
-        script,
-        env: session.vars.clone(),
-        cwd: cwd.to_path_buf(),
-        group: files.group.clone(),
-        redact: session
+    let job = match JobFiles::create(&files.job) {
+        Ok(job) => job,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(existing()),
+        Err(error) => return Err(format!("cannot create {}: {error}", files.job.display())),
+    };
+    let extra = Extra::at(&job);
+    let prepared = (|| {
+        launchd::make_fifo(&extra.env2).map_err(|error| error.to_string())?;
+        let (shell, command) = match launch {
+            Launch::Program(Program::Line { shell, line }) => (
+                service_layout::tools::program(shell)?
+                    .to_string_lossy()
+                    .into_owned(),
+                line.clone(),
+            ),
+            Launch::Program(Program::Script(bytes)) => {
+                let script = job.dir.join("script");
+                private_file(&script, bytes)?;
+                let zsh = zsh()?;
+                let line = format!(
+                    "exec {} -s < {}",
+                    quote(&zsh),
+                    quote(&script.to_string_lossy())
+                );
+                (zsh, line)
+            }
+            Launch::ScriptOnInput => {
+                let zsh = zsh()?;
+                let line = format!("exec {} -s", quote(&zsh));
+                (zsh, line)
+            }
+        };
+        let values: Vec<String> = session
             .secrets
             .iter()
             .map(|secret| secret.expose().to_string())
-            .collect(),
+            .collect();
+        let redactor = Redactor::new(&values);
+        // The redacted job's own output and report have their readers
+        // before the agent registers it, so launchd's open and the
+        // prelude's never block.
+        let redacted = if redactor.is_empty() {
+            None
+        } else {
+            launchd::make_fifo(&job.raw).map_err(|error| error.to_string())?;
+            launchd::make_fifo(&extra.exit).map_err(|error| error.to_string())?;
+            let raw = open_reader(&job.raw)?;
+            let exit = open_reader(&extra.exit)?;
+            Some((values, raw, exit))
+        };
+        private_file(&files.claim, b"")?;
+        let mut first = String::new();
+        if redacted.is_some() {
+            first.push_str(&format!(
+                "exec 9>{} || return 125\n",
+                quote(&extra.exit.to_string_lossy())
+            ));
+        }
+        first.push_str(&format!(
+            "printf '%s\\n' \"$$\" > {} || return 125\n\
+             eval \"$(/bin/cat {})\" || return 125\n",
+            quote(&extra.pid.to_string_lossy()),
+            quote(&extra.env2.to_string_lossy())
+        ));
+        let environment: Vec<(OsString, OsString)> = session
+            .vars
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        let second = launchd::env_script(&environment, cwd, Path::new(&shell), &command);
+        Ok::<_, String>((first, second, redacted))
+    })();
+    let (first, second, redacted) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            job.remove();
+            let _ = std::fs::remove_file(&files.claim);
+            return Err(error);
+        }
     };
-    let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    private_file(&files.request, &bytes)?;
-    Ok(format!(
-        "exec {} {ARGUMENT} {}",
-        crate::ssh::shell_quote(&launcher.to_string_lossy()),
-        crate::ssh::shell_quote(&files.request.to_string_lossy())
-    ))
+    let reference = JobRef {
+        dir: job.dir.to_string_lossy().into_owned(),
+        redacted: redacted.is_some(),
+    };
+    let feeder = Feeder {
+        files: files.clone(),
+        job,
+        extra,
+    };
+    std::thread::Builder::new()
+        .name("durable-job-feeder".into())
+        .spawn(move || {
+            if let Err(error) = feeder.feed(first.as_bytes(), &second, redacted) {
+                log(&format!(
+                    "WARN: durable job {}: {error}",
+                    feeder.job.dir.display()
+                ));
+            }
+        })
+        .map_err(|error| format!("cannot start the job's feeder: {error}"))?;
+    Ok(reference)
 }
 
-/// The process group a launcher recorded, once it has.
+fn open_reader(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))
+}
+
+struct Feeder {
+    files: Files,
+    job: JobFiles,
+    extra: Extra,
+}
+
+impl Feeder {
+    fn withdrawn(&self) -> bool {
+        !self.job.dir.exists()
+    }
+
+    fn feed(
+        &self,
+        first: &[u8],
+        second: &[u8],
+        redacted: Option<(Vec<String>, File, File)>,
+    ) -> Result<(), String> {
+        // Stage 1, once the agent has started the job.
+        self.write_fifo(&self.job.env, first, START_DEADLINE)
+            .map_err(|error| format!("the job never read its environment: {error}"))?;
+        let started = Instant::now();
+        let pid = loop {
+            let text = std::fs::read_to_string(&self.extra.pid).unwrap_or_default();
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                break pid;
+            }
+            if started.elapsed() > PID_DEADLINE || self.withdrawn() {
+                return Err("the job's shell never reported its PID".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // The record, then the claim (DC-220).
+        let recorded = process::process_info(pid)
+            .ok_or_else(|| format!("cannot read process group {pid}"))
+            .and_then(|leader| {
+                let record = LeaseSession {
+                    sid: pid,
+                    leader_start: leader.start,
+                    group: true,
+                };
+                let bytes =
+                    serde_json::to_vec(&record.to_json()).map_err(|error| error.to_string())?;
+                private_file(&self.files.group, &bytes)
+            });
+        let claimed = recorded.is_ok() && std::fs::remove_file(&self.files.claim).is_ok();
+        let stage = if claimed {
+            second
+        } else {
+            b"return 125\n".as_slice()
+        };
+        self.write_fifo(&self.extra.env2, stage, PID_DEADLINE)
+            .map_err(|error| format!("the job's shell never read its command: {error}"))?;
+        // A redacted job's report reaches the agent through here, also the
+        // launch failure of a job that runs nothing.
+        if let Some((values, raw, exit)) = redacted {
+            self.relay(&values, raw, exit)?;
+        }
+        recorded?;
+        if !claimed {
+            return Err("withdrawn before it started".into());
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` into the FIFO `path` once its reader opens it.
+    fn write_fifo(&self, path: &Path, bytes: &[u8], deadline: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let file = loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => break file,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    if started.elapsed() > deadline {
+                        return Err(format!("not opened within {} s", deadline.as_secs()));
+                    }
+                    if self.withdrawn() {
+                        return Err("withdrawn".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        self.write_all(&file, bytes)
+    }
+
+    /// Write `bytes` to the non-blocking `file`, waiting while it is full,
+    /// until the job's folder goes.
+    fn write_all(&self, file: &File, mut bytes: &[u8]) -> Result<(), String> {
+        let mut file = file;
+        while !bytes.is_empty() {
+            match file.write(bytes) {
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if self.withdrawn() {
+                        return Err("the job's folder went".into());
+                    }
+                    poll(&[(file.as_raw_fd(), libc::POLLOUT)], 200);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Pass the job's output on to `out` redacted, and the prelude's exit
+    /// report on to `status` after the output it follows, until the job's
+    /// folder goes or every writer has closed both.
+    fn relay(&self, values: &[String], mut raw: File, mut exit: File) -> Result<(), String> {
+        let open = |path: &Path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|error| format!("cannot open {}: {error}", path.display()))
+        };
+        let out = open(&self.job.out)?;
+        let status = open(&self.job.status)?;
+        let mut redactor = Redactor::new(values);
+        let mut buffer = vec![0u8; 64 << 10];
+        let mut report = Vec::new();
+        let (mut raw_open, mut exit_open) = (true, true);
+        while (raw_open || exit_open) && !self.withdrawn() {
+            let mut fds = Vec::new();
+            if raw_open {
+                fds.push((raw.as_raw_fd(), libc::POLLIN));
+            }
+            if exit_open {
+                fds.push((exit.as_raw_fd(), libc::POLLIN));
+            }
+            poll(&fds, 200);
+            if raw_open {
+                raw_open = self.pass(&mut raw, &mut buffer, &mut redactor, &out)?;
+            }
+            if exit_open {
+                match exit.read(&mut buffer) {
+                    Ok(0) => exit_open = false,
+                    Ok(count) => {
+                        report.extend_from_slice(&buffer[..count]);
+                        if report.contains(&b'\n') {
+                            // What the command wrote before it ended is in
+                            // `raw` by now: it goes first, whole.
+                            if raw_open {
+                                raw_open = self.pass(&mut raw, &mut buffer, &mut redactor, &out)?;
+                            }
+                            // The redactor's held tail goes before the
+                            // report; what the command left running is
+                            // redacted afresh after it.
+                            let ended = std::mem::replace(&mut redactor, Redactor::new(values));
+                            self.write_all(&out, &ended.finish())?;
+                            self.write_all(&status, &report)?;
+                            report.clear();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        self.write_all(&out, &redactor.finish())?;
+        Ok(())
+    }
+
+    /// Pass what `raw` holds now on to `out`; false once it has ended.
+    fn pass(
+        &self,
+        raw: &mut File,
+        buffer: &mut [u8],
+        redactor: &mut Redactor,
+        out: &File,
+    ) -> Result<bool, String> {
+        loop {
+            match raw.read(buffer) {
+                Ok(0) => return Ok(false),
+                Ok(count) => {
+                    let redacted = redactor.push(&buffer[..count]);
+                    self.write_all(out, &redacted)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+}
+
+fn poll(fds: &[(i32, i16)], timeout_ms: i32) {
+    let mut fds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&(fd, events)| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: `fds` is a valid array of `pollfd` of the length given.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+}
+
+/// The process group a job recorded, once it has.
 pub fn recorded_group(path: &Path) -> Option<LeaseSession> {
     let text = std::fs::read_to_string(path).ok()?;
     LeaseSession::from_json(&serde_json::from_str::<Value>(&text).ok()?)
@@ -198,162 +514,35 @@ pub fn recorded_groups(lease_dir: &Path) -> Vec<LeaseSession> {
         .collect()
 }
 
-/// Remove what one execution's launcher has not taken: its request and its
-/// script, never its process group's record, which release still needs.
+/// Remove what one settled execution left: its claim and its job's folder,
+/// never its process group's record, which release still needs.
 pub fn withdraw(files: &Files) {
-    let _ = std::fs::remove_file(&files.request);
-    let _ = std::fs::remove_file(&files.script);
+    let _ = std::fs::remove_file(&files.claim);
+    let _ = std::fs::remove_dir_all(&files.job);
 }
 
-/// Remove the requests no launcher has taken yet, so a command the relay
-/// agent starts after a release finds nothing to run (DM-7).
+/// Remove every claim no feeder has taken yet, so a job the relay agent
+/// starts after a release runs nothing (DM-7). The jobs' folders stay, so
+/// the jobs that run keep their output until release stops them.
 pub fn withdraw_requests(lease_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(lease_dir.join(FOLDER)) else {
         return;
     };
     for path in entries.flatten().map(|entry| entry.path()) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.ends_with(".request.json") || name.ends_with(".script") {
+        // `.request.json` and `.script` are what the launcher before RA-10
+        // left.
+        if name.ends_with(".claim") || name.ends_with(".request.json") || name.ends_with(".script")
+        {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// The launcher: run the request at `path`. It returns only when the
-/// command could not start, with the status to exit with.
-pub fn run(path: &Path) -> i32 {
-    match launch(path) {
-        Ok(never) => match never {},
-        Err(message) => {
-            eprintln!("machine-service: {message}");
-            FAILED
-        }
-    }
-}
-
-enum Never {}
-
-fn launch(path: &Path) -> Result<Never, String> {
-    let text = std::fs::read(path)
-        .map_err(|error| format!("no lease command at {}: {error}", path.display()))?;
-    let request: Request = serde_json::from_slice(&text)
-        .map_err(|error| format!("{} is not a lease command: {error}", path.display()))?;
-    // The script is opened before the claim, so a release that withdraws it
-    // after the claim cannot take it away from a command that may run.
-    let script = request
-        .script
-        .as_ref()
-        .map(|script| {
-            std::fs::File::open(script)
-                .map_err(|error| format!("cannot open {}: {error}", script.display()))
-        })
-        .transpose()?;
-    // SAFETY: `getpgrp` has no preconditions.
-    let group = unsafe { libc::getpgrp() };
-    let leader =
-        process::process_info(group).ok_or_else(|| format!("cannot read process group {group}"))?;
-    let record = LeaseSession {
-        sid: group,
-        leader_start: leader.start,
-        group: true,
-    };
-    let bytes = serde_json::to_vec(&record.to_json()).map_err(|error| error.to_string())?;
-    private_file(&request.group, &bytes)?;
-    // The claim: the request holds the session's keys and is removed before
-    // anything runs. A release that withdrew it first has the command start
-    // nothing (DC-220).
-    if let Err(error) = std::fs::remove_file(path) {
-        let _ = std::fs::remove_file(&request.group);
-        return Err(format!(
-            "the lease command at {} was withdrawn: {error}",
-            path.display()
-        ));
-    }
-    if let Some(script) = &request.script {
-        let _ = std::fs::remove_file(script);
-    }
-    let mut command = Command::new(&request.shell);
-    match (&request.line, script) {
-        (Some(line), _) => {
-            command.arg("-c").arg(line);
-        }
-        (None, Some(file)) => {
-            command.arg("-s").stdin(file);
-        }
-        (None, None) => {
-            command.arg("-s");
-        }
-    }
-    command
-        .env_clear()
-        .envs(&request.env)
-        .current_dir(&request.cwd);
-    let redactor = Redactor::new(&request.redact);
-    if redactor.is_empty() {
-        let error = command.exec();
-        return Err(format!("cannot start {}: {error}", request.shell));
-    }
-    supervise(command, redactor)
-}
-
-/// Run `command` as the launcher's child, in the launcher's process group,
-/// with its standard output and standard error on one pipe, and pass the
-/// output on redacted; then end as the command ended, with its exit status
-/// or its signal, so the relay agent sees what it would have seen of the
-/// command itself.
-fn supervise(mut command: Command, mut redactor: Redactor) -> Result<Never, String> {
-    let shell = command.get_program().to_string_lossy().to_string();
-    let (mut output, writer) = std::io::pipe().map_err(|error| error.to_string())?;
-    command
-        .stdout(writer.try_clone().map_err(|error| error.to_string())?)
-        .stderr(writer);
-    let spawned = command.spawn();
-    // The parent's copies of the pipe's write end go, so the read ends when
-    // the command's group closes it.
-    drop(command);
-    let mut child = spawned.map_err(|error| format!("cannot start {shell}: {error}"))?;
-    let mut out = std::io::stdout().lock();
-    let mut open = true;
-    let mut pass = |out: &mut std::io::StdoutLock<'_>, bytes: &[u8]| {
-        // A reader that went away takes nothing more; the command is still
-        // drained, so it never blocks on a full pipe.
-        if open && !bytes.is_empty() {
-            open = out.write_all(bytes).and_then(|_| out.flush()).is_ok();
-        }
-    };
-    let mut buffer = vec![0u8; 64 << 10];
-    loop {
-        match std::io::Read::read(&mut output, &mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                let redacted = redactor.push(&buffer[..count]);
-                pass(&mut out, &redacted);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    pass(&mut out, &redactor.finish());
-    drop(out);
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for {shell}: {error}"))?;
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(signal) = status.signal() {
-        // SAFETY: resetting a signal's disposition and signalling this
-        // process have no preconditions; the launcher has nothing to clean.
-        unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::kill(libc::getpid(), signal);
-        }
-        std::process::exit(128 + signal);
-    }
-    std::process::exit(status.code().unwrap_or(FAILED));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn session() -> SessionEnv {
         SessionEnv {
@@ -363,73 +552,55 @@ mod tests {
     }
 
     #[test]
-    fn a_request_is_private_and_names_the_launcher() {
+    fn a_job_is_private_and_its_reference_names_no_key() {
         let lease = tempfile::tempdir().unwrap();
         let files = files(lease.path(), "exec-1");
         let program = Program::Line {
             shell: "/bin/zsh".into(),
             line: "echo hi".into(),
         };
-        let line = prepare(
+        let job = prepare(
             &files,
-            Path::new("/opt/ms/machine-service"),
             Launch::Program(&program),
             &session(),
             lease.path(),
+            |_| {},
         )
         .unwrap();
-        assert!(
-            line.starts_with("exec /opt/ms/machine-service --durable-launch "),
-            "{line}"
-        );
-        assert!(
-            !line.contains("secret"),
-            "the keys are never in the command line"
-        );
+        assert!(job.redacted);
+        assert!(!job.dir.contains("secret"));
         use std::os::unix::fs::PermissionsExt;
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&files.request), 0o600);
-        assert_eq!(mode(files.request.parent().unwrap()), 0o700);
-        assert_ne!(files.request, super::files(lease.path(), "exec-2").request);
-        let request: Request =
-            serde_json::from_slice(&std::fs::read(&files.request).unwrap()).unwrap();
-        assert_eq!(request.redact, vec!["secret".to_string()]);
+        assert_eq!(mode(&files.job), 0o700);
+        assert_eq!(mode(files.job.parent().unwrap()), 0o700);
+        assert!(files.claim.exists());
+        assert_ne!(files.job, super::files(lease.path(), "exec-2").job);
         withdraw_requests(lease.path());
-        assert!(!files.request.exists());
+        assert!(!files.claim.exists());
+        assert!(files.job.exists());
+        withdraw(&files);
+        assert!(!files.job.exists());
     }
 
-    /// DC-219: a client's script names no file; the launcher's
-    /// shell reads it on standard input. One execution's leftovers are
-    /// withdrawn alone, and its group's record stays for release.
+    /// One execution's leftovers are withdrawn alone, and its group's
+    /// record stays for release.
     #[test]
-    fn a_script_on_input_and_one_executions_withdrawal() {
+    fn one_executions_withdrawal() {
         let lease = tempfile::tempdir().unwrap();
         let one = files(lease.path(), "exec-1");
         let two = files(lease.path(), "exec-2");
+        let plain = SessionEnv {
+            vars: BTreeMap::new(),
+            secrets: Vec::new(),
+        };
         for files in [&one, &two] {
-            prepare(
-                files,
-                Path::new("/opt/ms/machine-service"),
-                Launch::ScriptOnInput,
-                &session(),
-                lease.path(),
-            )
-            .unwrap();
+            let job = prepare(files, Launch::ScriptOnInput, &plain, lease.path(), |_| {}).unwrap();
+            assert!(!job.redacted);
         }
-        let request: Request =
-            serde_json::from_slice(&std::fs::read(&one.request).unwrap()).unwrap();
-        assert_eq!((request.line, request.script), (None, None));
         std::fs::write(&one.group, b"{}").unwrap();
         withdraw(&one);
-        assert!(!one.request.exists());
+        assert!(!one.job.exists() && !one.claim.exists());
         assert!(one.group.exists());
-        assert!(two.request.exists());
-    }
-
-    #[test]
-    fn a_missing_request_starts_nothing() {
-        let lease = tempfile::tempdir().unwrap();
-        assert_eq!(run(&lease.path().join("gone.request.json")), FAILED);
-        assert!(recorded_groups(lease.path()).is_empty());
+        assert!(two.job.exists() && two.claim.exists());
     }
 }

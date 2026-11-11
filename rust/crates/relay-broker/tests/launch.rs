@@ -190,3 +190,36 @@ fn a_failed_launch_refuses_the_call_uncommitted() {
     assert!(!ran.result.unwrap().replayed);
     drop(agent);
 }
+
+/// A job names files machine-service made and fed (RA-5, DM-4): a client
+/// never starts one, with or without a launcher, and nothing runs.
+#[test]
+fn a_client_cannot_start_a_job() {
+    let h = Harness::start(Options::default());
+    let a = lease(&h.broker, "vm-a");
+    let launcher = Arc::new(Marking::default());
+    h.broker.launch_through(&a.target, launcher.clone());
+    let agent = TestAgent::start(&h.url("ws"), &a.agent, None);
+    assert!(h.broker.wait_for_agent(&a.target, WAIT).is_some());
+    let client = TestClient::connect(&h.url("ws"), &a.client).unwrap();
+    let job = Op::Job {
+        job: relay_agent::protocol::JobRef {
+            dir: "/tmp/not-a-job".into(),
+            redacted: false,
+        },
+        stdin: false,
+        timeout_s: 60.0,
+    };
+    client.call(1, "j-1", job, b"");
+    match client.wait(1, WAIT).result.unwrap().outcome {
+        Outcome::Failed {
+            code, committed, ..
+        } => {
+            assert_eq!(code, "invalid_request");
+            assert!(!committed);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(launcher.launched.lock().unwrap().is_empty());
+    drop(agent);
+}

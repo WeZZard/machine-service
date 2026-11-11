@@ -718,6 +718,11 @@ impl Inner {
         let max_kept = self.config.max_kept_output;
         spec.lease = self.lease_of(&spec.target);
         let feeds = matches!(spec.feed, Feed::Client);
+        // A job names files another process made and wrote (RA-10, DM-4);
+        // only that process, never a client, asks for one.
+        if spec.launch && matches!(spec.op, Op::Job { .. }) {
+            return self.refused(spec, "invalid_request", "a client cannot start a job");
+        }
         let launcher = self
             .launcher_of(&spec.target)
             .filter(|_| spec.launch && matches!(spec.op, Op::Exec { .. } | Op::Script { .. }));

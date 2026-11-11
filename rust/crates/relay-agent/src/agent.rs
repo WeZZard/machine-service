@@ -718,7 +718,9 @@ impl Session {
             return self.refuse(call, &execution, "call_in_use", "the call number is in use");
         }
         let timeout = match &op {
-            Op::Exec { timeout_s, .. } | Op::Script { timeout_s } => *timeout_s,
+            Op::Exec { timeout_s, .. } | Op::Script { timeout_s } | Op::Job { timeout_s, .. } => {
+                *timeout_s
+            }
             _ => 1.0,
         };
         if !(timeout > 0.0 && timeout.is_finite()) {
@@ -1027,7 +1029,34 @@ impl Session {
                 let input = input
                     .filter(|_| stdin)
                     .map(|file| Box::new(file) as Box<dyn Read + Send>);
-                self.start_command(&mut state, &execution, kind, &command, input, timeout_s)
+                self.start_command(
+                    &mut state,
+                    &execution,
+                    kind,
+                    Run::Line(&command),
+                    input,
+                    timeout_s,
+                )
+            }
+            (
+                Op::Job {
+                    job,
+                    stdin,
+                    timeout_s,
+                },
+                Committed::Input(input),
+            ) => {
+                let input = input
+                    .filter(|_| stdin)
+                    .map(|file| Box::new(file) as Box<dyn Read + Send>);
+                self.start_command(
+                    &mut state,
+                    &execution,
+                    kind,
+                    Run::Job(&job),
+                    input,
+                    timeout_s,
+                )
             }
             (Op::Script { timeout_s }, Committed::Input(input)) => {
                 let command = guest_actions::script_command();
@@ -1035,7 +1064,14 @@ impl Session {
                     Some(file) => Box::new(file) as Box<dyn Read + Send>,
                     None => Box::new(std::io::empty()),
                 });
-                self.start_command(&mut state, &execution, kind, command, input, timeout_s)
+                self.start_command(
+                    &mut state,
+                    &execution,
+                    kind,
+                    Run::Line(command),
+                    input,
+                    timeout_s,
+                )
             }
             (Op::Write { .. }, Committed::File(sealed)) => {
                 let outcome = match sealed.rename() {
@@ -1184,11 +1220,23 @@ impl Session {
         state: &mut State,
         execution: &str,
         kind: OpKind,
-        command: &str,
+        run: Run<'_>,
         stdin: Option<Box<dyn Read + Send>>,
         timeout_s: f64,
     ) -> Known {
         let options = &self.inner.options;
+        let (command, job) = match run {
+            Run::Line(command) => (command, None),
+            Run::Job(job) => ("", Some(job)),
+        };
+        if job.is_some() && options.ownership != Ownership::Jobs {
+            let outcome = Outcome::failed(
+                "unsupported",
+                "this agent runs no launchd jobs, so it takes no job another process made",
+            );
+            let _ = state.store.complete(execution, outcome.clone());
+            return Known::Completed(kind, outcome);
+        }
         // The scope is named before the command starts, so the record names
         // it before anything can run in it; a group is known only once the
         // command has started, and is recorded at once (DC-139).
@@ -1230,17 +1278,31 @@ impl Session {
                         .map_err(std::io::Error::other)
                         .and_then(|launchd| {
                             let environment: Vec<_> = std::env::vars_os().collect();
+                            // A job another process made keeps its folder,
+                            // and that process writes its `env` (DM-4).
+                            let (dir, writer) = match job {
+                                Some(job) => (
+                                    std::path::PathBuf::from(&job.dir),
+                                    guest_actions::launchd::EnvWriter::Elsewhere {
+                                        redacted: job.redacted,
+                                    },
+                                ),
+                                None => (
+                                    state.store.job_dir(execution),
+                                    guest_actions::launchd::EnvWriter::Here {
+                                        environment: &environment,
+                                        cwd: &options.home,
+                                    },
+                                ),
+                            };
                             guest_actions::spawn_job(
                                 &launchd,
                                 label,
                                 &options.shell,
-                                &state.store.job_dir(execution),
+                                &dir,
                                 command,
                                 stdin.is_some(),
-                                guest_actions::launchd::EnvWriter::Here {
-                                    environment: &environment,
-                                    cwd: &options.home,
-                                },
+                                writer,
                             )
                         }),
                     None => guest_actions::spawn_shell_in(
@@ -1651,4 +1713,13 @@ pub fn reexec(executable: &std::path::Path) -> std::io::Error {
     std::process::Command::new(executable)
         .args(std::env::args_os().skip(1))
         .exec()
+}
+
+/// What a command call runs.
+#[derive(Clone, Copy)]
+enum Run<'a> {
+    /// A command line, in this agent's environment and home.
+    Line(&'a str),
+    /// A job whose files and environment another process made (RA-10).
+    Job(&'a crate::protocol::JobRef),
 }

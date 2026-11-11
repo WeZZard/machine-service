@@ -48,15 +48,18 @@ pub const PRELUDE_FAILED: i32 = 125;
 
 /// The script the job's shell runs: `$0` is the `env` FIFO and `$1` the
 /// `status` FIFO. It reports its group, sources `env`, runs the command as
-/// the shell's own child and reports its exit status.
-pub const PRELUDE: &str = r#"exec 3>"$1"
-printf 'group %s\n' "$$" >&3
-if ! eval "$(/bin/cat "$0")"; then printf 'exit 125\n' >&3; exit 125; fi
+/// the shell's own child and reports its exit status. The reports go to
+/// descriptor 9, which the command never inherits: the subshell closes it
+/// itself, because a redirection on the subshell would have the shell save
+/// it to a higher descriptor that the command keeps.
+pub const PRELUDE: &str = r#"exec 9>"$1"
+printf 'group %s\n' "$$" >&9
+if ! eval "$(/bin/cat "$0")"; then printf 'exit 125\n' >&9; exit 125; fi
 c=$RELAY_JOB_COMMAND s=$RELAY_JOB_SHELL n=$RELAY_JOB_NAME
 unset RELAY_JOB_COMMAND RELAY_JOB_SHELL RELAY_JOB_NAME
-(exec -a "$n" "$s" -c "$c" 3>&-)
+(exec 9>&-; exec -a "$n" "$s" -c "$c")
 r=$?
-printf 'exit %s\n' "$r" >&3
+printf 'exit %s\n' "$r" >&9
 exit "$r"
 "#;
 
@@ -178,6 +181,9 @@ pub struct JobFiles {
     pub out: PathBuf,
     /// The prelude's reports: `group <n>` and `exit <n>`.
     pub status: PathBuf,
+    /// The job's own output when another process redacts it into `out`
+    /// (DM-4); a FIFO only then.
+    pub raw: PathBuf,
     /// The job's plist.
     pub plist: PathBuf,
 }
@@ -188,12 +194,7 @@ impl JobFiles {
         std::fs::DirBuilder::new().mode(0o700).create(dir)?;
         let files = JobFiles::at(dir);
         for fifo in [&files.env, &files.input, &files.out, &files.status] {
-            let path = std::ffi::CString::new(fifo.as_os_str().as_bytes())
-                .map_err(|_| io::Error::other("a FIFO path holds a NUL byte"))?;
-            // SAFETY: `path` is a valid NUL-terminated string.
-            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            make_fifo(fifo)?;
         }
         Ok(files)
     }
@@ -206,6 +207,7 @@ impl JobFiles {
             input: dir.join("in"),
             out: dir.join("out"),
             status: dir.join("status"),
+            raw: dir.join("raw"),
             plist: dir.join("job.plist"),
         }
     }
@@ -216,8 +218,20 @@ impl JobFiles {
     }
 }
 
-/// The plist of a job that runs [`PRELUDE`] in `shell`.
-pub fn plist(label: &str, shell: &Path, files: &JobFiles, stdin: bool) -> Vec<u8> {
+/// Make the FIFO `path`, mode 600.
+pub fn make_fifo(path: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("a FIFO path holds a NUL byte"))?;
+    // SAFETY: `path` is a valid NUL-terminated string.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The plist of a job that runs [`PRELUDE`] in `shell`, its output going
+/// to `out`, which is `files.out` unless another process redacts it.
+pub fn plist(label: &str, shell: &Path, files: &JobFiles, stdin: bool, out: &Path) -> Vec<u8> {
     let arguments = [
         shell.as_os_str(),
         "-c".as_ref(),
@@ -243,7 +257,7 @@ pub fn plist(label: &str, shell: &Path, files: &JobFiles, stdin: bool) -> Vec<u8
         ));
     }
     body.push_str("</array>\n");
-    let out = xml(&files.out.to_string_lossy());
+    let out = xml(&out.to_string_lossy());
     body.push_str(&format!(
         "<key>StandardOutPath</key><string>{out}</string>\n\
          <key>StandardErrorPath</key><string>{out}</string>\n"
@@ -415,8 +429,13 @@ pub enum EnvWriter<'a> {
         cwd: &'a Path,
     },
     /// Another process that made the FIFOs, such as machine-service on a
-    /// durable Mac (DC-314), writes it; this side never sees it.
-    Elsewhere,
+    /// durable Mac (DC-314), writes it; this side never sees it. When
+    /// `redacted`, the job writes to `raw`, and that process writes the
+    /// redacted output to `out`.
+    Elsewhere {
+        /// Whether the job's output goes through `raw`.
+        redacted: bool,
+    },
 }
 
 /// Start `command` as the job `label`: make or take the FIFO set in `dir`,
@@ -433,7 +452,7 @@ pub fn start(
 ) -> io::Result<Job> {
     let files = match writer {
         EnvWriter::Here { .. } => JobFiles::create(dir)?,
-        EnvWriter::Elsewhere => JobFiles::at(dir),
+        EnvWriter::Elsewhere { .. } => JobFiles::at(dir),
     };
     let opened = (|| {
         let out = open_held(&files.out)?;
@@ -443,7 +462,11 @@ pub fn start(
         } else {
             None
         };
-        std::fs::write(&files.plist, plist(label, shell, &files, stdin))?;
+        let job_out = match writer {
+            EnvWriter::Elsewhere { redacted: true } => &files.raw,
+            _ => &files.out,
+        };
+        std::fs::write(&files.plist, plist(label, shell, &files, stdin, job_out))?;
         Ok::<_, io::Error>((out, status, input))
     })();
     let (out, status, input) = match opened {
@@ -668,6 +691,19 @@ mod tests {
         assert_eq!((exit.rc, exit.signal), (None, Some(15)), "{output}");
     }
 
+    /// The command holds no FIFO of its job beyond its standard streams,
+    /// so what it leaves running keeps none of them open.
+    #[test]
+    fn a_command_inherits_no_descriptor_of_its_job() {
+        let (exit, output, _) = run(
+            "/usr/sbin/lsof -p $$ -a -d 3-99 -F tn | /usr/bin/grep -c '^tFIFO' || true",
+            None,
+            Duration::from_secs(20),
+        );
+        assert_eq!(exit.rc, Some(0), "{output}");
+        assert_eq!(output.trim(), "0", "{output}");
+    }
+
     #[test]
     fn a_timeout_boots_the_job_out() {
         let (exit, _, took) = run("sleep 60", None, Duration::from_secs(1));
@@ -739,7 +775,10 @@ mod tests {
         crate::kill_group(child);
         // SAFETY: plain signal to the test's own leftover.
         unsafe { libc::kill(child, libc::SIGKILL) };
-        assert!(survived, "the background child {child} died with its command");
+        assert!(
+            survived,
+            "the background child {child} died with its command"
+        );
     }
 
     /// DC-316: stopping a running job kills its whole process group, which
@@ -756,9 +795,15 @@ mod tests {
             &label,
             Path::new("/bin/zsh"),
             &base.path().join("job"),
-            &format!("sleep 61 & echo $! > {}; sleep 62; wait", pid_file.display()),
+            &format!(
+                "sleep 61 & echo $! > {}; sleep 62; wait",
+                pid_file.display()
+            ),
             false,
-            EnvWriter::Here { environment: &environment, cwd: base.path() },
+            EnvWriter::Here {
+                environment: &environment,
+                cwd: base.path(),
+            },
         )
         .unwrap();
         assert!(spawned.group > 1, "the prelude reported no group");
@@ -769,8 +814,15 @@ mod tests {
         });
         let exit = spawned.supervise_from(None, Duration::from_secs(60), |_| true);
         stopper.join().unwrap();
-        let child: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-        assert!(wait_gone(child), "the background sleep {child} survived the stop");
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_gone(child),
+            "the background sleep {child} survived the stop"
+        );
         assert_eq!(exit.signal, Some(libc::SIGKILL), "{exit:?}");
     }
 

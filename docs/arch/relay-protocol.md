@@ -102,7 +102,7 @@ A client's `call` names no lease. On the agent's side of the broker, every `call
 
 `agent` in `ready` is `{"os":"macos","arch":"aarch64","build":"<sha256 of the agent executable>","protocol":3,"signing":{"kind":"adhoc"}}` when the lease's relay agent has a session, else `null`. `signing` is the agent's own code signature, from its hello; it is left out for an agent of an earlier protocol or one that cannot read its signature. A client ignores message names and fields it does not know.
 
-On a durable lease, the `call` the relay agent receives for a client's exec or script is an exec of machine-service's launcher, `exec <machine-service> --durable-launch <request>`, with the client's execution ID, `timeout_s` and upload; `stdin` is true for a script, whose upload the launcher's shell reads ([DM-4](durable-machine.md#dm-4-exec)). The relay agent runs it like any exec.
+On a durable lease, the `call` the relay agent receives for a client's exec or script is a `job` that names the job folder machine-service made, with the client's execution ID, `timeout_s` and upload; `stdin` is true for a script, whose upload the job's shell reads ([DM-4](durable-machine.md#dm-4-exec), [RA-5](relay-agent.md#ra-5-operations)). The relay agent runs it like an exec whose environment and command machine-service writes. A broker refuses a `job` from a client with `invalid_request`.
 
 On the agent's side, the broker sends `ready` too, right after the agent's `hello`, with its own `protocol` and `agent` set to `null`; each side speaks the lower of the agent's `hello.protocol` and the broker's. An agent of protocol 1 receives no `progress`, `resume` or `offset`, and the broker reports an upload's progress for it (RP-15).
 

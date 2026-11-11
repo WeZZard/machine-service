@@ -244,6 +244,17 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// A launchd job's files that another process made (RA-10, DM-4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRef {
+    /// The folder with the FIFOs `env`, `in`, `out` and `status`.
+    pub dir: String,
+    /// Whether the job writes its output to the FIFO `raw`, which the
+    /// other process redacts into `out`.
+    #[serde(default)]
+    pub redacted: bool,
+}
+
 /// The operations of RA-5.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,6 +274,22 @@ pub enum Op {
     /// `bash -s` on Linux. Chunks with the script follow, and an end.
     Script {
         /// Seconds before the script's process group is killed.
+        timeout_s: f64,
+    },
+    /// Run a command as a launchd job whose files another process made and
+    /// whose environment, working directory and command that process
+    /// writes, such as machine-service on a durable Mac (RA-10, DM-4). The
+    /// agent registers the job and relays its output; it never sees the
+    /// command's keys. Chunks with its standard input follow, possibly
+    /// none, and an end. Only machine-service's launcher sends it: a
+    /// broker refuses it from a client.
+    Job {
+        /// The job's files.
+        job: JobRef,
+        /// Whether the command reads the uploaded bytes on standard input;
+        /// otherwise it reads `/dev/null`.
+        stdin: bool,
+        /// Seconds before the job's process group is killed.
         timeout_s: f64,
     },
     /// Write a file atomically. Chunks with its bytes follow, and an end.
@@ -322,6 +349,7 @@ impl Op {
         match self {
             Op::Exec { .. } => OpKind::Exec,
             Op::Script { .. } => OpKind::Script,
+            Op::Job { .. } => OpKind::Exec,
             Op::Write { .. } => OpKind::Write,
             Op::Read { .. } => OpKind::Read,
             Op::WriteTree { .. } => OpKind::WriteTree,

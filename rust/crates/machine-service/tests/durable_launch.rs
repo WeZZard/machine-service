@@ -1,16 +1,14 @@
-//! TL-2: the durable launcher, `machine-service --durable-launch`, as the
-//! relay agent runs it: in a process group of its own, with standard output
-//! and standard error on one pipe (DM-4, DC-220, DC-221).
-
-mod common;
+//! TL-2: a durable lease's job as machine-service makes and feeds it, run
+//! as the relay agent runs it: a (fake) launchd job whose files another
+//! process made (RA-10, DM-4, DC-220, DC-221, DC-314).
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::sync::Once;
+use std::time::Duration;
 
-use common::DAEMON;
+use guest_actions::launchd::{label_for, EnvWriter, Launchd};
+use guest_actions::{spawn_job, Exit};
 use machine_service_core::durable::agents::Secret;
 use machine_service_core::durable::exec::Program;
 use machine_service_core::durable::launch::{self, Launch};
@@ -18,6 +16,21 @@ use machine_service_core::durable::session_env::SessionEnv;
 use serde_json::Value;
 
 const KEY: &str = "sk-fake-launch-key-0123456789abcdef";
+
+/// This test process's tool table: the read-only system tools and the
+/// fake `launchctl`, with the fake's state of its own.
+fn fake_launchd() -> Launchd {
+    static SETUP: Once = Once::new();
+    SETUP.call_once(|| {
+        let root = std::env::temp_dir().join(format!("ms-durable-launch-{}", std::process::id()));
+        let variables = service_layout::test_build::harness::fake_launchd(&root).unwrap();
+        for (name, value) in variables {
+            // SAFETY: set once, before any test here reads them.
+            unsafe { std::env::set_var(name, value) };
+        }
+    });
+    Launchd::resolve().unwrap()
+}
 
 fn session(keys: bool) -> SessionEnv {
     SessionEnv {
@@ -35,109 +48,167 @@ fn session(keys: bool) -> SessionEnv {
 
 fn line(text: &str) -> Program {
     Program::Line {
-        shell: "/bin/sh".into(),
+        shell: "/bin/zsh".into(),
         line: text.into(),
     }
 }
 
-/// Run the launcher on `execution`'s request as the relay agent would:
-/// `$SHELL -c <line>` in a new process group, output and errors combined.
-fn agent_runs(command: &str, input: &[u8]) -> (std::process::ExitStatus, Vec<u8>, i32) {
-    let (mut output, writer) = std::io::pipe().unwrap();
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(writer.try_clone().unwrap())
-        .stderr(writer)
-        .spawn()
-        .unwrap();
-    let group = child.id() as i32;
-    let mut stdin = child.stdin.take().unwrap();
-    let input = input.to_vec();
-    let feeding = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-    });
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut output, &mut bytes).unwrap();
-    let status = child.wait().unwrap();
-    feeding.join().unwrap();
-    (status, bytes, group)
-}
-
-fn prepared(
+/// Make `execution`'s job and run it as the relay agent would, with
+/// `input` on its standard input when given.
+fn run(
     lease: &Path,
     execution: &str,
     launch: Launch<'_>,
     keys: bool,
-) -> (launch::Files, String) {
+    input: Option<&[u8]>,
+    before: impl FnOnce(&launch::Files),
+) -> (Exit, String, i32, launch::Files) {
+    let launchd = fake_launchd();
     let files = launch::files(lease, execution);
-    let command =
-        launch::prepare(&files, Path::new(DAEMON), launch, &session(keys), lease).unwrap();
-    assert!(!command.contains(KEY), "{command}");
-    (files, command)
+    let job = launch::prepare(&files, launch, &session(keys), lease, |message| {
+        eprintln!("{message}")
+    })
+    .unwrap();
+    assert!(!job.dir.contains(KEY));
+    assert_eq!(job.redacted, keys);
+    before(&files);
+    let spawned = spawn_job(
+        &launchd,
+        &label_for("tl2", execution),
+        Path::new("/bin/zsh"),
+        Path::new(&job.dir),
+        "",
+        input.is_some(),
+        EnvWriter::Elsewhere {
+            redacted: job.redacted,
+        },
+    )
+    .unwrap();
+    let group = spawned.group;
+    let stdin = input.map(|bytes| Box::new(std::io::Cursor::new(bytes.to_vec())) as _);
+    let mut output = Vec::new();
+    let exit = spawned.supervise_from(stdin, Duration::from_secs(30), |bytes| {
+        output.extend_from_slice(bytes);
+        true
+    });
+    (exit, String::from_utf8(output).unwrap(), group, files)
 }
 
-/// DC-221: with loaded keys the launcher runs the shell as its
-/// child and passes the output on with every key redacted, also a key that
-/// the command writes in pieces; it ends with the command's exit status,
-/// or with its signal. Without keys it becomes the shell itself.
+/// DC-221: with loaded keys the job's output reaches the agent with every
+/// key redacted, also a key the command writes in pieces, and the agent
+/// sees the command's exit status after all of its output. Without keys
+/// the job writes to the agent directly. The command runs in the lease's
+/// working directory with the session's variables, and its group is
+/// recorded and its claim taken before it runs (DC-220).
 #[test]
-fn the_launcher_redacts_keys_and_ends_as_the_command_ended() {
+fn a_job_runs_in_the_session_with_its_keys_redacted() {
     let lease = tempfile::tempdir().unwrap();
     let lease = lease.path().canonicalize().unwrap();
     let (half, rest) = KEY.split_at(12);
     let program = line(&format!(
         "printf '%s' '{half}'; sleep 0.3; printf '%s\\n' '{rest}'; echo \"env=$ANTHROPIC_API_KEY\" >&2; pwd; exit 5"
     ));
-    let (files, command) = prepared(&lease, "split", Launch::Program(&program), true);
-    let (status, bytes, group) = agent_runs(&command, b"");
-    let text = String::from_utf8(bytes).unwrap();
-    assert_eq!(status.code(), Some(5), "{text}");
+    let (exit, text, group, files) = run(
+        &lease,
+        "split",
+        Launch::Program(&program),
+        true,
+        None,
+        |_| {},
+    );
+    assert_eq!(exit.rc, Some(5), "{text}");
     assert_eq!(
         text,
         format!("[redacted]\nenv=[redacted]\n{}\n", lease.display())
     );
-    assert!(!files.request.exists(), "the launcher claimed its request");
+    assert!(!files.claim.exists(), "the feeder took the claim");
     let recorded: Value = serde_json::from_slice(&std::fs::read(&files.group).unwrap()).unwrap();
     assert_eq!(recorded["sid"], group, "{recorded}");
     assert_eq!(recorded["group"], true);
 
-    // A signal that ends the command ends the launcher the same way.
-    let program = line("kill -TERM $$");
-    let (_, command) = prepared(&lease, "signal", Launch::Program(&program), true);
-    let (status, _, _) = agent_runs(&command, b"");
-    assert_eq!(status.signal(), Some(libc::SIGTERM));
-
     // A client's script arrives on standard input.
-    let (_, command) = prepared(&lease, "script", Launch::ScriptOnInput, true);
-    let (status, bytes, _) = agent_runs(&command, b"echo \"script $ANTHROPIC_API_KEY\"\nexit 3\n");
-    assert_eq!(status.code(), Some(3));
-    assert_eq!(String::from_utf8(bytes).unwrap(), "script [redacted]\n");
+    let (exit, text, _, _) = run(
+        &lease,
+        "script",
+        Launch::ScriptOnInput,
+        true,
+        Some(b"echo \"script $ANTHROPIC_API_KEY\"\nexit 3\n"),
+        |_| {},
+    );
+    assert_eq!(exit.rc, Some(3), "{text}");
+    assert_eq!(text, "script [redacted]\n");
 
-    // Without keys to redact the launcher is the shell itself.
-    let program = line("echo $$; exit 4");
-    let (_, command) = prepared(&lease, "plain", Launch::Program(&program), false);
-    let (status, bytes, group) = agent_runs(&command, b"");
-    assert_eq!(status.code(), Some(4));
-    assert_eq!(String::from_utf8(bytes).unwrap().trim(), group.to_string());
+    // A script machine-service's own exec has.
+    let script = Program::Script(b"echo \"own $ANTHROPIC_API_KEY\"\n".to_vec());
+    let (exit, text, _, _) = run(&lease, "own", Launch::Program(&script), true, None, |_| {});
+    assert_eq!(exit.rc, Some(0), "{text}");
+    assert_eq!(text, "own [redacted]\n");
+
+    // Without keys to redact, the job writes to the agent itself.
+    // The command's shell is in the job's group, which its prelude leads.
+    let program = line("/bin/ps -o pgid= -p $$; exit 4");
+    let (exit, text, group, _) = run(
+        &lease,
+        "plain",
+        Launch::Program(&program),
+        false,
+        None,
+        |_| {},
+    );
+    assert_eq!(exit.rc, Some(4));
+    assert_eq!(text.trim(), group.to_string());
 }
 
-/// DC-220: a request a release withdrew before the launcher took
-/// it starts nothing, and leaves no process group's record behind.
+/// DC-220: a job a release withdrew before its feeder took the claim runs
+/// nothing: its shell ends with the launch failure, and its group, recorded
+/// first, is one a release may stop.
 #[test]
-fn a_withdrawn_request_starts_nothing() {
+fn a_withdrawn_job_runs_nothing() {
     let lease = tempfile::tempdir().unwrap();
     let lease = lease.path().canonicalize().unwrap();
     let marker = lease.join("ran");
     let program = line(&format!("touch {}", marker.display()));
-    let (files, command) = prepared(&lease, "withdrawn", Launch::Program(&program), true);
-    launch::withdraw_requests(&lease);
-    let (status, bytes, _) = agent_runs(&command, b"");
-    assert_eq!(status.code(), Some(launch::FAILED));
-    assert!(String::from_utf8_lossy(&bytes).contains("no lease command"));
+    let (exit, text, _, files) = run(
+        &lease,
+        "withdrawn",
+        Launch::Program(&program),
+        true,
+        None,
+        |_| launch::withdraw_requests(&lease),
+    );
+    assert_eq!(exit.rc, Some(launch::FAILED), "{text}");
     assert!(!marker.exists());
-    assert!(!files.group.exists());
-    assert!(launch::recorded_groups(&lease).is_empty());
+    assert!(!files.claim.exists());
+}
+
+/// A second call with the same execution ID while the first's job lives
+/// names the same job and starts no second feeder, so the first job still
+/// gets its command, its redacted output and its exit status.
+#[test]
+fn a_repeated_execution_names_the_same_job() {
+    let lease = tempfile::tempdir().unwrap();
+    let lease = lease.path().canonicalize().unwrap();
+    let program = line("echo \"once $ANTHROPIC_API_KEY\"; exit 6");
+    let (exit, text, _, files) = run(
+        &lease,
+        "again",
+        Launch::Program(&program),
+        true,
+        None,
+        |files| {
+            let again = launch::prepare(
+                files,
+                Launch::Program(&line("echo twice")),
+                &session(true),
+                &lease,
+                |message| eprintln!("{message}"),
+            )
+            .unwrap();
+            assert_eq!(Path::new(&again.dir), files.job.as_path());
+            assert!(again.redacted);
+        },
+    );
+    assert_eq!(exit.rc, Some(6), "{text}");
+    assert_eq!(text, "once [redacted]\n");
+    assert!(!files.claim.exists());
 }

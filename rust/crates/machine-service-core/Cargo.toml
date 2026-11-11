@@ -29,6 +29,7 @@ guest-firewall = { path = "../guest-firewall" }
 application-catalog = { path = "../application-catalog" }
 console = { path = "../console" }
 guest-session = { path = "../guest-session" }
+guest-actions = { path = "../guest-actions" }
 relay-agent = { path = "../relay-agent" }
 relay-broker = { path = "../relay-broker" }
 remote-session = { path = "../remote-session" }

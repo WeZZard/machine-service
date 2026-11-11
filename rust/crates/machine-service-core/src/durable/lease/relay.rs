@@ -5,19 +5,19 @@
 //! Each call chooses its link: the relay agent when this instance runs the
 //! broker, the agent has a session, and its build is the installed
 //! release's (DC-140); otherwise the in-session path, and the answer says
-//! why. A command through the relay agent is started by the launcher of
-//! [`super::super::launch`], which records its process group before the
-//! release gate is let go, so release stops it and the sweep finds what it
-//! left exactly as for an in-session command (DM-7, HY-3).
+//! why. A command through the relay agent is a launchd job the agent runs
+//! and [`super::super::launch`] feeds, which records its process group
+//! before the release gate is let go, so release stops it and the sweep
+//! finds what it left exactly as for an in-session command (DM-7, HY-3).
 //!
-//! A relay client's exec and script on the lease start through the same
-//! launcher: the broker hands each to [`LeaseLauncher`], which writes the
-//! lease's request as machine-service's own exec does, so a command sees the
-//! lease's working directory, variables and agent keys whatever its entry,
-//! and none of them travels in the relay protocol (DC-219).
+//! A relay client's exec and script on the lease start the same way: the
+//! broker hands each to [`LeaseLauncher`], which makes the lease's job as
+//! machine-service's own exec does, so a command sees the lease's working
+//! directory, variables and agent keys whatever its entry, and none of them
+//! travels in the relay protocol (DC-219, DC-314).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Weak};
@@ -51,8 +51,6 @@ pub struct DurableRelay {
     /// The SHA-256 of the installed release's macOS relay agent, or why
     /// there is none (DC-140).
     pub expected_build: Result<String, String>,
-    /// The launcher: the daemon's own executable.
-    pub launcher: PathBuf,
     /// How long a call waits for an agent without a session (RP-8).
     pub agent_wait: Duration,
     /// How long release waits for the agent to confirm the purge of the
@@ -171,6 +169,12 @@ fn failure(outcome: &Outcome) -> String {
 }
 
 impl DurableMachine {
+    /// Where a job's feeder writes what it has to say: the daemon's log.
+    fn feeder_log(&self) -> impl Fn(&str) + Send + 'static {
+        let file = self.config.log_file.clone();
+        move |message: &str| super::log_to_file(&file, message)
+    }
+
     /// Attach this instance's broker, once (M4). A lease that is current
     /// across a restart is bound again; its calls may have reached the
     /// agent before the restart, so its release purges (DM-8, DC-173).
@@ -436,19 +440,19 @@ impl DurableMachine {
         let execution =
             crate::relay::execution_of(body).map_err(|e| Reply::error(409, e.message))?;
         let files = launch::files(&self.config.lease_dir(lease_id), &execution);
-        let command = launch::prepare(
+        let job = launch::prepare(
             &files,
-            &relay.launcher,
             Launch::Program(&request.program),
             &runtime.env,
             &request.cwd,
+            self.feeder_log(),
         )
         .map_err(|error| Reply::error(409, error))?;
         let events = relay.broker.submit(
             &relay.target,
             &execution,
-            Op::Exec {
-                command,
+            Op::Job {
+                job,
                 stdin: false,
                 timeout_s: timeout as f64,
             },
@@ -482,7 +486,7 @@ impl DurableMachine {
     /// feeds it. Under the release gate, like any start, so a release
     /// withdraws what this writes (DM-7).
     fn launch_client_call(&self, lease: &str, execution: &str, op: &Op) -> Result<Op, String> {
-        let relay = self.relay.get().ok_or("this instance runs no broker")?;
+        self.relay.get().ok_or("this instance runs no broker")?;
         let _gate = self
             .gate
             .read()
@@ -500,9 +504,9 @@ impl DurableMachine {
         let cwd = exec::resolve_cwd(&self.config.workspace(lease).join("work"), None)?;
         let files = launch::files(&self.config.lease_dir(lease), execution);
         let launched = |launch: Launch<'_>, stdin: bool, timeout_s: f64| {
-            launch::prepare(&files, &relay.launcher, launch, &runtime.env, &cwd).map(|command| {
-                Op::Exec {
-                    command,
+            launch::prepare(&files, launch, &runtime.env, &cwd, self.feeder_log()).map(|job| {
+                Op::Job {
+                    job,
                     stdin,
                     timeout_s,
                 }

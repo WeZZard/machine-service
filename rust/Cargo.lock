@@ -755,6 +755,7 @@ dependencies = [
  "console",
  "control-only",
  "environment",
+ "guest-actions",
  "guest-firewall",
  "guest-session",
  "lease-keys",
