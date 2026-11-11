@@ -89,7 +89,9 @@ relay=$(curl -fsS -m 20 "$instance/health" | json 'd["relay_url"]' | sed -E 's#^
 names="$names $relay"
 hosts=""
 for name in $(printf '%s\n' $names | sort -u); do
-    address=$(dscacheutil -q host -a name "$name" | awk '/^ip_address:/ {print $2; exit}')
+    # A name of this host resolves to loopback first, which in the VM is
+    # the VM itself: the first address that is not loopback is the one.
+    address=$(dscacheutil -q host -a name "$name" | awk '/^ip_address:/ && $2 !~ /^127\./ {print $2; exit}')
     [ -n "$address" ] || { echo "cannot resolve $name here" >&2; exit 1; }
     hosts="$hosts$address $name\n"
 done
@@ -102,11 +104,21 @@ for arg in "$@"; do
     quoted="$quoted '$(printf %s "$arg" | sed "s/'/'\\\\''/g")'"
 done
 
-exec_script "$vm" "chmod +x ~/relay-acceptance; printf '$hosts' | sudo -n tee -a /etc/hosts >/dev/null; \
+# The run's command line goes into a file of its own, so an argument with
+# spaces or quotes, such as a --host-shell, reaches the client whole: quoting
+# it once more inside another quoted command would split it.
+run_script=$(mktemp)
+printf '#!/bin/sh\nexec "$HOME/relay-acceptance" run%s --evidence "$HOME/evidence" > "$HOME/evidence/run.log" 2>&1\n' "$quoted" > "$run_script"
+run_sha=$(shasum -a 256 "$run_script" | cut -d' ' -f1)
+curl -fsS -m 60 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=acc-run.sh" \
+    -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $run_sha" --data-binary "@$run_script" >/dev/null
+rm -f "$run_script"
+started=$(exec_script "$vm" "chmod +x ~/relay-acceptance; printf '$hosts' | sudo -n tee -a /etc/hosts >/dev/null; \
 mkdir -p ~/evidence ~/rig-cache; systemd-run --user --unit relay-acceptance-run --collect \
 --setenv=NETWORK_RIG_CACHE=\$HOME/rig-cache \
 --setenv=RELAY_ACCEPTANCE_LONG_MINUTES=\${RELAY_ACCEPTANCE_LONG_MINUTES:-30} \
-sh -c 'exec ~/relay-acceptance run$quoted --evidence ~/evidence > ~/evidence/run.log 2>&1'; echo started" >/dev/null
+/bin/sh \$HOME/acc-run.sh && echo started" | json 'd.get("output","")')
+case "$started" in *started*) ;; *) echo "the run did not start in $vm: $started" >&2; exit 1 ;; esac
 echo "running $cell under $profile in $vm"
 
 # Only an answer from the VM ends the wait: a poll that does not reach it,
