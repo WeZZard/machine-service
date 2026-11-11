@@ -52,6 +52,12 @@ bootstrap)
             # A job gets its domain'"'"'s environment, not its caller'"'"'s.
             my %keep = map { $_ => $ENV{$_} } grep { defined $ENV{$_} } qw(HOME USER LOGNAME SHELL TMPDIR);
             %ENV = (%keep, PATH => "/usr/bin:/bin:/usr/sbin:/sbin");
+            # launchd hands a job no descriptor above 2: what the caller
+            # left open moves out of the way, so the job may use any low
+            # descriptor and a test still sees what it inherited.
+            for my $fd (3 .. 19) {
+                if (defined POSIX::dup2($fd, $fd + 100)) { POSIX::close($fd); }
+            }
             exec { $ARGV[0] } @ARGV; exit 127;
         }
         open(my $f, ">", $ENV{PIDF}); print $f $pid; close($f);

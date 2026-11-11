@@ -154,11 +154,19 @@ fn is_own_fork(row: &Row, own: i32) -> bool {
 /// `kill`, which `exec` does not tell apart, ended another test's child.
 /// In this order, a process judged not a copy is judged on what it holds
 /// after that.
+///
+/// The lifeline counts under any descriptor, not only the one it was handed
+/// under: a program may move it, as a launchd job's prelude that opens its
+/// own report descriptor does under the fake launchctl (RA-10), and what
+/// such a job leaves running holds it nowhere else.
 fn holds(row: &Row, own: i32, fd: i32, handle: u64) -> bool {
-    row.pid != own
-        && !is_own_fork(row, own)
-        && pipe_handle(row.pid, fd) == Some(handle)
-        && !pipe_ends(row.pid, fd).is_some_and(|(_, write)| holds_anywhere(row.pid, write))
+    if row.pid == own || is_own_fork(row, own) {
+        return false;
+    }
+    let reads = pipe_handle(row.pid, fd) == Some(handle) || holds_anywhere(row.pid, handle);
+    // The write end is the test's own: a process that holds it is the test.
+    let write = pipe_ends(own, fd).map(|(_, write)| write);
+    reads && !write.is_some_and(|write| holds_anywhere(row.pid, write))
 }
 
 /// One process's row.
