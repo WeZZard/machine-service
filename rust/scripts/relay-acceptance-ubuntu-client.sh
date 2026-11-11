@@ -87,11 +87,13 @@ done
 names=$(printf %s "$instance" | sed -E 's#^[a-z]+://##; s#[:/].*$##')
 relay=$(curl -fsS -m 20 "$instance/health" | json 'd["relay_url"]' | sed -E 's#^wss?://##; s#[:/].*$##')
 names="$names $relay"
+bridges=$(ifconfig 2>/dev/null | awk '/^bridge/ {b=1; next} /^[a-z]/ {b=0} b && /inet / {printf "%s ", $2}')
 hosts=""
 for name in $(printf '%s\n' $names | sort -u); do
-    # A name of this host resolves to loopback first, which in the VM is
-    # the VM itself: the first address that is not loopback is the one.
-    address=$(dscacheutil -q host -a name "$name" | awk '/^ip_address:/ && $2 !~ /^127\./ {print $2; exit}')
+    # A name of this host resolves to loopback and to its VM bridges too, in
+    # an order that changes; in the VM the first is the VM itself and the
+    # others are no listener's. The first address that is neither is the one.
+    address=$(dscacheutil -q host -a name "$name" | awk -v skip="$bridges" '/^ip_address:/ && $2 !~ /^127\./ && index(" " skip " ", " " $2 " ") == 0 {print $2; exit}')
     [ -n "$address" ] || { echo "cannot resolve $name here" >&2; exit 1; }
     hosts="$hosts$address $name\n"
 done
