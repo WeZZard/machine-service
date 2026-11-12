@@ -662,6 +662,119 @@ fn poll(fds: &[(i32, i16)], timeout_ms: i32) {
     unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
 }
 
+/// A job this process registered itself, when no relay agent is there to
+/// (RA-8, DC-318): the same job and feeder as the relay agent's, so the
+/// command is never this process's child either (DC-315).
+pub struct LocalJob {
+    files: Files,
+    spawned: guest_actions::Spawned,
+}
+
+/// How long a local job's start waits for its group's record.
+const RECORD_WAIT: Duration = Duration::from_secs(30);
+
+/// Make `execution`'s job for `launch` and register it in this user's GUI
+/// domain, its feeder a process of `executable`; answer once its group is
+/// recorded, so a release that starts after this returns finds it (DC-220).
+pub fn start_local(
+    files: &Files,
+    launch: Launch<'_>,
+    session: &SessionEnv,
+    cwd: &Path,
+    executable: &Path,
+    log: &Path,
+    agent: &str,
+) -> Result<LocalJob, String> {
+    let launchd = launchd::Launchd::resolve()?;
+    let shell = service_layout::tools::path(service_layout::tools::Tool::Zsh)?;
+    let job = prepare(
+        files,
+        launch,
+        session,
+        cwd,
+        FeedBy::Process { executable, log },
+    )?;
+    let key = files
+        .job
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = launchd::label_for(agent, &key);
+    let spawned = guest_actions::spawn_job(
+        &launchd,
+        &label,
+        &shell,
+        Path::new(&job.dir),
+        "",
+        false,
+        launchd::EnvWriter::Elsewhere {
+            redacted: job.redacted,
+        },
+    )
+    .map_err(|error| {
+        withdraw(files);
+        format!("cannot start the job: {error}")
+    })?;
+    let deadline = Instant::now() + RECORD_WAIT;
+    while !files.group.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(LocalJob {
+        files: files.clone(),
+        spawned,
+    })
+}
+
+impl LocalJob {
+    /// Wait for the job: its output, its end, the deadline, or `cancel`,
+    /// which a release sets; then remove what it left of its files.
+    pub fn wait(
+        self,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> super::exec::Outcome {
+        use std::sync::atomic::Ordering;
+        let killer = self.spawned.killer();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A release preempts the job: the watcher stops it, as the deadline
+        // would.
+        std::thread::scope(|scope| {
+            let (stopped, finished) = (cancelled.clone(), done.clone());
+            scope.spawn(move || {
+                while !finished.load(Ordering::SeqCst) {
+                    if cancel.load(Ordering::SeqCst) {
+                        stopped.store(true, Ordering::SeqCst);
+                        killer.kill();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let mut output = Vec::new();
+            let exit = self.spawned.supervise_from(None, timeout, |bytes| {
+                output.extend_from_slice(bytes);
+                true
+            });
+            done.store(true, Ordering::SeqCst);
+            withdraw(&self.files);
+            // A release sets `cancel` and stops the lease's groups itself, so
+            // the job may end before the watcher sees the flag: the flag
+            // decides.
+            if cancelled.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
+                super::exec::Outcome::Cancelled
+            } else if exit.timed_out {
+                super::exec::Outcome::TimedOut
+            } else {
+                super::exec::Outcome::Exited {
+                    rc: exit.rc.unwrap_or(-1),
+                    output: String::from_utf8_lossy(&output).into_owned(),
+                }
+            }
+        })
+    }
+}
+
 /// The process group a job recorded, once it has.
 pub fn recorded_group(path: &Path) -> Option<LeaseSession> {
     let text = std::fs::read_to_string(path).ok()?;

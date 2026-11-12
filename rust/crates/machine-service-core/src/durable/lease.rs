@@ -115,6 +115,14 @@ pub struct DurableMachine {
     retry: Mutex<relay::Retry>,
 }
 
+/// How the in-session fallback runs a command.
+enum Fallback {
+    /// As a process session of this service, where there is no launchd.
+    Session(exec::Running),
+    /// As a launchd job of its own (DC-318).
+    Job(super::launch::LocalJob),
+}
+
 impl DurableMachine {
     /// A durable machine for `config`.
     pub fn new(config: DurableConfig) -> Result<Self, String> {
@@ -887,15 +895,30 @@ impl DurableMachine {
                 }
                 Err(reason) => reason,
             };
-            let started = exec::start(&request, self.config.uid, |session| {
-                self.append_session(&lease_id, session)
-            });
+            // On macOS the command is a launchd job of its own here too,
+            // never this service's child (RA-8, DC-318).
+            let started = if cfg!(target_os = "macos") {
+                self.start_local_job(&lease_id, &request, &runtime)
+                    .map(Fallback::Job)
+            } else {
+                exec::start(&request, self.config.uid, |session| {
+                    self.append_session(&lease_id, session)
+                })
+                .map(Fallback::Session)
+            };
             match started {
                 Ok(running) => (running, runtime, reason),
                 Err(error) => return Reply::error(409, error),
             }
         };
-        match running.wait(&runtime.cancel) {
+        let waited = match running {
+            Fallback::Session(running) => running.wait(&runtime.cancel),
+            Fallback::Job(job) => Ok(job.wait(
+                std::time::Duration::from_secs(timeout as u64),
+                &runtime.cancel,
+            )),
+        };
+        match waited {
             Ok(Outcome::Exited { rc, output }) => {
                 let redacted = agents::redact(&output, &runtime.env.secrets);
                 Reply::ok(json!({
@@ -917,6 +940,36 @@ impl DurableMachine {
             }
             Err(error) => Reply::error(409, error),
         }
+    }
+
+    /// Register `request` as a launchd job of the lease, fed and recorded as
+    /// a relay agent's would be (RA-8, DC-318).
+    fn start_local_job(
+        &self,
+        lease_id: &str,
+        request: &exec::Request<'_>,
+        runtime: &Runtime,
+    ) -> Result<super::launch::LocalJob, String> {
+        let execution = uuid::Uuid::new_v4().to_string();
+        let files = super::launch::files(&self.config.lease_dir(lease_id), &execution);
+        let executable = std::env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|error| format!("cannot find this service's executable: {error}"))?;
+        let agent = format!(
+            "ms{}",
+            &service_layout::release::sha256_hex(
+                self.config.state_dir.to_string_lossy().as_bytes()
+            )[..10]
+        );
+        super::launch::start_local(
+            &files,
+            super::launch::Launch::Program(&request.program),
+            &runtime.env,
+            &request.cwd,
+            &executable,
+            &self.config.log_file,
+            &agent,
+        )
     }
 
     // ------------------------------------------------------------ transfers

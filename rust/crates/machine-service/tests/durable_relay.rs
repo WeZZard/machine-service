@@ -887,6 +887,18 @@ fn m4_without_the_release_agent_exec_falls_back_to_the_session() {
         .as_str()
         .unwrap()
         .contains("no session"));
+    // DC-318: without an agent the command is still a launchd job of its
+    // own, never the service's descendant.
+    let chain = lab.exec(
+        &name,
+        json!({"lease_id": lease, "script": "p=$PPID; while [ \"$p\" -gt 1 ]; do ps -o comm= -p \"$p\"; p=$(ps -o ppid= -p \"$p\" | tr -d ' '); [ -n \"$p\" ] || break; done"}),
+    );
+    assert_eq!(chain.status, 200, "{}", chain.body);
+    let ancestors = chain.body["output"].as_str().unwrap().to_string();
+    assert!(
+        !ancestors.contains("machine-service"),
+        "the command descends from the service: {ancestors}"
+    );
     let released = lab.release_lease(&name, &lease);
     assert_eq!(released.status, 200);
     // DC-173: no call reached a relay agent, so there is nothing to purge.
