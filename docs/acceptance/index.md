@@ -92,4 +92,4 @@ Each scenario names the [test layer](../arch/test-layers.md) that runs it. Stori
 13. AC-67: An expired session still reports its operations (US37, TL-7).
 14. AC-68: The client finds the broker by name (US38, TL-7).
 15. AC-69: A silent action survives the edge's idle close (US38, TL-7).
-16. AC-70: The link is the smallest part of an action's time (US37, TL-7).
+16. AC-70: Speed is measured, and the protocol adds no round trip of its own (US37, TL-7).

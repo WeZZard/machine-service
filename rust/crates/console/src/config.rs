@@ -491,10 +491,16 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-            let home = std::env::var("HOME").expect("HOME is set for tests");
+            // A temporary folder of the test's own, never under `HOME`
+            // (DC-257).
+            // Resolved, since the trust check refuses a linked parent such
+            // as macOS's `/var`.
+            let temp = std::env::temp_dir()
+                .canonicalize()
+                .expect("temporary folder");
             let dir = tempfile::Builder::new()
                 .prefix(".console-test-")
-                .tempdir_in(&home)
+                .tempdir_in(temp)
                 .expect("temporary directory");
             let root = dir.path().to_path_buf();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();

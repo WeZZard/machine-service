@@ -42,6 +42,7 @@
 
 - The link may add up to 1 second of round-trip latency, with jitter, and may limit bandwidth.
 - Timeouts are sized for that link, and no protocol step depends on a fast round trip.
+- A proxy on the way may queue deeply and carry both directions of a connection through one queue, so what one side sends may wait behind what the other side sent before it. A sender bounds what it holds in flight, so its own queue never outlasts the dead-connection bound ([RS-4](remote-session.md#rs-4-heartbeat-and-dead-connection-detection)).
 
 ## TC-8: A message may be limited in size
 

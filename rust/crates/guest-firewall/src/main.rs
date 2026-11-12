@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use guest_firewall::{
-    anchor_rules, daemon_plist, parse_anchor_table, parse_table, Line, ANCHOR, ANCHOR_FILE,
-    DAEMON_PLIST, DEFAULT_TABLE_FILE, LABEL,
+    anchor_rules, daemon_plist, parse_anchor_broker_port, parse_anchor_table, parse_table, Line,
+    ANCHOR, ANCHOR_FILE, DAEMON_PLIST, DEFAULT_BROKER_PORT, DEFAULT_TABLE_FILE, LABEL,
 };
 
 #[derive(Parser, Debug)]
@@ -34,6 +34,8 @@ enum Action {
         /// defaults to the user that ran sudo.
         #[arg(long)]
         owner: Option<u32>,
+        #[command(flatten)]
+        broker: Broker,
     },
     /// Unload the anchor and remove its file and LaunchDaemon (root). pf stays enabled.
     Remove,
@@ -42,20 +44,44 @@ enum Action {
         /// The table file every machine-service instance on this host writes.
         #[arg(long, default_value = DEFAULT_TABLE_FILE)]
         table: PathBuf,
+        #[command(flatten)]
+        broker: Broker,
     },
     /// Report what is installed, without root.
     Status,
 }
 
+/// The one host port the guests may reach (DC-107).
+#[derive(clap::Args, Debug)]
+struct Broker {
+    /// The broker's port, machine-service's session listener, that internet
+    /// guests may reach on this host (DC-107).
+    #[arg(long, default_value_t = DEFAULT_BROKER_PORT)]
+    broker_port: u16,
+    /// Let internet guests reach no port of this host, not even the broker's.
+    #[arg(long, conflicts_with = "broker_port")]
+    no_broker: bool,
+}
+
+impl Broker {
+    fn port(&self) -> Option<u16> {
+        (!self.no_broker).then_some(self.broker_port)
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Action::Install { table, owner } => install(&table, owner),
+        Action::Install {
+            table,
+            owner,
+            broker,
+        } => install(&table, owner, broker.port()),
         Action::Remove => remove(),
-        Action::Print { table } => {
+        Action::Print { table, broker } => {
             print!(
                 "# {ANCHOR_FILE}\n{}\n# {DAEMON_PLIST}\n{}",
-                anchor_rules(&table),
+                anchor_rules(&table, broker.port()),
                 daemon_plist(&table)
             );
             Ok(())
@@ -82,7 +108,7 @@ fn require_root(action: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn install(table: &Path, owner: Option<u32>) -> Result<(), String> {
+fn install(table: &Path, owner: Option<u32>, broker_port: Option<u16>) -> Result<(), String> {
     require_root("install")?;
     if !table.is_absolute() {
         return Err(format!("--table must be absolute: {}", table.display()));
@@ -90,7 +116,7 @@ fn install(table: &Path, owner: Option<u32>) -> Result<(), String> {
     let (uid, gid) = owner_ids(owner)?;
     prepare_table(table, uid, gid)?;
 
-    let rules = anchor_rules(table);
+    let rules = anchor_rules(table, broker_port);
     let candidate = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
     std::fs::write(candidate.path(), &rules).map_err(|error| error.to_string())?;
     run(
@@ -117,8 +143,9 @@ fn install(table: &Path, owner: Option<u32>) -> Result<(), String> {
             .unwrap_or(false);
         if loaded.contains("block drop in quick") && enabled {
             println!(
-                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}",
-                table.display()
+                "installed: pf is enabled and anchor {ANCHOR} drops new connections to this host from the guests in {}, and limits the egress guests of {} (DC-267)",
+                table.display(),
+                guest_firewall::EgressFiles::beside(table).guests.display()
             );
             println!("{}", loaded.trim_end());
             return Ok(());
@@ -179,6 +206,18 @@ fn prepare_table(table: &Path, uid: u32, gid: u32) -> Result<(), String> {
     chown(table, uid, gid)?;
     std::fs::set_permissions(table, std::fs::Permissions::from_mode(0o644))
         .map_err(|error| error.to_string())?;
+    // The egress section's files (DC-267): pf refuses an anchor whose
+    // table file is missing, so each exists, empty until it is written.
+    let egress = guest_firewall::EgressFiles::beside(table);
+    for file in egress.all() {
+        if !file.exists() {
+            guest_firewall::write_addresses(file, &[], &[])
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+        }
+        chown(file, uid, gid)?;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -213,19 +252,34 @@ fn remove() -> Result<(), String> {
 
 fn status() -> Result<(), String> {
     let table = match std::fs::read_to_string(ANCHOR_FILE) {
-        Ok(text) => match parse_anchor_table(&text) {
-            Some(table) => {
-                println!(
-                    "anchor file: {ANCHOR_FILE} (table file {})",
-                    table.display()
-                );
-                Some(table)
+        Ok(text) => {
+            match parse_anchor_table(&text) {
+                Some(table) => {
+                    println!(
+                        "anchor file: {ANCHOR_FILE} (table file {})",
+                        table.display()
+                    );
+                    match guest_firewall::parse_anchor_egress(&text) {
+                    Some(files) => println!(
+                        "egress section: guests {}, allow {}, lab {} (DC-267)",
+                        files.guests.display(),
+                        files.allow.display(),
+                        files.lab.display()
+                    ),
+                    None => println!("egress section: none; egress leases are refused (reinstall for DC-267)"),
+                }
+                    match parse_anchor_broker_port(&text) {
+                    Some(port) => println!("broker port internet guests may reach: {port} (DC-107)"),
+                    None => println!("broker port: none; internet guests reach no host port (reinstall for DC-107)"),
+                }
+                    Some(table)
+                }
+                None => {
+                    println!("anchor file: {ANCHOR_FILE} (no table file; reinstall it)");
+                    None
+                }
             }
-            None => {
-                println!("anchor file: {ANCHOR_FILE} (no table file; reinstall it)");
-                None
-            }
-        },
+        }
         Err(_) => {
             println!("anchor file: missing ({ANCHOR_FILE})");
             None

@@ -8,18 +8,46 @@ use crate::error::{OpError, OpResult};
 use crate::host::Host;
 use crate::ssh::shell_quote;
 
-/// The default credential pack name.
+/// The default credential pack name: the agent pack, for VMs of agent runs.
 pub const DEFAULT_PACK: &str = "default";
+
+/// The pack of the lab's ephemeral runner VMs: a separate folder, empty
+/// unless a CI need is added on purpose, and never the agent pack (DC-283).
+pub const CI_PACK: &str = "ci";
+
+/// Whether `name` is a pack's plain folder name: letters, digits, `.`, `_`
+/// and `-`, not starting with `.`, so it never names a folder outside the
+/// packs' folder.
+pub fn valid_pack_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// Resolve an env pack name to its directory, or `None` for `none`.
 pub fn pack_dir(home: &Path, name: &str) -> OpResult<Option<PathBuf>> {
+    pack_dir_in(&home.join(".config/vm-credentials"), name)
+}
+
+/// Resolve an env pack name to its directory under `packs`, or `None` for
+/// `none`. A named pack that is not there is a refusal, never another pack:
+/// a request for `ci` on a host without it is refused, not served with
+/// `default` (DC-283).
+pub fn pack_dir_in(packs: &Path, name: &str) -> OpResult<Option<PathBuf>> {
     if name.is_empty() || name == "none" {
         return Ok(None);
     }
-    let path = home.join(".config/vm-credentials").join(name);
+    if !valid_pack_name(name) {
+        return Err(OpError::new(format!(
+            "credential pack name {name:?} is not a plain folder name"
+        )));
+    }
+    let path = packs.join(name);
     if !path.is_dir() {
         return Err(OpError::new(format!(
-            "credential pack not found: {}",
+            "credential pack not found: {}; no other pack is used in its place",
             path.display()
         )));
     }
@@ -214,3 +242,46 @@ fi
 if [[ -f home.tgz ]]; then tar -xzf home.tgz -C "$HOME"; fi
 cd /; rm -rf /tmp/pack
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_named_pack_is_refused_and_never_replaced_by_default() {
+        let folder = tempfile::tempdir().unwrap();
+        let packs = folder.path();
+        std::fs::create_dir_all(packs.join(DEFAULT_PACK)).unwrap();
+        let error = pack_dir_in(packs, CI_PACK).unwrap_err().to_string();
+        assert!(error.contains("credential pack not found"), "{error}");
+        assert!(error.contains("no other pack"), "{error}");
+        std::fs::create_dir_all(packs.join(CI_PACK)).unwrap();
+        assert_eq!(
+            pack_dir_in(packs, CI_PACK).unwrap(),
+            Some(packs.join(CI_PACK))
+        );
+        assert_eq!(pack_dir_in(packs, "none").unwrap(), None);
+        assert_eq!(pack_dir_in(packs, "").unwrap(), None);
+    }
+
+    #[test]
+    fn a_pack_name_never_leaves_the_packs_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let packs = folder.path().join("vm-credentials");
+        std::fs::create_dir_all(packs.join(DEFAULT_PACK)).unwrap();
+        for name in [
+            "../vm-credentials/default",
+            "/etc",
+            "..",
+            ".hidden",
+            "a/b",
+            "ci ",
+        ] {
+            let error = pack_dir_in(&packs, name).unwrap_err().to_string();
+            assert!(error.contains("not a plain folder name"), "{name}: {error}");
+        }
+        for name in ["default", "ci", "agent_2", "v1.2-x"] {
+            assert!(valid_pack_name(name), "{name}");
+        }
+    }
+}

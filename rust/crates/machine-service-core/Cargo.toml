@@ -8,7 +8,18 @@ publish.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# The test seam of `launchd`: a test's own launchctl instead of /bin/launchctl
+# (DC-242). Only dev-dependencies enable it, so only `cargo test`
+# builds it into a binary; a release build never carries it.
+test-launchd = []
+# Every test seam of a test build (DC-251): the launchctl one above,
+# and `service_layout::test_build`'s guard, tool table, process seams and
+# lifeline. Only dev-dependencies enable it.
+test-build = ["test-launchd", "service-layout/test-build"]
+
 [dependencies]
+byte-transfer = { path = "../byte-transfer" }
 lease-keys = { path = "../lease-keys" }
 service-layout = { path = "../service-layout" }
 environment = { path = "../environment" }
@@ -18,6 +29,11 @@ guest-firewall = { path = "../guest-firewall" }
 application-catalog = { path = "../application-catalog" }
 console = { path = "../console" }
 guest-session = { path = "../guest-session" }
+guest-actions = { path = "../guest-actions" }
+relay-agent = { path = "../relay-agent" }
+relay-broker = { path = "../relay-broker" }
+remote-session = { path = "../remote-session" }
+second-instance = { path = "../second-instance" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

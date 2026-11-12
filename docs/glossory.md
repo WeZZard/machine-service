@@ -11,7 +11,7 @@
 - **Remote session:** a client link carried over one WebSocket connection, which can be resumed on a new connection after the old one breaks.
 - **Resume:** reattaching a new connection to an existing remote session. Each side resends the messages the other side has not acknowledged.
 - **Grace period:** how long vm-service keeps a disconnected remote session, its unacknowledged messages and its running operations, waiting for the client to resume.
-- **Heartbeat:** WebSocket ping and pong frames sent on an idle connection, so that a silently dead connection is detected within a bound.
+- **Heartbeat:** a message sent on an idle connection, so that a silently dead connection is detected within a bound; the remote session's is its own `ack` message, not a WebSocket ping (DC-110).
 - **Execution ID:** a client-chosen identifier for one operation. vm-service runs an operation with a given execution ID at most once.
 - **At most once:** an operation either ran once or did not run. It is never run a second time because a link failed.
 - **Uncertain:** the outcome reported when a link failed after an operation was sent and before its result arrived. The caller must not resend the operation; it can query the outcome by execution ID.

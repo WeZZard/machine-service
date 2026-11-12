@@ -5,10 +5,10 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::{free_port, run_machctl, try_http, LegacyFixture, DAEMON};
+use common::{free_port, run_machctl, try_http, LegacyFixture};
 use serde_json::json;
 
 /// AC-36: machine-service started with `VM_SERVICE_PORT` set refuses to
@@ -17,13 +17,14 @@ use serde_json::json;
 fn ac36_daemon_refuses_an_old_variable() {
     let fixture = LegacyFixture::new();
     let port = free_port();
-    let mut command = Command::new(DAEMON);
+    let err = fixture.root.join("daemon.err");
+    let mut command = common::daemon_command(&fixture.root);
     command
         .envs(fixture.env())
         .env("MACHINE_SERVICE_PORT", port.to_string())
         .env("VM_SERVICE_PORT", "6290")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err).expect("stderr file"));
     let mut child = command.spawn().expect("spawn machine-service");
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -32,14 +33,11 @@ fn ac36_daemon_refuses_an_old_variable() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             panic!("machine-service kept running with VM_SERVICE_PORT set");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let output = child.wait_with_output().expect("output");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::fs::read_to_string(&err).unwrap_or_default();
 
     assert!(!status.success());
     assert!(

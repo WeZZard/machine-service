@@ -546,7 +546,7 @@ fn an_unknown_guest_link_refuses_to_start() {
     assert!(error.contains("daemon exited early"), "{error}");
     assert!(
         error.contains(
-            r#"MACHINE_SERVICE_GUEST_LINK must be one of ssh, ssh-session; got "tart-session""#
+            r#"MACHINE_SERVICE_GUEST_LINK must be one of ssh, ssh-session, relay; got "tart-session""#
         ),
         "{error}"
     );

@@ -7,14 +7,22 @@
 use crate::Found;
 use std::time::Duration;
 
-/// Advertise on every interface, or only on this Mac (for tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where an advertisement goes and where a browse looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Every interface: the network.
     Network,
     /// This Mac only, never sent on any network (`LocalOnly`).
     LocalOnly,
+    /// A test build's folder, which stands for DNS-SD: an advertisement is
+    /// a file in it, found at loopback, and nothing reaches mDNSResponder
+    /// (DC-252).
+    #[cfg(feature = "test-build")]
+    Folder(std::path::PathBuf),
 }
+
+/// The variable that names a test build's DNS-SD folder.
+pub const TEST_VARIABLE: &str = "MACHINE_SERVICE_TEST_BONJOUR";
 
 impl Scope {
     /// Parse the discovery scope. Network discovery is the default; TL-2
@@ -29,8 +37,22 @@ impl Scope {
         }
     }
 
-    /// Read the common daemon/client test isolation setting (TL-2).
+    /// Read the scope a binary advertises and browses in. A test build's
+    /// is always the folder [`TEST_VARIABLE`] names, and without one it has
+    /// none: no binary the default suite starts reaches DNS-SD
+    /// (DC-252). The opt-in live layer reads the setting as a release
+    /// does.
     pub fn from_environment() -> Result<Self, String> {
+        #[cfg(feature = "test-build")]
+        if !service_layout::test_build::is_live() {
+            return service_layout::test_build::seam(TEST_VARIABLE)
+                .map(Scope::Folder)
+                .ok_or_else(|| {
+                    format!(
+                        "this is a test build, which advertises and browses only in the folder {TEST_VARIABLE} names"
+                    )
+                });
+        }
         match std::env::var("MACHINE_SERVICE_DISCOVERY_SCOPE") {
             Ok(value) => Self::parse(&value),
             Err(std::env::VarError::NotPresent) => Ok(Self::Network),
@@ -38,6 +60,26 @@ impl Scope {
                 Err("MACHINE_SERVICE_DISCOVERY_SCOPE is not valid UTF-8".into())
             }
         }
+    }
+
+    /// Whether what it advertises is found at loopback, so an instance
+    /// bound to loopback may advertise in it.
+    pub fn is_loopback(&self) -> bool {
+        #[cfg(feature = "test-build")]
+        if let Scope::Folder(_) = self {
+            return true;
+        }
+        false
+    }
+
+    /// A test build never sends an advertisement or a browse on the network.
+    fn check(&self) -> Result<(), String> {
+        if service_layout::test_build::is_isolated() && *self == Scope::Network {
+            return Err(
+                "this is a test build, which never advertises or browses on the network".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -47,9 +89,28 @@ pub struct Advertisement {
     /// when another service on the network already holds it.
     pub name: String,
     /// Held for its `Drop`, which withdraws the advertisement.
+    #[allow(dead_code)]
+    held: Held,
+}
+
+enum Held {
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
-    reference: mac::Ref,
+    Mac(mac::Ref),
+    #[cfg(feature = "test-build")]
+    File(std::path::PathBuf),
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    Nothing,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        #[cfg(feature = "test-build")]
+        if let Held::File(path) = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl std::fmt::Debug for Advertisement {
@@ -70,11 +131,20 @@ pub fn register(
     scope: Scope,
     timeout: Duration,
 ) -> Result<Advertisement, String> {
+    scope.check()?;
+    #[cfg(feature = "test-build")]
+    if let Scope::Folder(folder) = &scope {
+        let _ = timeout;
+        return folder::register(folder, name, service_type, port, txt);
+    }
     #[cfg(target_os = "macos")]
     {
         let record = crate::encode_txt(txt)?;
         let (reference, name) = mac::register(name, service_type, port, &record, scope, timeout)?;
-        Ok(Advertisement { name, reference })
+        Ok(Advertisement {
+            name,
+            held: Held::Mac(reference),
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -91,6 +161,12 @@ pub fn browse(
     window: Duration,
     resolve: Duration,
 ) -> Result<Vec<Found>, String> {
+    scope.check()?;
+    #[cfg(feature = "test-build")]
+    if let Scope::Folder(folder) = &scope {
+        let _ = resolve;
+        return Ok(folder::browse(folder, service_type, window));
+    }
     #[cfg(target_os = "macos")]
     {
         mac::browse(service_type, scope, window, resolve)
@@ -99,6 +175,89 @@ pub fn browse(
     {
         let _ = (service_type, scope, window, resolve);
         Err("Bonjour browsing needs macOS's DNS-SD service".to_string())
+    }
+}
+
+/// A test build's DNS-SD: one JSON file per advertisement, found at
+/// loopback. A browse gathers for its whole window, as DNS-SD's does.
+#[cfg(feature = "test-build")]
+mod folder {
+    use super::{Advertisement, Held};
+    use crate::Found;
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn file_name(service_type: &str, name: &str) -> String {
+        let safe: String = format!("{service_type}.{name}")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("{safe}.advertisement")
+    }
+
+    pub fn register(
+        folder: &Path,
+        name: &str,
+        service_type: &str,
+        port: u16,
+        txt: &[(String, String)],
+    ) -> Result<Advertisement, String> {
+        std::fs::create_dir_all(folder)
+            .map_err(|error| format!("{}: {error}", folder.display()))?;
+        let mut lines = vec![name.to_string(), service_type.to_string(), port.to_string()];
+        lines.extend(txt.iter().map(|(key, value)| format!("{key}={value}")));
+        let path = folder.join(file_name(service_type, name));
+        let staged = path.with_extension("staged");
+        std::fs::write(&staged, lines.join("\n")).map_err(|error| error.to_string())?;
+        std::fs::rename(&staged, &path).map_err(|error| error.to_string())?;
+        Ok(Advertisement {
+            name: name.to_string(),
+            held: Held::File(path),
+        })
+    }
+
+    pub fn browse(folder: &Path, service_type: &str, window: Duration) -> Vec<Found> {
+        std::thread::sleep(window);
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            return Vec::new();
+        };
+        let mut found: Vec<Found> = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|e| e == "advertisement")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| {
+                let mut lines = text.split('\n');
+                let name = lines.next()?.to_string();
+                (lines.next()? == service_type).then_some(())?;
+                let port = lines.next()?.parse().ok()?;
+                let txt = lines
+                    .map(|line| {
+                        let (key, value) = line.split_once('=').unwrap_or((line, ""));
+                        (key.to_ascii_lowercase(), value.to_string())
+                    })
+                    .collect();
+                Some(Found {
+                    name,
+                    host: "localhost.".to_string(),
+                    address: Some(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                    txt,
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        found
     }
 }
 
@@ -225,8 +384,8 @@ mod mac {
 
     fn interface(scope: Scope) -> u32 {
         match scope {
-            Scope::Network => INTERFACE_ANY,
             Scope::LocalOnly => INTERFACE_LOCAL_ONLY,
+            _ => INTERFACE_ANY,
         }
     }
 
@@ -633,5 +792,45 @@ mod tests {
         )
         .expect("browse after withdrawal");
         assert!(after.iter().all(|found| found.name != name), "{after:?}");
+    }
+
+    /// A test build's folder stands for DNS-SD: an advertisement is found
+    /// at loopback with its TXT record and is gone once withdrawn; the
+    /// network scope is refused.
+    #[cfg(feature = "test-build")]
+    #[test]
+    fn a_test_build_advertises_only_in_its_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let scope = Scope::Folder(folder.path().to_path_buf());
+        assert!(scope.is_loopback());
+        let txt = crate::txt_entries("Mac-T", "host-id", &["durable"]);
+        let advertisement = register(
+            "Mac-T",
+            "_t._tcp",
+            46241,
+            &txt,
+            scope.clone(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let found = browse("_t._tcp", scope.clone(), Duration::ZERO, Duration::ZERO).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].base_url(), "http://127.0.0.1:46241");
+        assert_eq!(found[0].machine_id(), Some("host-id"));
+        assert!(
+            browse("_other._tcp", scope.clone(), Duration::ZERO, Duration::ZERO)
+                .unwrap()
+                .is_empty()
+        );
+        drop(advertisement);
+        assert!(browse("_t._tcp", scope, Duration::ZERO, Duration::ZERO)
+            .unwrap()
+            .is_empty());
+        for refused in [
+            register("x", "_t._tcp", 1, &[], Scope::Network, Duration::ZERO).map(|_| ()),
+            browse("_t._tcp", Scope::Network, Duration::ZERO, Duration::ZERO).map(|_| ()),
+        ] {
+            assert!(refused.unwrap_err().contains("test build"));
+        }
     }
 }

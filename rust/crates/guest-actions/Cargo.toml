@@ -1,0 +1,19 @@
+[package]
+name = "guest-actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+sha2.workspace = true
+serde.workspace = true
+byte-transfer = { path = "../byte-transfer" }
+service-layout = { path = "../service-layout" }
+
+[dev-dependencies]
+# A test build runs launchctl only from its own tool table (DC-254).
+service-layout = { path = "../service-layout", features = ["test-build"] }
+tempfile.workspace = true
+serde_json.workspace = true

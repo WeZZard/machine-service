@@ -7,7 +7,7 @@ Feature: Actions through the relay agent and the broker
     Given a lease whose relay agent has registered with the broker
     When the client runs an action on a macOS target
     Then the action reads a test item from the login keychain without unlocking it
-    And the action drives Finder with osascript without a consent dialog and without a TCC grant for sshd-keygen-wrapper
+    And the action's process is not a descendant of the relay agent, so it holds none of the agent's privacy permissions
     And the action captures the screen through cua-driver
     When the client runs an action on an Ubuntu target
     Then the action sees the desktop session's display and session bus
@@ -21,6 +21,9 @@ Feature: Actions through the relay agent and the broker
     Then the printed hash matches the sent bytes
     When a command that starts child processes exceeds its timeout or is cancelled
     Then every process of its process group has exited
+    When the lease is a durable machine's and the client runs a script that prints the lease's working directory, variables and agent keys' SHA-256
+    Then it prints exactly what the same script prints through machine-service's HTTP exec of the lease
+    And every loaded agent key appears in its environment only as [redacted]
 
   @AC-57 @TL-7 @N0 @N1 @N2 @N3
   Scenario: Large output arrives whole
@@ -44,6 +47,7 @@ Feature: Actions through the relay agent and the broker
     Then the lease reaches running only after its relay agent has registered within its bound
     When the client releases the lease
     Then the broker refuses the lease credential and the agent credential
+    And on a durable Mac the agent credential, which is the machine's, keeps its session
 
   @AC-61 @TL-7 @N1 @N2 @N3
   Scenario: A connection cut during an action does not run it twice
@@ -78,10 +82,15 @@ Feature: Actions through the relay agent and the broker
     When the guest reboots
     Then the relay agent registers again from the desktop session without a manual step
     And AC-55 passes again
+    When the target is a durable Mac, which is never rebooted
+    Then its relay agent's LaunchAgent job is started afresh as a new desktop session starts it
+    And the relay agent registers again without a manual step
+    And AC-55 passes again
 
   @AC-66 @TL-7 @N0 @N1 @N2 @N3
   Scenario: Credentials and ports are guarded
     Then the broker refuses a missing, wrong, expired or released credential
+    And a lease's credential is accepted until the end of its TTL plus its grace bounded by its TTL, and refused after it
     And the target has no listening port that the relay agent opened
     And every hop of the chain runs TLS
     And the credentials work when a proxy ends TLS on the way
@@ -106,7 +115,8 @@ Feature: Actions through the relay agent and the broker
     And the client receives the exit status
 
   @AC-70 @TL-7 @N0 @N2
-  Scenario: The link is the smallest part of an action's time
+  Scenario: Speed is measured, and the protocol adds no round trip of its own
     When the client runs 100 short actions
     Then the suite records the time each action spent in the link and in the guest
-    And it reports the median and the 95th percentile for each cell
+    And it reports the median and the 95th percentile for each cell, with the path's own round-trip time
+    And each action takes one round trip of the client's session, with no extra round trip for a hello, a lookup or an acknowledgement

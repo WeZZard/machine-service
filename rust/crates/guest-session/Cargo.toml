@@ -13,6 +13,7 @@ name = "guest-session-agent"
 path = "src/main.rs"
 
 [dependencies]
+guest-actions = { path = "../guest-actions" }
 serde_json.workspace = true
 libc.workspace = true
 sha2.workspace = true
@@ -20,3 +21,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The agent a test runs is an isolated test child (DC-251).
+service-layout = { path = "../service-layout", features = ["test-build"] }

@@ -91,7 +91,7 @@ struct RealKeygen;
 
 impl Keygen for RealKeygen {
     fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunResult> {
-        let mut cmd = Command::new(&argv[0]);
+        let mut cmd = service_layout::tools::command_for(&argv[0]).map_err(io::Error::other)?;
         cmd.args(&argv[1..]);
         spawn_and_wait(cmd, None, false, timeout)
     }
@@ -118,7 +118,7 @@ impl SshTransport for RealSsh {
         env: &EnvMap,
         timeout: Duration,
     ) -> io::Result<RunResult> {
-        let mut cmd = Command::new(&argv[0]);
+        let mut cmd = service_layout::tools::command_for(&argv[0]).map_err(io::Error::other)?;
         cmd.args(&argv[1..]);
         cmd.env_clear();
         cmd.envs(env);

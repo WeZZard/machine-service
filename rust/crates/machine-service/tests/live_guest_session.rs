@@ -6,9 +6,11 @@
 //!
 //! ```sh
 //! scripts/build-guest-agents.sh target/live
-//! cp target/release/machine-service target/release/console-worker target/live/
-//! scripts/live-instance.sh start ssh-session            # port 6250
-//! LIVE_PORT=6251 scripts/live-instance.sh start ssh     # port 6251
+//! cp target/release/machine-service target/release/console-worker \
+//!   target/release/second-instance target/live/
+//! export LIVE_TART_HOME=<store>
+//! LIVE_PORT=6250 LIVE_BROKER_PORT=6260 scripts/live-instance.sh start ssh-session
+//! LIVE_PORT=6251 LIVE_BROKER_PORT=6261 scripts/live-instance.sh start ssh
 //! cargo test -p machine-service --test live_guest_session -- --ignored --test-threads=1
 //! ```
 //!
@@ -55,6 +57,10 @@ fn require_instance(link: &str, port: u16) {
         matches!(&health, Ok(response) if response.status == 200),
         "no machine-service on port {port}; start it with scripts/live-instance.sh"
     );
+    // Only a second instance, never the installed daemon (DC-245).
+    if let Err(refused) = second_instance::guard(port, &health.as_ref().unwrap().body) {
+        panic!("{refused}");
+    }
     let log = repository()
         .join(format!("rust/target/live/{port}/state/service.log"))
         .canonicalize()

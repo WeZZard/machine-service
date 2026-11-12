@@ -22,8 +22,46 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum concurrent macOS guests on the whole host.
 pub const MAX_MACOS_RUNNING: usize = 2;
-/// The reclamation grace period after TTL expiry, in hours.
+/// The reclamation grace period after TTL expiry, in hours, unless the
+/// instance sets `MACHINE_SERVICE_GRACE_HOURS` (DM-6).
 pub const GRACE_HOURS: i64 = 6;
+/// The instance setting of the reclamation grace period, in hours.
+pub const GRACE_HOURS_VARIABLE: &str = "MACHINE_SERVICE_GRACE_HOURS";
+
+/// Parse `MACHINE_SERVICE_GRACE_HOURS`: a finite number of hours, 0 or
+/// more; unset or empty is [`GRACE_HOURS`].
+pub fn parse_grace_hours(value: Option<&str>) -> Result<f64, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(GRACE_HOURS as f64),
+        Some(text) => text
+            .parse::<f64>()
+            .ok()
+            .filter(|hours| hours.is_finite() && *hours >= 0.0)
+            .ok_or_else(|| {
+                format!("{GRACE_HOURS_VARIABLE}={text:?} is not a number of hours, 0 or more")
+            }),
+    }
+}
+
+/// The instance's reclamation grace period, in hours, read once from its
+/// environment; an invalid setting stops the daemon at startup, so here it
+/// is only ever valid.
+pub fn grace_hours() -> f64 {
+    static GRACE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        parse_grace_hours(std::env::var(GRACE_HOURS_VARIABLE).ok().as_deref())
+            .unwrap_or(GRACE_HOURS as f64)
+    })
+}
+
+/// The end of a lease's relay credentials (RP-3, DC-214): the end of
+/// its TTL plus a grace that is the instance's reclamation grace bounded by
+/// the TTL itself, so a short lease's credentials never outlive it by more
+/// than its own length. A renewal moves the TTL, and with it this end;
+/// release and reclamation revoke the credentials before it.
+pub fn relay_credential_until(ttl_expires_at: f64, ttl_hours: f64, grace_hours: f64) -> f64 {
+    ttl_expires_at + grace_hours.min(ttl_hours).max(0.0) * 3600.0
+}
 /// Consecutive GC passes a `running` record's VM may be missing from Tart's
 /// running set before GC reclaims the lease. Two passes tolerate a record
 /// that became `running` between the `tart list` snapshot and the state read.
@@ -64,6 +102,7 @@ impl Service {
         source: &str,
         expected_source_fingerprint: Option<&Value>,
         vnc: bool,
+        egress: bool,
     ) -> OpResult<Value> {
         let configuration =
             acquisition_options::resolve(cpu, memory_mb, disk_gb, wait, ttl_hours, vnc)
@@ -103,6 +142,21 @@ impl Service {
         } else {
             None
         };
+        // An egress guest also needs the anchor's egress section and an
+        // allowlist that holds its resolvers (DC-267), checked before
+        // anything is reserved.
+        if egress {
+            let mut body = Map::new();
+            body.insert("network".to_string(), Value::String(network.to_string()));
+            body.insert(
+                "egress".to_string(),
+                Value::String(crate::network::EGRESS_ALLOWLIST.to_string()),
+            );
+            crate::network::validate_egress(&Value::Object(body))?;
+            let firewall = self.host.guest_firewall().map_err(OpError::new)?;
+            crate::isolation::check_egress(&firewall, guest_dns.as_deref().unwrap_or_default())
+                .map_err(OpError::new)?;
+        }
 
         if !valid_purpose(purpose) {
             return Err(OpError::new("purpose must match [a-z0-9][a-z0-9-]{0,63}"));
@@ -265,7 +319,10 @@ impl Service {
                     }
                 }
                 let suffix = &uuid::Uuid::new_v4().simple().to_string()[..6];
-                let vm = format!("{clone_prefix}{purpose_for_record}-{suffix}");
+                // A second instance's clones carry its own prefix, so that its
+                // launcher deletes them and no others (DC-246).
+                let owned = crate::second::vm_prefix();
+                let vm = format!("{owned}{clone_prefix}{purpose_for_record}-{suffix}");
                 let now = unix_now();
                 let mut record = Map::new();
                 record.insert("vm".to_string(), Value::String(vm.clone()));
@@ -290,6 +347,12 @@ impl Service {
                     "network".to_string(),
                     Value::String(guest_network.as_str().to_string()),
                 );
+                if egress {
+                    record.insert(
+                        "egress".to_string(),
+                        Value::String(crate::network::EGRESS_ALLOWLIST.to_string()),
+                    );
+                }
                 if let Some(servers) = &guest_dns {
                     record.insert(
                         "guest_dns".to_string(),
@@ -398,7 +461,14 @@ impl Service {
             disk_gb,
             wait,
         )?;
-        self.get_record(&vm)
+        let mut record = self.get_record(&vm)?;
+        // The lease credential travels in this answer only (RP-11).
+        if let Some(relay) = self.relay() {
+            if let Some(credential) = relay.take_credential(&vm) {
+                record["relay"] = relay.answer(&credential);
+            }
+        }
+        Ok(record)
     }
 
     /// Read-only verification that a configured work image exists and is stopped.
@@ -567,7 +637,12 @@ impl Service {
             },
             crate::tart::run_log_path(vm)
         ));
-        let mut child = self.host.spawn_run(vm, network)?;
+        let egress = self.egress_policy(&record)?;
+        let softnet_allow = egress
+            .as_ref()
+            .map(|policy| policy.lab.clone())
+            .unwrap_or_default();
+        let mut child = self.host.spawn_run_allowing(vm, network, &softnet_allow)?;
         self.host.boot_refused(&mut *child, vm, None)?;
         let ip = self.host.wait_ip(vm, 420).ok_or_else(|| {
             OpError::new(format!(
@@ -590,6 +665,9 @@ impl Service {
             // DC-15: the guest's address enters the firewall's table as soon
             // as it is known, before the guest is reachable for any work.
             self.add_to_firewall(vm, &ip)?;
+        }
+        if let Some(policy) = &egress {
+            self.add_to_egress(vm, &ip, policy)?;
         }
 
         let ssh_user = cfg
@@ -615,7 +693,16 @@ impl Service {
         }
         self.host.verify_transfer(&ip, &ssh_user, &key_dir)?;
         let isolation = if network == GuestNetwork::Internet {
-            Some(self.isolate_guest(vm, &record, kind, &ip, &ssh_user, &ssh_pass, &key_dir)?)
+            Some(self.isolate_guest(
+                vm,
+                &record,
+                kind,
+                &ip,
+                &ssh_user,
+                &ssh_pass,
+                &key_dir,
+                egress.as_ref(),
+            )?)
         } else {
             None
         };
@@ -629,6 +716,10 @@ impl Service {
                 )));
             }
         }
+
+        // RA-7: the relay agent registers before the lease is `running`, or
+        // the lease is served over SSH (RA-8).
+        let link = self.bootstrap_relay(vm, kind, network, &ip, &ssh_user, &key_dir);
 
         let wants_vnc = record
             .get("configuration")
@@ -667,10 +758,16 @@ impl Service {
                 if let Some(isolation) = &isolation {
                     record["isolation"] = isolation.clone();
                 }
+                if let Some(fields) = link.as_object() {
+                    for (key, value) in fields {
+                        record[key.as_str()] = value.clone();
+                    }
+                }
                 Ok(())
             },
             Option::<fn(&Map<String, Value>)>::None,
         )?;
+        self.relay_credentials_until(vm);
         self.log(&format!(
             "acquired {vm} (key-only SSH verified, env={}, ip={ip})",
             chosen.as_deref().unwrap_or("none")
@@ -714,6 +811,69 @@ impl Service {
         Ok(())
     }
 
+    /// The egress fence a lease asked for, read afresh from the egress
+    /// section's files, or `None` for a lease that asked for none
+    /// (DC-267).
+    fn egress_policy(&self, record: &Value) -> OpResult<Option<crate::isolation::EgressPolicy>> {
+        if record.get("egress").and_then(Value::as_str) != Some(crate::network::EGRESS_ALLOWLIST) {
+            return Ok(None);
+        }
+        let resolvers: Vec<crate::isolation::GuestResolver> = record
+            .get("guest_dns")
+            .and_then(Value::as_array)
+            .map(|items| {
+                let text = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                crate::isolation::parse_guest_dns(Some(&text)).unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let firewall = self.host.guest_firewall().map_err(OpError::new)?;
+        crate::isolation::check_egress(&firewall, &resolvers)
+            .map(Some)
+            .map_err(OpError::new)
+    }
+
+    /// Add an egress guest's address to the egress guests' table and record
+    /// where, so release removes it (DC-267).
+    fn add_to_egress(
+        &self,
+        vm: &str,
+        ip: &str,
+        policy: &crate::isolation::EgressPolicy,
+    ) -> OpResult<()> {
+        let address: std::net::Ipv4Addr = ip
+            .parse()
+            .map_err(|_| OpError::new(format!("{vm} reported a non-IPv4 address {ip}")))?;
+        let table = policy.files.guests.display().to_string();
+        let table_for_record = table.clone();
+        self.state.update(
+            |data| {
+                let record = vms_mut(data)
+                    .get_mut(vm)
+                    .ok_or_else(|| OpError::new(format!("unknown VM: {vm}")))?;
+                record["egress_table"] = Value::String(table_for_record.clone());
+                Ok(())
+            },
+            Option::<fn(&Map<String, Value>)>::None,
+        )?;
+        guest_firewall::add_guest(
+            &policy.files.guests,
+            guest_firewall::Guest {
+                address,
+                instance: self.firewall_instance(),
+                vm: vm.to_string(),
+            },
+        )
+        .map_err(|error| OpError::new(format!("egress guests' table {table}: {error}")))?;
+        self.log(&format!(
+            "{vm}: {ip} added to the egress guests' table {table}"
+        ));
+        Ok(())
+    }
+
     /// The name this instance's entries carry in the shared table file.
     fn firewall_instance(&self) -> String {
         self.config.state_dir.display().to_string()
@@ -721,6 +881,21 @@ impl Service {
 
     /// Remove a lease's entry from the firewall table it was added to.
     fn remove_from_firewall(&self, vm: &str, record: &Value) {
+        if let Some(table) = record.get("egress_table").and_then(Value::as_str) {
+            match guest_firewall::remove_guest(
+                std::path::Path::new(table),
+                &self.firewall_instance(),
+                vm,
+            ) {
+                Ok(()) => self.log(&format!(
+                    "{vm}: removed from the egress guests' table {table}"
+                )),
+                Err(error) => self.log(&format!(
+                    "WARN: {vm}: could not remove it from the egress guests' table {table}: \
+{error}; the next GC pass retries"
+                )),
+            }
+        }
         let Some(table) = record.get("firewall_table").and_then(Value::as_str) else {
             return;
         };
@@ -743,6 +918,15 @@ the next GC pass retries"
     /// address never cuts off a later guest that receives it (DC-15).
     pub fn prune_firewall_table(&self) {
         let table = self.host.firewall_table();
+        let egress = guest_firewall::EgressFiles::beside(&table).guests;
+        for table in [table, egress] {
+            self.prune_table_file(&table);
+        }
+    }
+
+    /// Drop this instance's entries of one table file whose lease is gone.
+    fn prune_table_file(&self, table: &std::path::Path) {
+        let table = table.to_path_buf();
         if !table.exists() {
             return;
         }
@@ -787,6 +971,7 @@ the next GC pass retries"
         ssh_user: &str,
         ssh_pass: &str,
         key_dir: &std::path::Path,
+        egress_policy: Option<&crate::isolation::EgressPolicy>,
     ) -> OpResult<Value> {
         let resolvers: Vec<crate::isolation::GuestResolver> = record
             .get("guest_dns")
@@ -898,7 +1083,11 @@ the next GC pass retries"
         ));
 
         // The egress check: a name resolves to a public address over DNS
-        // over TLS, and HTTPS to it answers.
+        // over TLS, and HTTPS to it answers. An egress guest loads its
+        // allowlist's check name instead (DC-267).
+        let check_host = egress_policy
+            .map(|policy| policy.check_name.clone())
+            .unwrap_or_else(|| crate::isolation::EGRESS_HOST.to_string());
         let mut egress = None;
         for attempt in 1..=crate::isolation::EGRESS_ATTEMPTS {
             let output = self
@@ -907,28 +1096,51 @@ the next GC pass retries"
                     ip,
                     ssh_user,
                     key_dir,
-                    &crate::isolation::egress_command(kind),
+                    &crate::isolation::egress_command_for(kind, &check_host),
                     None,
                     60,
                 )
                 .map(|(_, output)| output)
                 .unwrap_or_default();
             egress = crate::isolation::parse_egress(&output);
-            if crate::isolation::decide_egress(egress.as_ref()).is_ok() {
+            if crate::isolation::decide_egress_for(&check_host, egress.as_ref()).is_ok() {
                 break;
             }
             if attempt < crate::isolation::EGRESS_ATTEMPTS {
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
-        crate::isolation::decide_egress(egress.as_ref()).map_err(OpError::new)?;
+        crate::isolation::decide_egress_for(&check_host, egress.as_ref()).map_err(OpError::new)?;
         let egress = egress.expect("decided egress has a result");
         self.log(&format!(
-            "{vm}: egress verified; {} resolved to {} and HTTPS answered {}",
-            crate::isolation::EGRESS_HOST,
-            egress.address,
-            egress.https
+            "{vm}: egress verified; {check_host} resolved to {} and HTTPS answered {}",
+            egress.address, egress.https
         ));
+        // An egress guest must not load a name its allowlist does not hold.
+        let denied = match egress_policy {
+            None => None,
+            Some(_) => {
+                let output = self
+                    .host
+                    .ssh(
+                        ip,
+                        ssh_user,
+                        key_dir,
+                        &crate::isolation::egress_command(kind),
+                        None,
+                        60,
+                    )
+                    .map(|(_, output)| output)
+                    .unwrap_or_default();
+                let denied = crate::isolation::parse_egress(&output);
+                crate::isolation::decide_denied(denied.as_ref()).map_err(OpError::new)?;
+                self.log(&format!(
+                    "{vm}: egress fence verified; https://{}/ did not answer the guest",
+                    crate::isolation::EGRESS_HOST
+                ));
+                denied
+            }
+        };
         Ok(serde_json::json!({
             "status": "verified",
             "address": ip,
@@ -939,10 +1151,14 @@ the next GC pass retries"
             "guest_dns": resolvers.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "dns_transport": "dns-over-tls",
             "egress": {
-                "name": crate::isolation::EGRESS_HOST,
+                "name": check_host,
                 "address": egress.address,
                 "https": egress.https,
             },
+            "egress_denied": denied.map(|denied| serde_json::json!({
+                "name": crate::isolation::EGRESS_HOST,
+                "https": denied.https,
+            })),
             "observed_at": unix_now(),
         }))
     }
@@ -1008,6 +1224,9 @@ the next GC pass retries"
         )?;
         if proceed {
             self.release_flag(vm).store(true, Ordering::SeqCst);
+            // From the moment it starts releasing, no relay credential of the
+            // lease is accepted (RP-10).
+            self.revoke_relay(vm, expired_only);
         }
         Ok(proceed)
     }
@@ -1069,7 +1288,15 @@ the next GC pass retries"
             Option::<fn(&Map<String, Value>)>::None,
         )?;
         self.consoles.forget(vm);
-        Ok(serde_json::json!({"vm": vm, "released": true, "reason": reason}))
+        let mut answer = serde_json::json!({"vm": vm, "released": true, "reason": reason});
+        // A VM's relay agent keeps its records inside the clone, so they
+        // went with it; release asks for no purge (DC-173).
+        if record_before.get("link").and_then(Value::as_str) == Some(crate::relay::LINK_RELAY) {
+            let skipped = "the relay agent's records were deleted with the VM";
+            self.log(&format!("{vm}: relay records not purged: {skipped}"));
+            answer["relay_records"] = serde_json::json!({"purged": false, "skipped": skipped});
+        }
+        Ok(answer)
     }
 
     /// Renew a lease TTL and clear the grace warning.
@@ -1154,6 +1381,8 @@ release it and acquire a new lease"
                 }
             }),
         )?;
+        // The renewal moves the end of the lease's relay credentials too.
+        self.relay_credentials_until(vm);
         if let Some((ttl, expires)) = renewal.get() {
             self.log(&format!(
                 "heartbeat {vm}: TTL renewed for {ttl}h (until {})",
@@ -1218,6 +1447,14 @@ release it and acquire a new lease"
         } else {
             return Err(OpError::new("need 'argv' or 'script'"));
         };
+        if let Some(target) = self.relay_target(&record) {
+            let script = body
+                .get("script")
+                .and_then(Value::as_str)
+                .map(|script| script.as_bytes().to_vec());
+            let command = script.is_none().then(|| remote_cmd.clone());
+            return self.relay_exec(vm, &target, body, command, script, timeout as u64);
+        }
         if self.config.guest_link == GuestLink::SshSession {
             let target = GuestTarget {
                 ip: &ip,
@@ -1268,6 +1505,13 @@ release it and acquire a new lease"
             std::path::Path::new(local),
             true,
         )?;
+        if let Some(target) = self.relay_target(&record) {
+            if let Some(answer) =
+                self.relay_push(vm, &target, body, std::path::Path::new(local), remote)?
+            {
+                return Ok(answer);
+            }
+        }
         if self.config.guest_link == GuestLink::SshSession && !std::path::Path::new(local).is_dir()
         {
             let target = GuestTarget {
@@ -1323,6 +1567,13 @@ release it and acquire a new lease"
         )?;
         if let Some(parent) = std::path::Path::new(local).parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(target) = self.relay_target(&record) {
+            if let Some(answer) =
+                self.relay_pull(vm, &target, body, remote, std::path::Path::new(local))?
+            {
+                return Ok(answer);
+            }
         }
         if self.config.guest_link == GuestLink::SshSession {
             let target = GuestTarget {
@@ -1546,7 +1797,7 @@ release it and acquire a new lease"
                         let grace = record.get("grace_until").and_then(Value::as_f64);
                         match grace {
                             None => {
-                                let until = now + GRACE_HOURS as f64 * 3600.0;
+                                let until = now + grace_hours() * 3600.0;
                                 record["grace_until"] = number(until);
                                 record["warned"] = Value::Bool(true);
                                 actions.push((vm.clone(), "warn", Some(until)));
@@ -1710,7 +1961,7 @@ const DEFAULT_TTL_HOURS: f64 = 24.0;
 
 /// The lease's own initial TTL: its resolved `initial_ttl_hours`, or the
 /// acquisition default for a legacy record without a configuration report.
-fn lease_initial_ttl_hours(record: &Value) -> f64 {
+pub(crate) fn lease_initial_ttl_hours(record: &Value) -> f64 {
     record
         .get("configuration")
         .and_then(|config| config.get("effective"))
@@ -1751,7 +2002,7 @@ fn arg_text(value: &Value) -> String {
     }
 }
 
-fn record_kind(record: &Value) -> &str {
+pub(crate) fn record_kind(record: &Value) -> &str {
     record
         .get("image_kind")
         .and_then(Value::as_str)

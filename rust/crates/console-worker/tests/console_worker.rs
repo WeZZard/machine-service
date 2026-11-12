@@ -400,7 +400,10 @@ fn test_stale_generation_cannot_extend() {
     let guest = fixture.guest_echo();
     let viewer = fixture.viewer_default();
     let (mut control, mut process) = spawn_process();
-    control.send(fixture.config(&guest, &viewer, 0.25));
+    // The stale renewal must reach the worker before the session expires,
+    // or the worker closes first and the test reads end-of-file. A short
+    // wait overshoots on a busy host, so the session gets 2 s, not 0.25 s.
+    control.send(fixture.config(&guest, &viewer, 2.0));
     control.until("ready");
     control.send(json!({
         "op": "renew",

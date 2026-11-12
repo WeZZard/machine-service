@@ -1,11 +1,11 @@
 //! The host probe: `machine-service --probe-host` (`docs/arch/machines.md`,
 //! MM-3).
 //!
-//! The service runs its own executable with this flag as a child, so macOS
-//! attributes the privacy checks to the service, which is the responsible
-//! process, and a crash or a hang in Metal never reaches the daemon: the
-//! parent bounds the child with a timeout. It prints one JSON object with
-//! the `gpu` and `permissions` sections and changes nothing.
+//! The service runs its own executable with this flag as a child, so a
+//! crash or a hang in Metal never reaches the daemon: the parent bounds the
+//! child with a timeout. It prints one JSON object with the `gpu` section
+//! and changes nothing. It checks no privacy permission: the service knows
+//! nothing about them (DC-309).
 
 use std::ffi::{c_char, c_void, CStr};
 
@@ -20,17 +20,6 @@ extern "C" {
 #[link(name = "Metal", kind = "framework")]
 extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *mut c_void;
-}
-
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGPreflightPostEventAccess() -> bool;
-}
-
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXIsProcessTrusted() -> u8;
 }
 
 /// `MTLGPUFamily` values and their report names.
@@ -104,26 +93,8 @@ fn gpu() -> Option<Value> {
     }
 }
 
-fn granted(value: bool) -> &'static str {
-    if value {
-        "granted"
-    } else {
-        "denied"
-    }
-}
-
 /// Print the probe's answer.
 pub fn run() {
-    // SAFETY: the three preflight functions take no arguments, prompt for
-    // nothing, and only read the privacy state of this process's
-    // responsible process.
-    let permissions = unsafe {
-        json!({
-            "screen_recording": granted(CGPreflightScreenCaptureAccess()),
-            "accessibility": granted(AXIsProcessTrusted() != 0),
-            "post_event": granted(CGPreflightPostEventAccess()),
-        })
-    };
-    let answer = json!({"gpu": gpu(), "permissions": permissions});
+    let answer = json!({"gpu": gpu()});
     println!("{answer}");
 }

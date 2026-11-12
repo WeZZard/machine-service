@@ -6,7 +6,6 @@
 //! `docs/arch/image-catalog.md`); see [`crate::catalog`].
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -41,7 +40,7 @@ pub fn read_line_conf(conf_path: &Path) -> Result<Map<String, Value>, String> {
         .map(|key| format!("print -- \"{key}=${{{key}}}\""))
         .collect();
     let script = format!("source {quoted} || exit $?; {}", prints.join(" ; "));
-    let mut command = Command::new("/bin/zsh");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Zsh)?;
     command.args(["-c", &script]);
     let output = run_capture(&mut command, None, SOURCE_TIMEOUT).map_err(|error| match error {
         ProcError::Timeout => format!(

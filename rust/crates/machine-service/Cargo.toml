@@ -13,15 +13,29 @@ path = "src/main.rs"
 machine-service-core = { path = "../machine-service-core" }
 byte-transfer = { path = "../byte-transfer" }
 discovery = { path = "../discovery" }
+second-instance = { path = "../second-instance" }
 uuid.workspace = true
 tiny_http.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# The daemon and installer a test runs are test builds: the test's own
+# launchctl (DC-242) and every other test seam (DC-251);
+# `cargo build` never enables this.
+machine-service-core = { path = "../machine-service-core", features = ["test-build"] }
+service-layout = { path = "../service-layout", features = ["test-build"] }
+discovery = { path = "../discovery", features = ["test-build"] }
 machine-service-install = { path = "../machine-service-install" }
 byte-transfer = { path = "../byte-transfer" }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 environment = { path = "../environment" }
+relay-agent = { path = "../relay-agent" }
+relay-broker = { path = "../relay-broker" }
+remote-session = { path = "../remote-session" }
+guest-actions = { path = "../guest-actions" }
+network-rig = { path = "../network-rig" }
+second-instance = { path = "../second-instance" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

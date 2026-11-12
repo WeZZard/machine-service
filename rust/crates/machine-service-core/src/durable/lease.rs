@@ -34,6 +34,11 @@ use super::process::{self, LeaseSession};
 use super::session_env::{self, SessionEnv, WorkspacePaths};
 use crate::config::{log_to_file, unix_now};
 
+mod purges;
+mod relay;
+pub use purges::PendingPurge;
+pub use relay::{DurableRelay, LINK_IN_SESSION, LINK_RELAY, PURGE_WAIT};
+
 /// Fields a durable acquisition refuses, because none can be applied to a
 /// running Mac (DM-3).
 pub const REFUSED_FIELDS: [&str; 7] = [
@@ -100,6 +105,22 @@ pub struct DurableMachine {
     /// began (DM-7).
     gate: RwLock<()>,
     runtime: Mutex<Option<Runtime>>,
+    /// The broker, when this instance runs one (M4).
+    relay: std::sync::OnceLock<DurableRelay>,
+    /// Serializes changes to the pending purges and the hygiene records
+    /// they update (DC-177).
+    purges: Mutex<()>,
+    /// Whether a pass over the pending purges runs, and whether another
+    /// was asked for while it ran (DC-177).
+    retry: Mutex<relay::Retry>,
+}
+
+/// How the in-session fallback runs a command.
+enum Fallback {
+    /// As a process session of this service, where there is no launchd.
+    Session(exec::Running),
+    /// As a launchd job of its own (DC-318).
+    Job(super::launch::LocalJob),
 }
 
 impl DurableMachine {
@@ -126,6 +147,9 @@ impl DurableMachine {
             store: Mutex::new(()),
             gate: RwLock::new(()),
             runtime: Mutex::new(None),
+            relay: std::sync::OnceLock::new(),
+            purges: Mutex::new(()),
+            retry: Mutex::new(relay::Retry::default()),
         })
     }
 
@@ -229,6 +253,23 @@ impl DurableMachine {
         self.current_id().and_then(|id| self.read_record(&id))
     }
 
+    /// Keep the SHA-256 of the relay client credential issued for the
+    /// current lease `lease_id` in its record, as a virtual machine's record
+    /// keeps `relay_client_sha256`, so that the broker accepts it again
+    /// after a restart of the instance (DM-8, RP-3).
+    pub fn record_relay_client(&self, lease_id: &str, sha256: &str) -> Result<(), String> {
+        let _gate = self.gate.read().map_err(|_| "durable gate poisoned")?;
+        let _store = self.store.lock().map_err(|_| "durable state poisoned")?;
+        let mut record = self
+            .current_id()
+            .filter(|id| id == lease_id)
+            .and_then(|id| self.read_record(&id))
+            .filter(|record| record["state"] != "released")
+            .ok_or_else(|| format!("{lease_id} is not the current lease"))?;
+        record["relay_client_sha256"] = json!(sha256);
+        self.write_record(&record)
+    }
+
     fn write_json(path: &Path, value: &Value) -> Result<(), String> {
         let parent = path.parent().unwrap_or(Path::new("/"));
         std::fs::DirBuilder::new()
@@ -262,7 +303,17 @@ impl DurableMachine {
         Self::write_json(&self.current_file(), &json!({"current": lease_id}))
     }
 
+    /// The sessions the lease started, and the process groups of its relay
+    /// commands (DM-7, HY-3).
     fn sessions(&self, lease_id: &str) -> Vec<LeaseSession> {
+        let mut sessions = self.stored_sessions(lease_id);
+        sessions.extend(super::launch::recorded_groups(
+            &self.config.lease_dir(lease_id),
+        ));
+        sessions
+    }
+
+    fn stored_sessions(&self, lease_id: &str) -> Vec<LeaseSession> {
         std::fs::read_to_string(self.sessions_file(lease_id))
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
@@ -279,7 +330,7 @@ impl DurableMachine {
             .lock()
             .map_err(|_| "durable state poisoned".to_string())?;
         let mut sessions: Vec<Value> = self
-            .sessions(lease_id)
+            .stored_sessions(lease_id)
             .iter()
             .map(LeaseSession::to_json)
             .collect();
@@ -358,10 +409,24 @@ impl DurableMachine {
             "workspace": field("workspace"),
             "agents": field("agents"),
             "warnings": super::capabilities::warnings(&capabilities, self.config.disk_warn_bytes),
+            "relay_purges_pending": self
+                .pending_purges()
+                .iter()
+                .map(PendingPurge::to_json)
+                .collect::<Vec<_>>(),
             "capabilities": capabilities,
         });
         if let Some(reason) = unavailable {
             out["unavailable_reason"] = json!(reason);
+        }
+        // The link a lease's calls take now, with or without a lease: the
+        // Mac's relay agent keeps its session across leases (RA-4, RA-8).
+        if self.relay.get().is_some() {
+            if let Value::Object(fields) = self.link_fields(&self.relay_route()) {
+                for (key, value) in fields {
+                    out[key] = value;
+                }
+            }
         }
         if let Some(ttl) = lease.and_then(|record| record["ttl_expires_at"].as_f64()) {
             out["ttl_hours_remaining"] =
@@ -562,6 +627,9 @@ impl DurableMachine {
             }
         }
         drop(current_name);
+        // The relay agent's records of this lease's calls name it, so
+        // release can purge them (DC-173).
+        self.bind_relay_lease(&lease_id, false);
         self.log(&format!(
             "durable acquire {} for purpose {purpose} (lease {lease_id}, ttl {ttl}h)",
             self.name()
@@ -570,6 +638,8 @@ impl DurableMachine {
         match self.prepare(record) {
             Ok(record) => {
                 let mut out = self.machine_record_from(Some(&record));
+                // The record carries the link the lease's calls take now;
+                // each answer says which one served it (RA-8).
                 out["workspace"] = record["workspace"].clone();
                 Reply::ok(out)
             }
@@ -659,7 +729,11 @@ impl DurableMachine {
     }
 
     fn base_environment() -> Vec<(String, String)> {
-        std::env::vars().collect()
+        // A test build's lease shell reads only its fixture's `HOME`, never
+        // the startup files an inherited `ZDOTDIR` names (DC-253).
+        std::env::vars()
+            .filter(|(name, _)| !(service_layout::test_build::is_isolated() && name == "ZDOTDIR"))
+            .collect()
     }
 
     fn login_environment(&self) -> Result<Vec<(String, String)>, String> {
@@ -761,7 +835,7 @@ impl DurableMachine {
                 _ => return Reply::error(409, "timeout must be positive"),
             },
         };
-        let (running, runtime) = {
+        let (running, runtime, reason) = {
             let Ok(_gate) = self.gate.read() else {
                 return Reply::error(500, "durable gate poisoned");
             };
@@ -806,15 +880,45 @@ impl DurableMachine {
             if runtime.cancel.load(Ordering::SeqCst) {
                 return Reply::error(409, format!("command cancelled by release of {name}"));
             }
-            let started = exec::start(&request, self.config.uid, |session| {
-                self.append_session(&lease_id, session)
-            });
+            // The relay agent runs it in the desktop session when it can;
+            // else the service does, as DM-4 says (RA-8).
+            let reason = match self.relay_route() {
+                Ok(relay) => {
+                    let started = match self
+                        .relay_start(relay, &lease_id, &runtime, &request, timeout, body)
+                    {
+                        Ok(started) => started,
+                        Err(reply) => return reply,
+                    };
+                    drop(_gate);
+                    return self.relay_finish(relay, name, &runtime, started, timeout);
+                }
+                Err(reason) => reason,
+            };
+            // On macOS the command is a launchd job of its own here too,
+            // never this service's child (RA-8, DC-318).
+            let started = if cfg!(target_os = "macos") {
+                self.start_local_job(&lease_id, &request, &runtime)
+                    .map(Fallback::Job)
+            } else {
+                exec::start(&request, self.config.uid, |session| {
+                    self.append_session(&lease_id, session)
+                })
+                .map(Fallback::Session)
+            };
             match started {
-                Ok(running) => (running, runtime),
+                Ok(running) => (running, runtime, reason),
                 Err(error) => return Reply::error(409, error),
             }
         };
-        match running.wait(&runtime.cancel) {
+        let waited = match running {
+            Fallback::Session(running) => running.wait(&runtime.cancel),
+            Fallback::Job(job) => Ok(job.wait(
+                std::time::Duration::from_secs(timeout as u64),
+                &runtime.cancel,
+            )),
+        };
+        match waited {
             Ok(Outcome::Exited { rc, output }) => {
                 let redacted = agents::redact(&output, &runtime.env.secrets);
                 Reply::ok(json!({
@@ -822,6 +926,8 @@ impl DurableMachine {
                     "vm": name,
                     "rc": rc,
                     "output": tail_chars(&redacted, MAX_OUTPUT_CHARS),
+                    "link": LINK_IN_SESSION,
+                    "link_reason": reason,
                 }))
             }
             Ok(Outcome::TimedOut) => Reply::error(
@@ -834,6 +940,36 @@ impl DurableMachine {
             }
             Err(error) => Reply::error(409, error),
         }
+    }
+
+    /// Register `request` as a launchd job of the lease, fed and recorded as
+    /// a relay agent's would be (RA-8, DC-318).
+    fn start_local_job(
+        &self,
+        lease_id: &str,
+        request: &exec::Request<'_>,
+        runtime: &Runtime,
+    ) -> Result<super::launch::LocalJob, String> {
+        let execution = uuid::Uuid::new_v4().to_string();
+        let files = super::launch::files(&self.config.lease_dir(lease_id), &execution);
+        let executable = std::env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|error| format!("cannot find this service's executable: {error}"))?;
+        let agent = format!(
+            "ms{}",
+            &service_layout::release::sha256_hex(
+                self.config.state_dir.to_string_lossy().as_bytes()
+            )[..10]
+        );
+        super::launch::start_local(
+            &files,
+            super::launch::Launch::Program(&request.program),
+            &runtime.env,
+            &request.cwd,
+            &executable,
+            &self.config.log_file,
+            &agent,
+        )
     }
 
     // ------------------------------------------------------------ transfers
@@ -903,6 +1039,20 @@ impl DurableMachine {
                 return Reply::error(409, error);
             }
         }
+        // A file goes through the relay agent when it can; a folder, which
+        // the relay protocol does not move, goes by the service (DC-151).
+        let is_file = std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.is_file());
+        let route = if is_file {
+            self.relay_route()
+        } else {
+            Err("a folder is copied by the service; the relay link moves single files".into())
+        };
+        let reason = match route {
+            Ok(relay) => {
+                return self.relay_transfer(relay, name, body, push, &source, &destination)
+            }
+            Err(reason) => reason,
+        };
         match copy_into_place(&source, &destination) {
             Ok((target, bytes, digest)) => {
                 let mut out = json!({
@@ -910,6 +1060,8 @@ impl DurableMachine {
                     "vm": name,
                     "bytes": bytes,
                     "sha256": digest,
+                    "link": LINK_IN_SESSION,
+                    "link_reason": reason,
                 });
                 if push {
                     out["pushed"] = json!(local);
@@ -1019,6 +1171,10 @@ impl DurableMachine {
                 runtime.cancel.store(true, Ordering::SeqCst);
             }
         }
+        // A relay command not yet started finds nothing to run (DM-7).
+        if let Some(lease_id) = record["lease_id"].as_str() {
+            super::launch::withdraw_requests(&self.config.lease_dir(lease_id));
+        }
         Ok(record)
     }
 
@@ -1118,6 +1274,14 @@ impl DurableMachine {
             }
         }
 
+        // 2b. The relay agent's records of the lease, with the command
+        // output they keep, which may hold agent keys (DC-173, AK-5). Its
+        // commands were stopped above, so none of them still runs.
+        let (relay_records, unconfirmed) = self.purge_relay_records(&lease_id);
+        if let Some(reason) = &unconfirmed {
+            failures.push(json!({"step": "relay-records", "reason": reason}));
+        }
+
         // 3. The expensive facts and the inventory after (MM-4, HY-4).
         let login = match self.login_environment() {
             Ok(login) => login,
@@ -1180,6 +1344,19 @@ impl DurableMachine {
         // The last sample, then any interval still open ends at release
         // (HY-5, DC-75).
         let ci = ci_close(&self.sample_ci(&lease_id, released_at), released_at);
+        // An unconfirmed purge is kept before the lease is released, under
+        // the lock the retry takes to mark the hygiene record, so neither a
+        // crash nor a retry that confirms at once loses it (DC-177).
+        let purges = self.purges.lock();
+        if let Some(reason) = &unconfirmed {
+            if let Err(error) = self.keep_purge_pending(&lease_id, released_at, reason) {
+                self.log(&format!("WARN: durable lease {lease_id}: {error}"));
+                failures.push(json!({
+                    "step": "relay-records",
+                    "reason": format!("the purge cannot be kept pending: {error}"),
+                }));
+            }
+        }
         let hygiene = json!({
             "lease_id": lease_id,
             "name": name,
@@ -1196,6 +1373,7 @@ impl DurableMachine {
             },
             "changes": changes,
             "workspace": workspace_report,
+            "relay_records": relay_records,
             "ci_busy_intervals": ci["intervals"],
             "ci_sampling": {"interval_s": ci["interval_s"], "samples": ci["samples"]},
             "failures": failures,
@@ -1204,6 +1382,7 @@ impl DurableMachine {
         if let Err(error) = Self::write_json(&hygiene_path, &hygiene) {
             self.log(&format!("WARN: durable lease {lease_id}: {error}"));
         }
+        drop(purges);
 
         // 5. Free the machine.
         record["state"] = json!("released");

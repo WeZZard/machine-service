@@ -11,15 +11,26 @@ use crate::proc::{combined_text, run_capture, ProcError};
 /// The settle window used to detect a hypervisor-refused boot.
 pub const BOOT_SETTLE_S: u64 = 10;
 
-/// Build a `tart` command with the configured executable and environment.
-pub fn tart_command(config: &Config, args: &[&str]) -> Command {
-    let mut command = Command::new(&config.tart_executable);
+/// Build a `tart` command with the configured executable and environment;
+/// a test build's Tart is its tool table's (DC-254).
+pub fn tart_command(config: &Config, args: &[&str]) -> OpResult<Command> {
+    let program = if Path::new(&config.tart_executable).is_absolute() {
+        // A path the configuration names; a test build refuses one in the
+        // system's folders (DC-254).
+        service_layout::tools::program(&config.tart_executable)
+    } else {
+        service_layout::tools::located(service_layout::tools::Tool::Tart, || {
+            Ok(std::path::PathBuf::from(&config.tart_executable))
+        })
+    }
+    .map_err(OpError::new)?;
+    let mut command = Command::new(program);
     command.args(args);
     if let Some(environment) = &config.subprocess_env {
         command.env_clear();
         command.envs(environment.iter().map(|(key, value)| (key, value)));
     }
-    command
+    Ok(command)
 }
 
 /// Run `tart` and capture output. `check` mirrors Python's `check=True`.
@@ -29,7 +40,7 @@ pub fn tart(
     check: bool,
     timeout_s: u64,
 ) -> OpResult<std::process::Output> {
-    let mut command = tart_command(config, args);
+    let mut command = tart_command(config, args)?;
     let output = run_capture(&mut command, None, Duration::from_secs(timeout_s))
         .map_err(|error| tart_error(args, error))?;
     if check && !output.status.success() {
@@ -83,7 +94,7 @@ pub fn vm_running(config: &Config, name: &str) -> OpResult<bool> {
 ///
 /// Best effort: a failed gauge degrades to `None` and never raises.
 pub fn host_macos_guests() -> Option<usize> {
-    let mut command = Command::new("/usr/bin/pgrep");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Pgrep).ok()?;
     command.args(["-f", "com.apple.Virtualization.VirtualMachine"]);
     let output = run_capture(&mut command, None, Duration::from_secs(10)).ok()?;
     let code = output.status.code()?;
@@ -131,13 +142,14 @@ pub fn spawn_run(
     config: &Config,
     vm: &str,
     network: acquisition_options::GuestNetwork,
+    softnet_allow: &[String],
 ) -> OpResult<std::process::Child> {
     let log_path = format!("/tmp/tart-run-{vm}.log");
     let stdout = std::fs::File::create(&log_path)?;
     let stderr = stdout.try_clone()?;
-    let args = crate::network::run_args(vm, network);
+    let args = crate::network::run_args_allowing(vm, network, softnet_allow);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut command = tart_command(config, &args);
+    let mut command = tart_command(config, &args)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -165,6 +177,24 @@ pub fn tart_path(config: &Config) -> Option<std::ffi::OsString> {
 /// names one, else `tart` found on the `PATH` Tart runs with. Answers why
 /// there is none, naming Tart, so the refusal says what is missing (AC-38).
 pub fn find_executable(config: &Config) -> Result<std::path::PathBuf, String> {
+    let found = if Path::new(&config.tart_executable).is_absolute() {
+        service_layout::tools::program(&config.tart_executable)
+            .and_then(|_| find_configured(config))
+    } else {
+        service_layout::tools::located(service_layout::tools::Tool::Tart, || {
+            find_configured(config)
+        })
+    };
+    found.map_err(|error| {
+        if error.starts_with("Tart is not installed") {
+            error
+        } else {
+            format!("Tart is not installed ({error})")
+        }
+    })
+}
+
+fn find_configured(config: &Config) -> Result<std::path::PathBuf, String> {
     let executable = |path: &Path| {
         std::fs::metadata(path).is_ok_and(|meta| {
             meta.is_file()

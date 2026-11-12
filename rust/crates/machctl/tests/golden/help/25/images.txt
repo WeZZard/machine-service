@@ -1,6 +1,8 @@
 usage: machctl images
        [-h] [--json]
        [--reload]
+       [--local]
+       [--instance INSTANCE]
 
 options:
   -h, --help
@@ -14,3 +16,10 @@ options:
     catalog first; exit
     1 unless it is
     current
+  --local
+    ask only the local
+    instance
+  --instance INSTANCE
+    ask only this
+    instance (ID or
+    address)

@@ -1,0 +1,13 @@
+{
+  "id": "N2",
+  "name": "Long-haul",
+  "edge": { "idle_close_s": 100, "max_message_bytes": 1048576 },
+  "toxics": [
+    { "name": "latency-up", "stream": "upstream", "type": "latency", "attributes": { "latency": 325, "jitter": 175 } },
+    { "name": "latency-down", "stream": "downstream", "type": "latency", "attributes": { "latency": 325, "jitter": 175 } },
+    { "name": "bandwidth-up", "stream": "upstream", "type": "bandwidth", "attributes": { "rate": 4096 } },
+    { "name": "bandwidth-down", "stream": "downstream", "type": "bandwidth", "attributes": { "rate": 4096 } },
+    { "name": "slicer-up", "stream": "upstream", "type": "slicer", "attributes": { "average_size": 1024, "size_variation": 768, "delay": 100 } },
+    { "name": "slicer-down", "stream": "downstream", "type": "slicer", "attributes": { "average_size": 1024, "size_variation": 768, "delay": 100 } }
+  ]
+}

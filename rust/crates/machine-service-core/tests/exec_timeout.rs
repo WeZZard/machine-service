@@ -122,6 +122,13 @@ fn test_timeout_never_replays_the_command() {
 
     let fixture = common::Fixture::new();
     let keys = fixture.key_dir("key-command-test");
+    // The test build runs `ssh` only from a tool table (DC-254); this
+    // one is never run, since the override answers in its place.
+    let tools = tempfile::tempdir().unwrap();
+    let ssh = tools.path().join("ssh");
+    std::fs::write(&ssh, "#!/bin/sh\nexit 99\n").unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::env::set_var(service_layout::tools::TEST_VARIABLE, tools.path());
     reset_run_capture_invocations();
     // `mock.patch.object(self.svc.subprocess, 'run', side_effect=TimeoutExpired)`:
     // the timed subprocess is observed, never spawned.

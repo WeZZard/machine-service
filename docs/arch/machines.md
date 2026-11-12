@@ -56,7 +56,6 @@ flowchart TB
 | `gpu` | `name`, `metal_families` (for example `apple9`, `mac2`, `common3`, `metal3`), `metal3` (boolean), `argument_buffers_tier` | a small helper that asks `MTLCreateSystemDefaultDevice` for `supportsFamily` and `argumentBuffersSupport` |
 | `display` | `console_user`, `gui_session` (boolean), `screen_locked` | `/dev/console` owner, and the `CGSSessionScreenIsLocked` key of the service user's session in `ioreg`'s `IOConsoleUsers` (DC-77) |
 | `software` | `node`, `cua_driver`, `claude_code`, `codex`, `tart`, each a version or `null`; `xcode`, `unity`, `unreal`, each a list of installed versions with their paths | version commands run in the login environment; the standard install folders of Xcode, Unity Hub and the Epic launcher |
-| `permissions` | `screen_recording`, `accessibility`, `post_event`, each `granted`, `denied` or `unknown` for the service's own executable | `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`, `CGPreflightPostEventAccess` |
 | `agents` | `claude_code`, `codex`, each `{ "key": "present" \| "absent" \| "unsafe-mode" \| "invalid", "endpoint": "present" \| "absent" \| "invalid" }` | the key files' existence and modes and `endpoints.json` ([AK-1](agent-keys.md#ak-1-key-files), [AK-2](agent-keys.md#ak-2-gateway-endpoints-are-local-configuration)); never a key |
 | `ci_runner` | `present`, `busy`, `name` | `~/actions-runner/.runner` and a running `Runner.Worker` process ([HY-5](hygiene.md#hy-5-coexistence-with-the-ci-runner)) |
 | `observed_at` | the time of each section's last observation | the instance's clock |
@@ -68,7 +67,8 @@ flowchart TB
 ## MM-4: When facts are observed
 
 - Cheap facts are read on every `GET /machines` request: `disk.free_bytes`, `display`, `ci_runner.busy`, `agents` and the lease state.
-- Expensive facts are read at startup, once a day, at the start and the end of every durable lease, and on `POST /machines/<name>/refresh`: `gpu`, `software` and `permissions`.
+- Expensive facts are read at startup, once a day, at the start and the end of every durable lease, and on `POST /machines/<name>/refresh`: `gpu` and `software`.
+- The report holds no privacy permissions: the service knows nothing about them, and a task that needs one arranges it itself (DC-309).
 - A refresh never installs, starts, grants or changes anything. It runs only read-only commands, and each command has a timeout of 30 seconds.
 
 ## MM-5: States

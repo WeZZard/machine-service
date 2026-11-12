@@ -8,31 +8,29 @@
 //!
 //! ```sh
 //! cp -R ~/path/to/pilot-images /tmp/ic-live-pilot     # a checkout the test may write
-//! PILOT_REPO=/tmp/ic-live-pilot scripts/live-instance.sh start ssh   # port 6250
-//! LIVE_PILOT=/tmp/ic-live-pilot \
+//! PILOT_REPO=/tmp/ic-live-pilot LIVE_PORT=6250 LIVE_BROKER_PORT=6251 \
+//!   LIVE_TART_HOME=<store> scripts/live-instance.sh start ssh
+//! LIVE_ROOT=$PWD/target/live/6250 LIVE_PILOT=/tmp/ic-live-pilot \
 //!   cargo test -p machine-service --test live_image_catalog -- --ignored
 //! ```
 //!
-//! `LIVE_PORT` (default 6250) selects the instance and `LIVE_CLONE_SOURCE`
-//! (default `pilot-ubuntu-base`) the stopped VM to clone. The test refuses
-//! the installed daemon's port and an instance whose image checkout is not
-//! `LIVE_PILOT`.
+//! `LIVE_ROOT` names the instance by its launcher root, and
+//! `LIVE_CLONE_SOURCE` (default `pilot-ubuntu-base`) the stopped VM to clone.
+//! The test refuses an instance that does not report itself as a second
+//! instance and one whose image checkout is not `LIVE_PILOT`. Tart cannot
+//! clone from one store into another, so the clone is made in the
+//! instance's store, which may be the operator's: the source is only read,
+//! the clones carry the instance's prefix, so the launcher's `stop` deletes
+//! them if the test cannot, and no clone prunes the store's cache
+//! (DC-246).
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use second_instance::{Manifest, INSTALLED_PORT};
 use serde_json::Value;
-
-const INSTALLED_PORT: u16 = 6240;
-
-fn live_port() -> u16 {
-    std::env::var("LIVE_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(6250)
-}
 
 fn listener_pid(port: u16) -> Option<String> {
     let output = Command::new("lsof")
@@ -43,16 +41,23 @@ fn listener_pid(port: u16) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn tart(arguments: &[&str]) {
-    let status = Command::new("tart")
-        .args(arguments)
-        .status()
-        .expect("run tart");
+/// `tart` in the instance's own store, without pruning its cache.
+fn tart_in(store: &Path) -> Command {
+    let mut command = Command::new("tart");
+    command
+        .env("TART_HOME", store)
+        .env("TART_NO_AUTO_PRUNE", "1");
+    command
+}
+
+fn tart(store: &Path, arguments: &[&str]) {
+    let status = tart_in(store).args(arguments).status().expect("run tart");
     assert!(status.success(), "tart {arguments:?} failed");
 }
 
 /// Removes the test's line folder and VMs, however the test ends.
 struct Cleanup {
+    store: PathBuf,
     folder: PathBuf,
     vms: Vec<String>,
 }
@@ -61,7 +66,7 @@ impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.folder);
         for vm in &self.vms {
-            let _ = Command::new("tart").args(["delete", vm]).status();
+            let _ = tart_in(&self.store).args(["delete", vm]).status();
         }
     }
 }
@@ -76,13 +81,18 @@ fn image(port: u16, name: &str) -> Option<Value> {
 /// promotion makes it acquirable, and its removal hides it, while the
 /// instance and the installed daemon keep their processes (AC-18).
 #[test]
-#[ignore = "TL-4: needs real Tart, a second instance on its own port started with a writable PILOT_REPO, and LIVE_PILOT naming that checkout"]
+#[ignore = "TL-4: needs real Tart, a second instance under LIVE_ROOT started with a writable PILOT_REPO, and LIVE_PILOT naming that checkout"]
 fn ac39_ac40_live_line_promotion_and_removal() {
-    let port = live_port();
-    assert_ne!(
-        port, INSTALLED_PORT,
-        "never test against the installed daemon"
-    );
+    let root = PathBuf::from(std::env::var("LIVE_ROOT").expect("LIVE_ROOT"));
+    let manifest = Manifest::read(&root)
+        .expect("read the manifest")
+        .expect("a second instance under LIVE_ROOT");
+    let port = manifest.port;
+    let health = common::http(port, "GET", "/health", None, None);
+    if let Err(refused) = second_instance::guard(port, &health.body) {
+        panic!("{refused}");
+    }
+    let store = manifest.tart_home.clone();
     let pilot = PathBuf::from(std::env::var("LIVE_PILOT").expect("LIVE_PILOT"));
     let machines = common::http(port, "GET", "/machines", None, None);
     assert_eq!(machines.status, 200, "no machine-service on port {port}");
@@ -95,17 +105,18 @@ fn ac39_ac40_live_line_promotion_and_removal() {
     let instance = listener_pid(port);
 
     let suffix = &uuid_suffix();
-    let name = format!("ic-live-{suffix}");
+    let name = format!("{}ic-live-{suffix}", manifest.vm_prefix());
     let work = format!("{name}-work");
     let base = format!("{name}-base");
     let source = std::env::var("LIVE_CLONE_SOURCE").unwrap_or_else(|_| "pilot-ubuntu-base".into());
     let folder = pilot.join("images").join(&name);
     let _cleanup = Cleanup {
+        store: store.clone(),
         folder: folder.clone(),
         vms: vec![work.clone(), base.clone()],
     };
 
-    tart(&["clone", &source, &work]);
+    tart(&store, &["clone", &source, &work]);
     std::fs::create_dir_all(&folder).expect("line folder");
     std::fs::write(
         folder.join("line.conf"),
@@ -119,7 +130,7 @@ fn ac39_ac40_live_line_promotion_and_removal() {
     assert_eq!(added["base_available"], false);
     assert_eq!(added["concurrency"]["acquirable"], false);
 
-    tart(&["rename", &work, &base]);
+    tart(&store, &["rename", &work, &base]);
     let promoted = image(port, &name).expect("the line is still listed");
     assert_eq!(promoted["base_available"], true);
     assert_eq!(promoted["concurrency"]["acquirable"], true);

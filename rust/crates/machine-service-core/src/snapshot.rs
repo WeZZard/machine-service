@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 use crate::catalog::CatalogView;
 use crate::config::unix_now;
 use crate::error::{OpError, OpResult};
-use crate::ops::{GRACE_HOURS, MAX_MACOS_RUNNING};
+use crate::ops::{grace_hours, MAX_MACOS_RUNNING};
 use crate::service::Service;
 
 /// Build the `GET /machines` body. The lease set is under `machines`; the
@@ -74,7 +74,7 @@ pub fn snapshot(service: &Service) -> OpResult<Value> {
     }
     Ok(json!({
         "machines": vms,
-        "limits": {"max_macos_running": MAX_MACOS_RUNNING, "grace_hours": GRACE_HOURS},
+        "limits": {"max_macos_running": MAX_MACOS_RUNNING, "grace_hours": hours_value(grace_hours())},
         "pilot_repo": service.config.pilot.as_ref().map(|pilot| pilot.to_string_lossy()),
         "port": service.config.port,
     }))
@@ -337,4 +337,14 @@ fn inventories(
         }
     }
     out
+}
+
+/// Whole hours as an integer, as the limit always read before it became an
+/// instance setting; a fraction as a number.
+fn hours_value(hours: f64) -> Value {
+    if hours.fract() == 0.0 && hours <= i64::MAX as f64 {
+        Value::from(hours as i64)
+    } else {
+        Value::from(hours)
+    }
 }

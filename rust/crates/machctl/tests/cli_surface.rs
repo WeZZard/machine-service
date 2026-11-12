@@ -5,13 +5,11 @@
 //! choice and exits 2. `clap` adds one unless it is disabled, which would be
 //! surface the original does not have.
 
-use std::process::Command;
-
 const MACHCTL: &str = env!("CARGO_BIN_EXE_machctl");
 
 #[test]
 fn help_is_not_a_subcommand() {
-    let output = Command::new(MACHCTL)
+    let output = service_layout::test_build::harness::command(MACHCTL)
         .arg("help")
         .output()
         .expect("spawn machctl");
@@ -24,7 +22,7 @@ fn help_is_not_a_subcommand() {
 
 #[test]
 fn help_flag_still_works_and_advertises_no_help_command() {
-    let output = Command::new(MACHCTL)
+    let output = service_layout::test_build::harness::command(MACHCTL)
         .arg("--help")
         .output()
         .expect("spawn machctl");

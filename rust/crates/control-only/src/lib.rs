@@ -23,7 +23,7 @@ pub const SOURCE: &str = "e5fd48cf033ed0ec376710607187d761e60c2374";
 /// SHA-256 over [`policy`] serialized with sorted keys and no spaces.
 pub const POLICY_SHA256: &str = "f56feb327ec84db945e3328fe95431b4e4978b607abb6ea03ca877c94eef8e0b";
 /// Accepted acquisition request field names.
-pub const FIELDS: [&str; 16] = [
+pub const FIELDS: [&str; 17] = [
     "purpose",
     "image",
     "line",
@@ -40,6 +40,7 @@ pub const FIELDS: [&str; 16] = [
     "source",
     "expected_source_fingerprint",
     "vnc",
+    "egress",
 ];
 
 /// Host binding fields a [`LeaseGuard`] requires.

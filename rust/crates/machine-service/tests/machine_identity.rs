@@ -1,10 +1,12 @@
 //! MI-1 to MI-3 / DC-87 to DC-89 at TL-2: isolated real daemons, a file
-//! name source, and local-only DNS-SD. No test changes the Mac's name.
+//! name source, and the test build's DNS-SD folder, so every daemon binds
+//! loopback and nothing is advertised beyond this test (DC-252). No
+//! test changes the Mac's name.
 
 mod common;
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -16,7 +18,7 @@ struct Fixture {
 }
 
 struct Daemon {
-    child: Child,
+    child: common::Owned,
     port: u16,
 }
 
@@ -41,17 +43,17 @@ impl Fixture {
 
     fn start(&self, exposed: bool, advertised: bool) -> Daemon {
         let port = common::free_port();
-        let child = Command::new(common::DAEMON)
-            .env_clear()
+        let mut command = common::daemon_command(&self.root);
+        command
             .env("HOME", self.root.join("home"))
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("MACHINE_SERVICE_STATE", self.root.join("state"))
             .env("MACHINE_SERVICE_CONFIG_DIR", self.root.join("config"))
             .env("MACHINE_SERVICE_DURABLE_LOCK_DIR", self.root.join("lock"))
             .env("MACHINE_SERVICE_PORT", port.to_string())
+            .env("MACHINE_SERVICE_HOST", "127.0.0.1")
             .env(
-                "MACHINE_SERVICE_HOST",
-                if advertised { "0.0.0.0" } else { "127.0.0.1" },
+                "MACHINE_SERVICE_DISCOVERY",
+                if advertised { "bonjour" } else { "consul" },
             )
             .env(
                 "MACHINE_SERVICE_EXPOSE_DURABLE",
@@ -59,16 +61,13 @@ impl Fixture {
             )
             .env("MACHINE_SERVICE_NAME_FILE", &self.name)
             .env("MACHINE_SERVICE_NAME_POLL_MS", "50")
-            .env("MACHINE_SERVICE_DISCOVERY_SCOPE", "local-only")
             .env("PILOT_REPO", self.root.join("pilot"))
             .env("TART_HOME", self.root.join("tart"))
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.root.join("daemon.err")).unwrap(),
-            ))
-            .spawn()
-            .unwrap();
+            ));
+        let child = command.spawn().unwrap();
         let daemon = Daemon { child, port };
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
@@ -101,13 +100,6 @@ impl Daemon {
     }
 }
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// MI-1 / DC-87: hardware identity is available without durable exposure.
 #[test]
 fn mi1_virtual_only_instance_reports_hardware_identity() {
@@ -121,10 +113,10 @@ fn mi1_virtual_only_instance_reports_hardware_identity() {
     assert_eq!(health["former_names"], json!([]));
 }
 
-fn advertised(port: u16) -> Vec<discovery::Found> {
+fn advertised(root: &std::path::Path, port: u16) -> Vec<discovery::Found> {
     discovery::dnssd::browse(
         discovery::SERVICE_TYPE,
-        discovery::dnssd::Scope::LocalOnly,
+        discovery::dnssd::Scope::Folder(root.join("bonjour")),
         Duration::from_millis(150),
         Duration::from_millis(300),
     )
@@ -145,7 +137,7 @@ fn ac50_live_rename_replaces_advertisement_without_restart() {
     let pid = daemon.child.id();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if advertised(daemon.port)
+        if advertised(&fixture.root, daemon.port)
             .iter()
             .any(|found| found.instance() == "Mac-A")
         {
@@ -156,7 +148,7 @@ fn ac50_live_rename_replaces_advertisement_without_restart() {
     std::fs::write(&fixture.name, "Mac-B\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let found = advertised(daemon.port);
+        let found = advertised(&fixture.root, daemon.port);
         let health = daemon.health();
         if health["instance"] == "Mac-B"
             && found.iter().any(|f| {

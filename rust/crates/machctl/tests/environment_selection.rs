@@ -9,7 +9,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use serde_json::{json, Map, Value};
 use tempfile::TempDir;
@@ -104,7 +104,7 @@ impl Fixture {
     /// cleared first so the operator's shell cannot influence the test;
     /// callers re-add the values they want to exercise.
     fn run(&self, arguments: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut command = Command::new(MACHCTL);
+        let mut command = service_layout::test_build::harness::command(MACHCTL);
         command
             .args(arguments)
             .env_remove("VM_ENVIRONMENT_FILE")

@@ -17,6 +17,12 @@
 //! launched it. `machctl` runs with Consul at a closed port and its own
 //! state folder. Every lease is released.
 //!
+//! The daemon is this worktree's test build, started with the live
+//! layer's opt-in (`MACHINE_SERVICE_TEST_LIVE=TL-6`), which only these
+//! ignored tests set: with it the build sweeps the real session and runs the
+//! system's tools as a release does, and still refuses the installed ports
+//! and folders (DC-253).
+//!
 //! ```sh
 //! cargo test -p machine-service --test live_durable -- --ignored --test-threads=1
 //! ```
@@ -151,6 +157,15 @@ impl Live {
                 .env("MACHINE_SERVICE_HOST", "127.0.0.1")
                 .env("MACHINE_SERVICE_CONFIG_DIR", &self.config)
                 .env("MACHINE_SERVICE_EXPOSE_DURABLE", "on")
+                // The opt-in live layer (DC-253): the test build runs
+                // the system's tools, reads the Mac's name, takes the
+                // host-wide lock and sweeps the real session, as a release
+                // does; the installed ports and folders stay refused.
+                .env(
+                    service_layout::test_build::LIVE_VARIABLE,
+                    service_layout::test_build::LIVE_VALUE,
+                )
+                .env("MACHINE_SERVICE_CONSOLE_CONFIG", self.root.join("no-console.json"))
                 .env("PILOT_REPO", self.root.join("no-pilot"))
                 .env("TART_HOME", self.root.join("no-tart"))
                 .stdin(Stdio::null())
@@ -779,4 +794,189 @@ fn live_ac33_restart_and_release_during_a_command() {
             .body["state"],
         "available"
     );
+}
+
+// ------------------------------------------------- applications, from TL-2
+
+/// Whether this process runs in a logged-in GUI (Aqua) session, where
+/// Launch Services can open an application.
+fn in_gui_session() -> bool {
+    Command::new("/bin/launchctl")
+        .arg("managername")
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "Aqua")
+}
+
+/// Build a minimal regular application, signed ad hoc, that quits when
+/// asked as any application does. Answers its bundle and executable.
+fn stand_in_app(root: &Path, name: &str, bundle_id: &str) -> (PathBuf, PathBuf) {
+    let app = root.join(format!("{name}.app"));
+    let macos = app.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    let source = root.join(format!("{name}.m"));
+    std::fs::write(
+        &source,
+        "#import <Cocoa/Cocoa.h>\nint main(void) { @autoreleasepool { [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]; [NSApp run]; } return 0; }\n",
+    )
+    .unwrap();
+    let executable = macos.join(name);
+    // The system's own toolchain and SDK: a `DEVELOPER_DIR` chosen for the
+    // Rust build may name an Xcode older than the running macOS.
+    let built = Command::new("/usr/bin/clang")
+        .env_remove("DEVELOPER_DIR")
+        .env_remove("SDKROOT")
+        .args(["-fobjc-arc", "-framework", "Cocoa", "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\
+<key>CFBundleIdentifier</key><string>{bundle_id}</string>\
+<key>CFBundleExecutable</key><string>{name}</string>\
+<key>CFBundleName</key><string>{name}</string>\
+<key>CFBundlePackageType</key><string>APPL</string>\
+<key>CFBundleVersion</key><string>1</string>\
+</dict></plist>\n"
+        ),
+    )
+    .unwrap();
+    let signed = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&app)
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    (app, executable)
+}
+
+/// The PIDs running `executable`.
+fn pids_of(executable: &Path) -> Vec<i32> {
+    let output = Command::new("/usr/bin/pgrep")
+        .arg("-f")
+        .arg(executable)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+fn wait_for_pid(executable: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(pid) = pids_of(executable).first() {
+            return *pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never started",
+            executable.display()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Removes a stand-in application's Launch Services registration.
+struct Registered(PathBuf);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let _ = Command::new(
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+        )
+        .arg("-u")
+        .arg(&self.0)
+        .output();
+    }
+}
+
+/// AC-30, HY-3 (DC-73), live: an application the lease opened with `open`
+/// is asked to quit at release and recorded with the `application` rule;
+/// an application the owner opened during the lease, which no rule may
+/// touch, keeps running. It builds, registers and opens two stand-in
+/// applications in this Mac's desktop session, which is why it is not in
+/// the default suite (DC-253).
+#[test]
+#[ignore = "live TL-6: builds, registers and opens stand-in applications in this Mac's desktop session through a second instance with exposure on; see the module documentation"]
+fn live_ac30_release_quits_the_applications_the_lease_opened_and_only_those() {
+    if !in_gui_session() {
+        eprintln!("skipped: no logged-in GUI session to open applications in");
+        return;
+    }
+    let live = Live::new();
+    let tag = &uuid_like();
+    let (lease_app, lease_exe) = stand_in_app(
+        &live.root,
+        "LeaseStandIn",
+        &format!("dev.machine-service.test.lease.{tag}"),
+    );
+    let (owner_app, owner_exe) = stand_in_app(
+        &live.root,
+        "OwnerStandIn",
+        &format!("dev.machine-service.test.owner.{tag}"),
+    );
+    let _registrations = (Registered(lease_app.clone()), Registered(owner_app.clone()));
+    let instance = live.start("state");
+    let (name, lease, _) = instance.acquire("live-apps", "none");
+
+    // The owner opens an application during the lease, outside it.
+    let opened = Command::new("/usr/bin/open")
+        .args(["-g", "-n"])
+        .arg(&owner_app)
+        .env_remove("MACHINE_SERVICE_LEASE_ID")
+        .status()
+        .unwrap();
+    assert!(opened.success());
+    let owner_pid = wait_for_pid(&owner_exe);
+    let _owner_guard = Leftover(owner_pid);
+    // The lease opens one through Launch Services.
+    let output = instance.exec(
+        &name,
+        &lease,
+        &format!(
+            "/usr/bin/open -g -n '{}' && echo opened",
+            lease_app.display()
+        ),
+    );
+    assert_eq!(output["output"].as_str().unwrap().trim(), "opened");
+    let lease_pid = wait_for_pid(&lease_exe);
+    let _lease_guard = Leftover(lease_pid);
+
+    let released = instance.release(&name, &lease);
+    let swept = released["hygiene"]["swept"].as_array().unwrap().clone();
+    let entry = swept
+        .iter()
+        .find(|entry| entry["pid"] == lease_pid)
+        .unwrap_or_else(|| panic!("the lease's application was not swept: {swept:?}"));
+    assert_eq!(entry["rule"], "application");
+    assert_eq!(entry["ended"], true);
+    assert_eq!(entry["signal"], "QUIT", "asked to quit first: {entry}");
+    assert!(wait_dead(lease_pid));
+    assert!(alive(owner_pid), "the owner's application was ended");
+    assert!(swept.iter().all(|entry| entry["pid"] != owner_pid));
+}
+
+/// A short random tag for bundle identifiers.
+fn uuid_like() -> String {
+    format!(
+        "{:x}{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    )
 }

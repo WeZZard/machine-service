@@ -6,7 +6,7 @@
 
 use std::io::{self, PipeWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,14 +32,14 @@ struct Faults {
 
 /// A guest session agent behind a link the test controls.
 struct Link {
-    child: Child,
+    child: service_layout::test_build::harness::Owned,
     to_agent: Arc<Mutex<Option<ChildStdin>>>,
     to_host: Arc<Mutex<Option<PipeWriter>>>,
 }
 
 impl Link {
     fn start(home: &Path, faults: Faults) -> (Link, Session) {
-        let mut child = Command::new(AGENT)
+        let mut child = service_layout::test_build::harness::command(AGENT)
             .arg("serve")
             .env("HOME", home)
             .env("SHELL", "/bin/sh")
@@ -51,7 +51,7 @@ impl Link {
             .expect("start the agent");
         let (host_reader, link_writer) = io::pipe().unwrap();
         let (mut link_reader, host_writer) = io::pipe().unwrap();
-        let to_agent = Arc::new(Mutex::new(child.stdin.take()));
+        let to_agent = Arc::new(Mutex::new(child.child().stdin.take()));
         let to_host = Arc::new(Mutex::new(Some(link_writer)));
         {
             // Host → agent. On a failed write the link stops reading, so the
@@ -71,7 +71,7 @@ impl Link {
         }
         {
             // Agent → host.
-            let mut agent_output = child.stdout.take().unwrap();
+            let mut agent_output = child.child().stdout.take().unwrap();
             let to_agent = Arc::clone(&to_agent);
             let to_host = Arc::clone(&to_host);
             thread::spawn(move || {
@@ -109,15 +109,14 @@ impl Link {
 
     /// Kill the agent itself, as a guest-side crash does.
     fn crash(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.child.child().kill();
     }
 }
 
 impl Drop for Link {
     fn drop(&mut self) {
         self.cut();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.end();
     }
 }
 

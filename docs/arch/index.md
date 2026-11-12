@@ -45,8 +45,10 @@ flowchart LR
 2. RS: [Remote session](remote-session.md). A resumable WebSocket session with heartbeats and execution IDs carries operations across unreliable networks, at most once.
 3. RA: [Relay agent](relay-agent.md). A daemon in each machine's desktop session dials out to the broker and runs every action as a child of that session; SSH stays for bootstrap, rescue and fallback.
 4. BK: [Broker](broker.md). A part of machine-service that relay agents and clients both dial out to, which pairs each client with its lease's relay agent.
-5. TC: [Transport contract](transport-contract.md). The worst case of every supported network; the relay stack relies on nothing more, so an intranet that passes the relay acceptance proves Tailscale and Cloudflare Tunnel too.
+5. RP: [Relay protocol](relay-protocol.md). The client-facing wire contract of the broker: session messages, roles and credentials, relay messages, execution IDs, errors and discovery fields.
+6. TC: [Transport contract](transport-contract.md). The worst case of every supported network; the relay stack relies on nothing more, so an intranet that passes the relay acceptance proves Tailscale and Cloudflare Tunnel too.
 
 ## Tests
 
 1. TL: [Test layers](test-layers.md). Each behaviour is tested on the layer that owns it: unit, component integration, network lab, live VM, end to end, and live durable machine.
+2. LR: [Lab runners](lab-runners.md). Each lab job runs in an ephemeral runner, a fresh VM that production lends with the `ci` credential pack, a one-job runner and a network limited to GitHub and the run's test environments; the code under test is a test environment started from the run's own build for that run only, and a durable Mac has one only during a run its owner dispatched.

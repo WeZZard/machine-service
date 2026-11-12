@@ -15,8 +15,11 @@ pub mod exec;
 pub mod hostlock;
 pub mod identity;
 pub mod inventory;
+pub mod launch;
 pub mod lease;
 pub mod process;
+pub mod relay_agent;
+pub mod seam;
 pub mod session_env;
 
 pub use config::DurableConfig;

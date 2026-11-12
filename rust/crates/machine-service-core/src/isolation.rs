@@ -234,8 +234,8 @@ cat > \"$plist\" <<'PLIST'\n\
 PLIST\n\
 chown root:wheel \"$plist\"\n\
 chmod 644 \"$plist\"\n\
-launchctl bootout system/{GUEST_FORWARDER_LABEL} 2>/dev/null || true\n\
-launchctl bootstrap system \"$plist\"\n\
+/bin/launchctl bootout system/{GUEST_FORWARDER_LABEL} 2>/dev/null || true\n\
+/bin/launchctl bootstrap system \"$plist\"\n\
 i=0\n\
 until dig +short +time=2 +tries=1 @127.0.0.1 {EGRESS_HOST} A | grep -q '^[0-9]'; do\n\
   i=$((i + 1))\n\
@@ -289,6 +289,100 @@ pub fn as_root(script: &str, password: &str) -> (String, Option<Vec<u8>>) {
 pub struct GuestFirewall {
     /// The table file the anchor reads and this service writes.
     pub table: PathBuf,
+    /// The host port the anchor lets the guests reach, the broker's
+    /// (DC-107); `None` for an anchor installed before it, or without it.
+    pub broker_port: Option<u16>,
+    /// The anchor's egress section's files (DC-267); `None` for an
+    /// anchor installed before it.
+    pub egress: Option<guest_firewall::EgressFiles>,
+}
+
+/// What an egress guest's acquisition reads from the egress section's files
+/// (DC-267).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressPolicy {
+    /// The section's files.
+    pub files: guest_firewall::EgressFiles,
+    /// The name the isolation check loads over HTTPS: the allow file's
+    /// `# check:` line.
+    pub check_name: String,
+    /// The lab hosts' addresses, which Softnet must pass.
+    pub lab: Vec<String>,
+}
+
+/// Whether `entry`, an address or a network of a pf table file, holds
+/// `address`.
+pub fn entry_holds(entry: &str, address: Ipv4Addr) -> bool {
+    let (base, bits) = match entry.split_once('/') {
+        Some((base, bits)) => (base, bits.parse::<u32>().ok()),
+        None => (entry, Some(32)),
+    };
+    let (Ok(base), Some(bits)) = (base.parse::<Ipv4Addr>(), bits) else {
+        return false;
+    };
+    if bits > 32 {
+        return false;
+    }
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    u32::from(base) & mask == u32::from(address) & mask
+}
+
+/// Check that this host can give an egress guest its fence, or say why
+/// not: the installed anchor has the egress section, this service can
+/// write its guests' file, and the allow file names a check name and holds
+/// every guest resolver, so the guest can still resolve names (DC-16).
+pub fn check_egress(
+    firewall: &GuestFirewall,
+    resolvers: &[GuestResolver],
+) -> Result<EgressPolicy, String> {
+    let install = guest_firewall::install_command(&installer_path(), &firewall.table);
+    let files = firewall.egress.clone().ok_or_else(|| {
+        format!(
+            "guest firewall outdated: its anchor has no egress section (DC-267); reinstall it \
+with: {install}"
+        )
+    })?;
+    let directory = files.guests.parent().unwrap_or_else(|| Path::new("/"));
+    if !writable(directory) || (files.guests.exists() && !writable(&files.guests)) {
+        return Err(format!(
+            "egress guests' table {} is not writable by this machine-service; reinstall the guest \
+firewall from this account with: {install}",
+            files.guests.display()
+        ));
+    }
+    let allow = std::fs::read_to_string(&files.allow).unwrap_or_default();
+    let check_name = guest_firewall::parse_check_name(&allow).ok_or_else(|| {
+        format!(
+            "the egress allowlist {} names no check name; lab-host writes it (LR-5)",
+            files.allow.display()
+        )
+    })?;
+    let entries = guest_firewall::parse_addresses(&allow);
+    if let Some(missing) = resolvers.iter().find(|resolver| {
+        !entries
+            .iter()
+            .any(|entry| entry_holds(entry, resolver.address))
+    }) {
+        return Err(format!(
+            "the egress allowlist {} does not hold the guest resolver {}; lab-host writes it (LR-5)",
+            files.allow.display(),
+            missing.address
+        ));
+    }
+    let lab =
+        guest_firewall::parse_addresses(&std::fs::read_to_string(&files.lab).unwrap_or_default())
+            .into_iter()
+            .filter(|entry| guest_firewall::valid_entry(entry))
+            .collect();
+    Ok(EgressPolicy {
+        files,
+        check_name,
+        lab,
+    })
 }
 
 /// The anchor file the service reads: `MACHINE_SERVICE_GUEST_FIREWALL_ANCHOR`, or
@@ -349,6 +443,8 @@ account with: {install} (no NAT fallback)",
     }
     Ok(GuestFirewall {
         table: table.to_path_buf(),
+        broker_port: guest_firewall::parse_anchor_broker_port(&text),
+        egress: guest_firewall::parse_anchor_egress(&text),
     })
 }
 
@@ -496,19 +592,44 @@ after {PROBE_RETRY_S} s; the pf anchor {} is not dropping the addresses in {}; i
 /// resolver and loads it over HTTPS, printing
 /// `egress name=<host> address=<a.b.c.d|none> https=<status>`.
 pub fn egress_command(kind: &str) -> String {
+    egress_command_for(kind, EGRESS_HOST)
+}
+
+/// The egress check's guest command for `host`, a name the caller chose
+/// from its own configuration, never a client's.
+pub fn egress_command_for(kind: &str, host: &str) -> String {
+    let host = shell_quote(host);
     let lookup = if kind == "macos" {
-        format!(
-            "dscacheutil -q host -a name {EGRESS_HOST} | awk '/^ip_address:/ {{print $2; exit}}'"
-        )
+        format!("dscacheutil -q host -a name {host} | awk '/^ip_address:/ {{print $2; exit}}'")
     } else {
-        format!("getent ahostsv4 {EGRESS_HOST} | awk 'NR == 1 {{print $1}}'")
+        format!("getent ahostsv4 {host} | awk 'NR == 1 {{print $1}}'")
     };
     format!(
         "# {EGRESS_MARKER}\n\
 a=$({lookup})\n\
-c=$(curl -sS -o /dev/null -w '%{{http_code}}' -m 20 https://{EGRESS_HOST}/ 2>/dev/null || true)\n\
-echo \"egress name={EGRESS_HOST} address=${{a:-none}} https=${{c:-000}}\"\n"
+c=$(curl -sS -o /dev/null -w '%{{http_code}}' -m 20 https://{host}/ 2>/dev/null || true)\n\
+echo \"egress name={host} address=${{a:-none}} https=${{c:-000}}\"\n"
     )
+}
+
+/// Decide an egress guest's denied check (DC-267): HTTPS to
+/// [`EGRESS_HOST`], which no allowlist holds, must not answer at all. The
+/// name may still resolve, since the guest's resolvers are allowed.
+pub fn decide_denied(egress: Option<&Egress>) -> Result<(), String> {
+    let Some(egress) = egress else {
+        return Err(format!(
+            "guest egress fence check failed: no result for {EGRESS_HOST}"
+        ));
+    };
+    if egress.https == "000" {
+        Ok(())
+    } else {
+        Err(format!(
+            "guest egress fence check failed: https://{EGRESS_HOST}/ at {} answered {} in an egress \
+guest, which the allowlist does not hold",
+            egress.address, egress.https
+        ))
+    }
 }
 
 /// What the egress check saw.
@@ -544,26 +665,29 @@ pub fn parse_egress(output: &str) -> Option<Egress> {
 /// Decide the egress check: the name must resolve to a public address, and
 /// HTTPS must answer with a 2xx or 3xx status.
 pub fn decide_egress(egress: Option<&Egress>) -> Result<(), String> {
+    decide_egress_for(EGRESS_HOST, egress)
+}
+
+/// [`decide_egress`] for the name `EGRESS_HOST` stands for.
+pub fn decide_egress_for(host: &str, egress: Option<&Egress>) -> Result<(), String> {
     let Some(egress) = egress else {
-        return Err(format!(
-            "guest egress check failed: no result for {EGRESS_HOST}"
-        ));
+        return Err(format!("guest egress check failed: no result for {host}"));
     };
     let address: Option<Ipv4Addr> = egress.address.parse().ok();
     match address {
         Some(address) if globally_routable(address) => {}
         _ => {
             return Err(format!(
-            "guest egress check failed: {EGRESS_HOST} resolved to {} in the guest, not a public \
+                "guest egress check failed: {host} resolved to {} in the guest, not a public \
 address; the guest's DNS over TLS is not answering",
-            egress.address
-        ))
+                egress.address
+            ))
         }
     }
     match egress.https.parse::<u16>() {
         Ok(status) if (200..400).contains(&status) => Ok(()),
         _ => Err(format!(
-            "guest egress check failed: https://{EGRESS_HOST}/ at {} answered {} in the guest",
+            "guest egress check failed: https://{host}/ at {} answered {} in the guest",
             egress.address, egress.https
         )),
     }
@@ -572,6 +696,44 @@ address; the guest's DNS over TLS is not answering",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_allowlist_entry_holds_its_addresses() {
+        let address = |text: &str| text.parse::<Ipv4Addr>().unwrap();
+        assert!(entry_holds("1.1.1.1", address("1.1.1.1")));
+        assert!(!entry_holds("1.1.1.1", address("1.0.0.1")));
+        assert!(entry_holds("140.82.112.0/20", address("140.82.127.255")));
+        assert!(!entry_holds("140.82.112.0/20", address("140.82.128.0")));
+        assert!(entry_holds("0.0.0.0/0", address("8.8.8.8")));
+        assert!(!entry_holds("1.1.1.1/33", address("1.1.1.1")));
+        assert!(!entry_holds("example.com", address("1.1.1.1")));
+    }
+
+    #[test]
+    fn the_egress_check_loads_the_name_it_is_given() {
+        let command = egress_command_for("linux", "api.github.com");
+        assert!(command.contains(EGRESS_MARKER));
+        assert!(command.contains("https://api.github.com/"));
+        assert!(decide_egress_for(
+            "api.github.com",
+            Some(&Egress {
+                address: "140.82.112.6".into(),
+                https: "200".into()
+            })
+        )
+        .is_ok());
+        assert!(decide_denied(Some(&Egress {
+            address: "104.20.23.154".into(),
+            https: "000".into()
+        }))
+        .is_ok());
+        let open = decide_denied(Some(&Egress {
+            address: "104.20.23.154".into(),
+            https: "200".into(),
+        }));
+        assert!(open.unwrap_err().contains("fence check failed"));
+        assert!(decide_denied(None).is_err());
+    }
 
     fn gateway() -> Option<Ipv4Addr> {
         Some("192.168.2.1".parse().unwrap())
@@ -644,7 +806,7 @@ mod tests {
         assert!(script.contains(
             "\t\t<string>--upstream</string>\n\t\t<string>1.1.1.1#cloudflare-dns.com</string>\n\t\t<string>--upstream</string>\n\t\t<string>8.8.8.8#dns.google</string>\n"
         ));
-        assert!(script.contains("launchctl bootstrap system \"$plist\""));
+        assert!(script.contains("/bin/launchctl bootstrap system \"$plist\""));
         assert!(script.contains("dig +short +time=2 +tries=1 @127.0.0.1 example.com A"));
         assert!(script.contains("networksetup -setdnsservers \"$svc\" 127.0.0.1\n"));
         assert_eq!(
@@ -875,7 +1037,7 @@ mod tests {
 
         std::fs::write(
             &anchor,
-            guest_firewall::anchor_rules(Path::new("/elsewhere/guests")),
+            guest_firewall::anchor_rules(Path::new("/elsewhere/guests"), Some(6241)),
         )
         .unwrap();
         let error = check_guest_firewall(&anchor, &table).unwrap_err();
@@ -884,12 +1046,19 @@ mod tests {
             "{error}"
         );
 
-        std::fs::write(&anchor, guest_firewall::anchor_rules(&table)).unwrap();
+        std::fs::write(&anchor, guest_firewall::anchor_rules(&table, None)).unwrap();
         assert_eq!(
             check_guest_firewall(&anchor, &table).unwrap(),
             GuestFirewall {
-                table: table.clone()
+                table: table.clone(),
+                broker_port: None,
+                egress: Some(guest_firewall::EgressFiles::beside(&table)),
             }
+        );
+        std::fs::write(&anchor, guest_firewall::anchor_rules(&table, Some(6241))).unwrap();
+        assert_eq!(
+            check_guest_firewall(&anchor, &table).unwrap().broker_port,
+            Some(6241)
         );
 
         std::fs::remove_file(&table).unwrap();

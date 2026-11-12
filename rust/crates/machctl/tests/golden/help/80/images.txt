@@ -1,6 +1,9 @@
-usage: machctl images [-h] [--json] [--reload]
+usage: machctl images [-h] [--json] [--reload] [--local] [--instance INSTANCE]
 
 options:
-  -h, --help  show this help message and exit
-  --json      machine-readable output
-  --reload    rebuild the image catalog first; exit 1 unless it is current
+  -h, --help           show this help message and exit
+  --json               machine-readable output
+  --reload             rebuild the image catalog first; exit 1 unless it is
+                       current
+  --local              ask only the local instance
+  --instance INSTANCE  ask only this instance (ID or address)

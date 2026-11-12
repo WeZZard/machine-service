@@ -24,7 +24,7 @@
 - SSH stdio channel: `ssh <lease key options> -T <user>@<ip> <start command>`. It uses the lease's existing identity, host-key pin and `ClearAllForwardings=yes`; it adds no new authority.
 - Tart exec channel: `tart exec -i <vm> <start command>`. It reaches the guest over vsock through the Tart guest agent (Tart 2.40.1 or later), so it does not depend on the guest network or sshd.
 - Every channel must start the agent as the lease's SSH user with that user's login environment, because commands sent today inherit that environment from `sshd`.
-- `MACHINE_SERVICE_GUEST_LINK` selects the link: `ssh` (one SSH connection per operation, the current behaviour), `ssh-session` or `tart-session`. The [conformance suite](test-layers.md#tl-4-live-vm) decides which becomes the default.
+- `MACHINE_SERVICE_GUEST_LINK` selects the link: `ssh` (one SSH connection per operation, the current behaviour), `ssh-session`, or `relay`, the [relay agent](relay-agent.md) through the [broker](broker.md). The [conformance suite](test-layers.md#tl-4-live-vm) decides which becomes the default.
 
 ## GS-3: The guest session agent
 

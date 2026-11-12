@@ -9,17 +9,17 @@ positional arguments:
     acquire             lease a machine: a fresh VM clone, or a durable Mac
     wait                block until a lease is running (useful after --no-wait)
     list                list every machine from every instance
-    images              query available images and capacity
-    images-show         show one image's full record (JSON)
+    images              query every instance's images and capacity
+    images-show         show one image's full record on every instance (JSON)
     status              show one lease
     exec                run a command in the guest
     push                copy host -> guest
     pull                copy guest -> host
     heartbeat           reset TTL; keeps a leased machine alive
     release             end a lease; a VM is stopped, deleted and unregistered
-    capabilities        show supported and unavailable network capabilities
+    capabilities        show every instance's supported and unavailable network capabilities
     acquisition-capabilities
-                        describe acquisition and console prerequisites without allocating a VM
+                        describe every instance's acquisition and console prerequisites without allocating a VM
     console-resolve     resolve the exact lease console; viewer is on the service host
     console-open        open the exact lease console; viewer is on the service host
     console-cancel      cancel the exact lease console; viewer is on the service host

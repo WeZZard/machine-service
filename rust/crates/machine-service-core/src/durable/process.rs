@@ -160,8 +160,24 @@ fn process_path(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buffer).to_string())
 }
 
-/// The whole process table, optionally limited to one user.
+/// The process table the sweep sees, optionally limited to one user. In a
+/// test build, only the processes it started and its fixture's rows
+/// (`seam`, DC-253).
 pub fn process_table(uid: Option<u32>) -> Vec<ProcessInfo> {
+    if !super::seam::active() {
+        return system_table(uid);
+    }
+    let started = super::seam::signalable();
+    let mut rows: Vec<ProcessInfo> = system_table(uid)
+        .into_iter()
+        .filter(|info| started.contains(&info.pid))
+        .collect();
+    rows.extend(super::seam::fixture_rows(uid));
+    rows
+}
+
+/// The Mac's whole process table, optionally limited to one user.
+pub fn system_table(uid: Option<u32>) -> Vec<ProcessInfo> {
     let mut capacity = 4096usize;
     let pids: Vec<i32> = loop {
         let mut buffer = vec![0i32; capacity];
@@ -185,8 +201,16 @@ pub fn process_table(uid: Option<u32>) -> Vec<ProcessInfo> {
         .collect()
 }
 
-/// Read a process's arguments and start-up environment.
+/// Read a process's arguments and start-up environment; a test build's
+/// fixture row's are the fixture's.
 pub fn process_arguments(pid: i32) -> Option<Arguments> {
+    if super::seam::active() && super::seam::is_fixture(pid) {
+        return super::seam::arguments(pid);
+    }
+    system_arguments(pid)
+}
+
+fn system_arguments(pid: i32) -> Option<Arguments> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut size: libc::size_t = 0;
     // SAFETY: a size query with a null buffer; `mib` is valid for its length.
@@ -265,18 +289,31 @@ pub fn parse_procargs(buffer: &[u8]) -> Option<Arguments> {
 
 /// A process session the lease started (DM-4): its ID, which is its
 /// leader's PID, and the leader's start time.
+///
+/// A command that the relay agent runs is not a session of its own: the
+/// agent starts each command as a process group in the agent's session, and
+/// a group leader cannot start a session. Such a command is recorded as its
+/// process group, with `group` set, and its members are the processes of
+/// that group (RA-2, DC-164).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseSession {
-    /// The session ID.
+    /// The session ID, or the process group ID when `group` is set.
     pub sid: i32,
     /// The leader's start time.
     pub leader_start: (u64, u64),
+    /// Whether this records a process group rather than a session.
+    pub group: bool,
 }
 
 impl LeaseSession {
     /// The JSON form kept in the lease record.
     pub fn to_json(&self) -> Value {
-        json!({"sid": self.sid, "leader_start": [self.leader_start.0, self.leader_start.1]})
+        let mut value =
+            json!({"sid": self.sid, "leader_start": [self.leader_start.0, self.leader_start.1]});
+        if self.group {
+            value["group"] = json!(true);
+        }
+        value
     }
 
     /// Read the JSON form back.
@@ -286,7 +323,17 @@ impl LeaseSession {
         Some(Self {
             sid,
             leader_start: (start.first()?.as_u64()?, start.get(1)?.as_u64()?),
+            group: value.get("group").and_then(Value::as_bool).unwrap_or(false),
         })
+    }
+
+    /// Whether `info` is a member: of the session, or of the group.
+    fn contains(&self, info: &ProcessInfo) -> bool {
+        if self.group {
+            info.pgid == self.sid
+        } else {
+            info.sid == Some(self.sid)
+        }
     }
 }
 
@@ -381,7 +428,7 @@ pub struct Verdict {
 fn trusted_sessions(
     by_pid: &HashMap<i32, &ProcessInfo>,
     sessions: &[LeaseSession],
-) -> HashMap<i32, (u64, u64)> {
+) -> Vec<LeaseSession> {
     sessions
         .iter()
         .filter(|session| {
@@ -389,8 +436,16 @@ fn trusted_sessions(
                 .get(&session.sid)
                 .is_none_or(|leader| leader.start == session.leader_start)
         })
-        .map(|session| (session.sid, session.leader_start))
+        .copied()
         .collect()
+}
+
+/// Whether `info` belongs to a trusted session or group, and started no
+/// earlier than its leader.
+fn in_trusted(info: &ProcessInfo, trusted: &[LeaseSession]) -> bool {
+    trusted
+        .iter()
+        .any(|session| session.contains(info) && info.start >= session.leader_start)
 }
 
 /// The members of the lease's trusted sessions: the processes a release
@@ -404,14 +459,7 @@ pub fn session_members(
     let trusted = trusted_sessions(&by_pid, &context.sessions);
     let mut verdict = Verdict::default();
     for info in table {
-        if info.uid != context.uid || info.zombie {
-            continue;
-        }
-        let Some(sid) = info.sid else { continue };
-        let Some(leader_start) = trusted.get(&sid) else {
-            continue;
-        };
-        if info.start < *leader_start {
+        if info.uid != context.uid || info.zombie || !in_trusted(info, &trusted) {
             continue;
         }
         let matched = Matched {
@@ -431,11 +479,8 @@ pub fn classify(
 ) -> Verdict {
     let by_pid: HashMap<i32, &ProcessInfo> = table.iter().map(|info| (info.pid, info)).collect();
     let trusted = trusted_sessions(&by_pid, &context.sessions);
-    let in_session = |info: &ProcessInfo| -> bool {
-        info.sid
-            .and_then(|sid| trusted.get(&sid))
-            .is_some_and(|leader_start| info.uid == context.uid && info.start >= *leader_start)
-    };
+    let in_session =
+        |info: &ProcessInfo| -> bool { info.uid == context.uid && in_trusted(info, &trusted) };
     let tag = format!("{LEASE_VARIABLE}={}", context.lease_id);
     let mut verdict = Verdict::default();
     for info in table {
@@ -644,6 +689,9 @@ impl Ended {
 /// Whether `info` still names a living process: same PID, same start time,
 /// same user, not a zombie.
 pub fn still_alive(info: &ProcessInfo) -> bool {
+    if super::seam::active() && super::seam::is_fixture(info.pid) {
+        return super::seam::fixture_alive(info.pid);
+    }
     process_info(info.pid)
         .is_some_and(|now| now.start == info.start && now.uid == info.uid && !now.zombie)
 }
@@ -652,6 +700,16 @@ pub fn still_alive(info: &ProcessInfo) -> bool {
 fn send(info: &ProcessInfo, signal: libc::c_int) -> bool {
     if info.pid <= 1 || !still_alive(info) {
         return false;
+    }
+    // A test build signals only what it started, or its fixture's rows
+    // (DC-253).
+    if super::seam::active() {
+        let name = match signal {
+            libc::SIGTERM => "TERM",
+            libc::SIGKILL => "KILL",
+            _ => "SIGNAL",
+        };
+        return super::seam::send(info.pid, signal, name);
     }
     // SAFETY: `kill` takes a PID that was re-validated immediately above.
     unsafe { libc::kill(info.pid, signal) == 0 }
@@ -776,6 +834,58 @@ mod tests {
         out
     }
 
+    /// A command the relay agent runs is recorded as its process group in
+    /// the agent's session: the group and its descendants are the lease's,
+    /// while the agent and the agent's other commands, in the same session,
+    /// are not (RA-2, HY-3).
+    #[test]
+    fn a_relay_command_is_matched_by_its_process_group() {
+        let group_row = |pid: i32, ppid: i32, pgid: i32, start: u64, comm: &str| ProcessInfo {
+            pgid,
+            ..row(pid, ppid, 100, start, comm)
+        };
+        let table = vec![
+            group_row(100, 1, 100, 900, "relay-agent"),
+            group_row(200, 100, 200, 1100, "zsh"),
+            group_row(201, 200, 200, 1101, "sleep"),
+            // Left the group with setpgid; still a descendant.
+            group_row(202, 201, 202, 1102, "sleep"),
+            // Another command of the agent, not the lease's.
+            group_row(300, 100, 300, 1200, "sh"),
+        ];
+        let group = LeaseSession {
+            sid: 200,
+            leader_start: (1100, 0),
+            group: true,
+        };
+        assert_eq!(
+            LeaseSession::from_json(&group.to_json()),
+            Some(group),
+            "the record keeps its kind"
+        );
+        let verdict = classify(&table, &context(vec![group]), &no_arguments);
+        assert_eq!(
+            pids(&verdict),
+            vec![
+                (200, Rule::Session),
+                (201, Rule::Session),
+                (202, Rule::Descendant)
+            ]
+        );
+        let members = session_members(&table, &context(vec![group]), &no_arguments);
+        assert_eq!(
+            pids(&members),
+            vec![(200, Rule::Session), (201, Rule::Session)]
+        );
+        // Read as a session, the same ID would name nothing here, and the
+        // agent's own session ID never names the lease.
+        let as_session = LeaseSession {
+            group: false,
+            ..group
+        };
+        assert!(pids(&classify(&table, &context(vec![as_session]), &no_arguments)).is_empty());
+    }
+
     /// AC-30 (TL-1): the rules match the lease's session, its descendants
     /// that left the session, and lease-tagged processes, and nothing else:
     /// not a process from before the lease, not another user's, not an
@@ -785,6 +895,7 @@ mod tests {
         let session = LeaseSession {
             sid: 200,
             leader_start: (1100, 0),
+            group: false,
         };
         let table = vec![
             row(1, 0, 1, 0, "launchd"),
@@ -837,6 +948,7 @@ mod tests {
         let session = LeaseSession {
             sid: 200,
             leader_start: (1100, 0),
+            group: false,
         };
         let mut ci_listener = row(210, 200, 200, 1101, "Runner.Listener");
         ci_listener.path = Some("/Users/u/actions-runner/bin/Runner.Listener".to_string());
@@ -873,6 +985,7 @@ mod tests {
         sessions.sessions.push(LeaseSession {
             sid: 50,
             leader_start: (900, 0),
+            group: false,
         });
         sessions.lease_started = 0.0;
         let verdict = classify(&table, &sessions, &arguments);
@@ -905,6 +1018,7 @@ mod tests {
         let session = LeaseSession {
             sid: 200,
             leader_start: (1100, 0),
+            group: false,
         };
         let table = vec![
             // PID 200 now belongs to a later, unrelated session leader.
@@ -925,10 +1039,12 @@ mod tests {
             LeaseSession {
                 sid: 200,
                 leader_start: (1100, 0),
+                group: false,
             },
             LeaseSession {
                 sid: 300,
                 leader_start: (1200, 0),
+                group: false,
             },
         ];
         let table = vec![
@@ -967,7 +1083,7 @@ mod tests {
         let me = process_info(pid).unwrap();
         // SAFETY: `geteuid` only reads process state.
         assert_eq!(me.uid, unsafe { libc::geteuid() });
-        assert!(process_table(Some(me.uid))
+        assert!(system_table(Some(me.uid))
             .iter()
             .any(|info| info.pid == pid));
         let args = process_arguments(pid).unwrap();

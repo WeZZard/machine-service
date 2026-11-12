@@ -9,5 +9,17 @@ publish.workspace = true
 name = "service_layout"
 path = "src/lib.rs"
 
+[features]
+# The test seams of a test build (DC-251): the marker, the guard of
+# the installed defaults, the tool table's test folder and the lifeline.
+# Only the workspace's dev-dependencies enable it, so only `cargo test`
+# builds it into a binary; a release build never carries it.
+test-build = []
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -19,10 +19,19 @@ mod name_watch;
 mod probe;
 
 fn main() {
+    // A test build keeps its marker and watches its test's lifeline; a
+    // release does nothing (DC-256).
+    machine_service_core::service_layout::test_build::start();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--probe-host") {
         probe::run();
         return;
+    }
+    // One durable job's feeder, which the daemon starts (DM-4, DC-319).
+    if arguments.first().map(String::as_str)
+        == Some(machine_service_core::durable::launch::FEED_ARGUMENT)
+    {
+        std::process::exit(machine_service_core::durable::launch::feed_main());
     }
     if let Err(message) = run(&arguments) {
         eprintln!("machine-service: {message}");
@@ -37,6 +46,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
     environment::renamed::refuse_legacy_variables(
         std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
     )?;
+    machine_service_core::test_guard::check_environment_selection()?;
     let mut environment_path: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
@@ -60,8 +70,24 @@ fn run(arguments: &[String]) -> Result<(), String> {
         None => Config::legacy(),
     };
     config.guest_link = GuestLink::from_environment()?;
+    // A second instance runs only on resources of its own, and says so in
+    // `/health`, the one mark the live tools accept (DC-244).
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    if let Some(marker) = second_instance::from_process_env(&home)? {
+        if bundle.is_some() {
+            return Err(format!(
+                "{}: a second instance never runs a selected environment",
+                second_instance::MARKER_VARIABLE
+            ));
+        }
+        machine_service_core::second::set(marker);
+    }
     // An unknown mode stops the daemon before it serves (FD-1, DC-84).
     let discovery_mode = discovery::Mode::from_environment()?;
+    // A test build touches none of the installed defaults (DC-251).
+    machine_service_core::test_guard::check(&config)?;
 
     if bundle.is_none() {
         // A selected startup binds a store/state; legacy startup must not
@@ -142,6 +168,10 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
         service.log(&format!("WARN: startup reconciliation failed: {error}"));
     }
     durable_routes::install(&service)?;
+    if service.config.guest_link == GuestLink::Relay {
+        start_relay(&service)?;
+    }
+    durable_routes::start(&service);
 
     let address = if service.config.host.contains(':') {
         format!("[{}]:{}", service.config.host, service.config.port)
@@ -176,6 +206,26 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
     Ok(())
 }
 
+/// Start the broker on the session listener and install the relay link
+/// (`docs/arch/broker.md`, BK-1). A listener that cannot start stops the
+/// daemon: an instance told to serve the relay link must not silently serve
+/// SSH instead.
+fn start_relay(service: &Arc<Service>) -> Result<(), String> {
+    use machine_service_core::relay::{Relay, RelaySettings};
+    let settings = RelaySettings::from_environment()?;
+    let log_file = service.config.log_file.clone();
+    let log = Arc::new(move |message: &str| {
+        machine_service_core::config::log_to_file(&log_file, message)
+    });
+    let relay = Relay::start(settings, &service.config.state_dir, log)?;
+    durable_routes::install_relay(&relay, &service.config.state_dir);
+    service
+        .install_relay(relay)
+        .map_err(|error| error.to_string())?;
+    service.watch_relay_agents();
+    Ok(())
+}
+
 /// `virtual` needs Tart as well as a catalog: a Mac without Tart offers only
 /// its durable machine (MM-1, AC-38, DC-66).
 fn offers_virtual(service: &Service) -> bool {
@@ -191,7 +241,8 @@ fn advertise(service: &Service, mode: discovery::Mode) -> Option<discovery::dnss
         service.log("discovery: consul mode; not advertising on the network");
         return None;
     }
-    if discovery::is_loopback_host(&service.config.host) {
+    let scope = discovery::dnssd::Scope::from_environment().ok()?;
+    if discovery::is_loopback_host(&service.config.host) && !scope.is_loopback() {
         service.log(&format!(
             "discovery: bound to loopback ({}), so no other Mac could reach this instance; not advertising",
             service.config.host
@@ -199,13 +250,17 @@ fn advertise(service: &Service, mode: discovery::Mode) -> Option<discovery::dnss
         return None;
     }
     let (instance, machine_id, kinds) = durable_routes::identity(offers_virtual(service))?;
-    let txt = discovery::txt_entries(&instance, &machine_id, &kinds);
+    let mut txt = discovery::txt_entries(&instance, &machine_id, &kinds);
+    if let Some(relay) = service.relay() {
+        let fields = relay.discovery();
+        txt.extend(discovery::relay_txt_entries(&fields[0].1, &fields[1].1));
+    }
     match discovery::dnssd::register(
         &instance,
         discovery::SERVICE_TYPE,
         service.config.port,
         &txt,
-        discovery::dnssd::Scope::from_environment().ok()?,
+        scope,
         std::time::Duration::from_secs(5),
     ) {
         Ok(advertisement) => {
@@ -238,6 +293,10 @@ fn handle(service: &Service, mut request: Request) {
         files::handle(service, request, &name);
         return;
     }
+    if method == Method::Get && url == "/relay/ca.pem" {
+        relay_authority(service, request);
+        return;
+    }
     let response = match method {
         Method::Get => handle_get(service, &mut request, &url),
         Method::Post => handle_post(service, &mut request, &url),
@@ -264,6 +323,25 @@ fn handle(service: &Service, mut request: Request) {
             let _ = send(request, 409, &body);
         }
     }
+}
+
+/// `GET /relay/ca.pem`: the broker's authority, which a client trusts after
+/// checking it against `relay_ca_sha256` (RP-1).
+fn relay_authority(service: &Service, request: Request) {
+    let Some(relay) = service.relay() else {
+        let _ = send(
+            request,
+            404,
+            &json!({"error": "this instance runs no broker"}),
+        );
+        return;
+    };
+    let content_type = Header::from_bytes(&b"Content-Type"[..], &b"application/x-pem-file"[..])
+        .expect("static header");
+    let response = Response::from_string(relay.authority.cert_pem())
+        .with_status_code(200)
+        .with_header(content_type);
+    let _ = request.respond(response);
 }
 
 /// The answer to a request on a removed `/vms` path: HTTP 410 Gone, naming
@@ -361,6 +439,19 @@ fn handle_get(service: &Service, request: &mut Request, url: &str) -> OpResult<(
             body["environment"] = environment.clone();
         }
         durable_routes::health(&mut body, offers_virtual(service));
+        if let Some(marker) = machine_service_core::second::get() {
+            body["second_instance"] = json!({"id": marker.id});
+            if let Some(cell) = &marker.durable_cell {
+                body["second_instance"]["durable_cell"] = json!(cell);
+            }
+        }
+        if let Some(relay) = service.relay() {
+            for (key, value) in relay.discovery() {
+                body[key] = json!(value);
+            }
+            // DC-236: the last check of the held release.
+            body["relay_agent_release"] = relay.release_health();
+        }
         return Ok((200, body));
     }
     if path == "/capabilities" {
@@ -480,6 +571,7 @@ fn handle_post(service: &Service, request: &mut Request, url: &str) -> OpResult<
             ));
         }
         machine_service_core::network::validate_request(&body)?;
+        let egress = machine_service_core::network::validate_egress(&body)?;
         let Some(purpose) = body.get("purpose").and_then(Value::as_str) else {
             return Ok((409, json!({"error": "'purpose' (string) is required"})));
         };
@@ -503,6 +595,7 @@ fn handle_post(service: &Service, request: &mut Request, url: &str) -> OpResult<
             body.get("source").and_then(Value::as_str).unwrap_or("base"),
             body.get("expected_source_fingerprint"),
             body.get("vnc").and_then(Value::as_bool).unwrap_or(false),
+            egress,
         )?;
         return Ok((200, record));
     }

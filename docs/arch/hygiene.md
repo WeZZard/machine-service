@@ -11,6 +11,7 @@
 - Hygiene has three parts: a scratch workspace ([HY-2](#hy-2-scratch-workspace)), a leftover-process sweep ([HY-3](#hy-3-leftover-process-sweep)), and an inventory before and after the lease ([HY-4](#hy-4-inventory-before-and-after)) (DC-28).
 - Hygiene reports. It never refuses an acquisition, never blocks a release, and never undoes a change outside the workspace.
 - A failure in any hygiene step is recorded with its reason in the lease's hygiene record.
+- A step that needs a party absent at release, the relay agent's purge of the lease's records, is kept pending and finished when that party returns, not by holding the Mac. The hygiene record then says it was finished later ([DM-7](durable-machine.md#dm-7-release), DC-177).
 
 ## HY-2: Scratch workspace
 
@@ -21,7 +22,7 @@
 
 - At release, after the lease's own process groups are stopped, the service ends the processes that the lease left running.
 - A process is a leftover when it runs as the operator's account, it started after the lease began, and one of these holds:
-  - It belongs to a process session that the lease started, or it descends from one.
+  - It belongs to a process session that the lease started, or it descends from one. A command of the lease is a launchd job whose label the lease record names, and the shell that launchd started for it leads its process group, which counts as such a session (its own session is launchd's, so the rule goes by the recorded group, [DM-4](durable-machine.md#dm-4-exec), DC-312). The exclusion of launchd jobs' own processes never spares a job the lease record names; the relay agent itself is never matched.
   - Its environment carries `MACHINE_SERVICE_LEASE_ID` with this lease's ID. macOS 27 does not let a process read another process's environment, so there this rule finds nothing, and a process that left the lease's sessions after its parents exited is not swept (DC-48).
   - It is a regular application, one with a Dock presence, that the lease launched: it was not running in the inventory before the lease, and its launchd job in the user's GUI domain (`application.<bundle>.<n>.<n>`) was started with `MACHINE_SERVICE_LEASE_ID` set to this lease's ID. Applications started through Launch Services, for example with `open`, are children of launchd and belong to no session of the lease, but `open` hands the caller's environment to the job it creates, so the lease's own launches carry the variable. An application that was already running is only activated by `open` and keeps its own job, and one that the owner or another program opened carries no such variable, so the rule never ends an application the lease did not launch (DC-73).
 - The job's environment is read with `launchctl print`; only `MACHINE_SERVICE_LEASE_ID` is parsed out, in memory, and nothing else of the output is logged or kept, because a job inherits whatever its caller's environment held.
@@ -49,7 +50,7 @@
 - The global npm packages are recorded as `{name: version}` from the session's `npm ls --global --depth=0 --json`. A crontab entry is recorded as its schedule and its program, keyed by the SHA-256 of its whole line: a change shows, and an argument, such as a token written into a crontab line, never reaches the hygiene record that any LAN client can read (DC-74).
 - The service compares the two inventories and records what was added, removed and changed. The CI runner's processes and files are marked with their origin, so a client does not attribute a CI job's work to the lease.
 - The lease record keeps `inventory-before.json`, `inventory-after.json` and `changes.json` under the lease's state folder. The release response carries `changes.json` and the paths of the full inventories.
-- `GET /machines/<name>/leases/<lease_id>/hygiene` returns the hygiene record of a current or recent lease for 30 days.
+- `GET /machines/<name>/leases/<lease_id>/hygiene` returns the hygiene record of a current or recent lease for 30 days. Its `relay_records` changes once after release, when a pending purge is confirmed (DC-177).
 
 ## HY-5: Coexistence with the CI runner
 

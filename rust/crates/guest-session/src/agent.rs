@@ -8,20 +8,19 @@
 //! command's process group is killed and every unfinished file is removed.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use guest_actions::{kill_group, spawn_shell, ActionError, AtomicFile};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+pub use guest_actions::{hex, resolve};
 
 use crate::frame::{read_frame, write_frame, Frame, FrameError, Kind};
 
@@ -53,30 +52,13 @@ impl AgentOptions {
     /// `$HOME` (else `/`), the hash of the running executable, and alive
     /// frames every [`HEARTBEAT`].
     pub fn from_environment() -> AgentOptions {
-        let shell = std::env::var_os("SHELL")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-        let home = std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let build = std::env::current_exe()
-            .and_then(std::fs::read)
-            .map(|bytes| hex(&Sha256::digest(bytes)))
-            .unwrap_or_default();
         AgentOptions {
-            shell,
-            home,
-            build,
+            shell: guest_actions::user_shell(),
+            home: guest_actions::user_home(),
+            build: guest_actions::executable_sha256(),
             heartbeat: Some(HEARTBEAT),
         }
     }
-}
-
-/// Lower-case hexadecimal.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// The frame writer shared by the request loop and the request threads.
@@ -87,6 +69,10 @@ impl Sink {
     fn send(&self, frame: &Frame) -> io::Result<()> {
         let mut writer = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         write_frame(&mut **writer, frame)
+    }
+
+    fn fail(&self, request: u64, error: &ActionError) {
+        self.error(request, error.code, &error.message);
     }
 
     fn error(&self, request: u64, code: &str, message: &str) {
@@ -112,14 +98,8 @@ enum Pending {
         timeout: Duration,
         input: Vec<u8>,
     },
-    Write {
-        temporary: PathBuf,
-        destination: PathBuf,
-        mode: Option<u32>,
-        file: File,
-        hasher: Sha256,
-        size: u64,
-    },
+    /// Dropping the file removes its temporary sibling.
+    Write(AtomicFile),
 }
 
 /// Serve one guest session until `input` ends.
@@ -166,11 +146,7 @@ pub fn serve(
         Ok(())
     })();
     drop(stop);
-    for (_, request) in pending.drain() {
-        if let Pending::Write { temporary, .. } = request {
-            let _ = std::fs::remove_file(temporary);
-        }
-    }
+    pending.clear();
     for process in running.lock().unwrap_or_else(|p| p.into_inner()).values() {
         kill_group(process.group);
     }
@@ -221,9 +197,9 @@ fn handle(
             let value = frame.value()?;
             match open_write(&value, &options.home, id) {
                 Ok(write) => {
-                    pending.insert(id, write);
+                    pending.insert(id, Pending::Write(write));
                 }
-                Err((code, message)) => sink.error(id, code, &message),
+                Err(error) => sink.fail(id, &error),
             }
         }
         Kind::Read => {
@@ -246,17 +222,10 @@ fn handle(
                     input.extend_from_slice(&frame.payload);
                 }
             }
-            Some(Pending::Write {
-                file, hasher, size, ..
-            }) => {
-                if let Err(error) = file.write_all(&frame.payload) {
-                    if let Some(Pending::Write { temporary, .. }) = pending.remove(&id) {
-                        let _ = std::fs::remove_file(temporary);
-                    }
-                    sink.error(id, "write_failed", &error.to_string());
-                } else {
-                    hasher.update(&frame.payload);
-                    *size += frame.payload.len() as u64;
+            Some(Pending::Write(file)) => {
+                if let Err(error) = file.append(&frame.payload) {
+                    pending.remove(&id);
+                    sink.fail(id, &error);
                 }
             }
             // A request that already failed may still have data in flight.
@@ -290,45 +259,23 @@ fn handle(
                         start_exec(sink, running, id, options, &command, stdin, timeout);
                     }
                 }
-                Some(Pending::Write {
-                    temporary,
-                    destination,
-                    mode,
-                    file,
-                    hasher,
-                    size,
-                }) => {
-                    let digest = hex(&hasher.finalize());
-                    let finished = (|| -> Result<(), (&str, String)> {
-                        if (Some(size), Some(digest.clone())) != declared {
-                            return Err((
-                                "checksum_mismatch",
-                                "file does not match its end frame".into(),
-                            ));
-                        }
-                        file.sync_all()
-                            .map_err(|e| ("write_failed", e.to_string()))?;
-                        drop(file);
-                        if let Some(mode) = mode {
-                            std::fs::set_permissions(
-                                &temporary,
-                                std::fs::Permissions::from_mode(mode & 0o7777),
-                            )
-                            .map_err(|e| ("write_failed", e.to_string()))?;
-                        }
-                        std::fs::rename(&temporary, &destination)
-                            .map_err(|e| ("write_failed", e.to_string()))
-                    })();
+                Some(Pending::Write(file)) => {
+                    let finished = match declared {
+                        (Some(size), Some(sha256)) => file
+                            .seal(size, &sha256)
+                            .and_then(guest_actions::Sealed::rename),
+                        _ => Err(ActionError::new(
+                            "checksum_mismatch",
+                            "file does not match its end frame",
+                        )),
+                    };
                     match finished {
-                        Ok(()) => sink.send(&Frame::json(
+                        Ok(digest) => sink.send(&Frame::json(
                             Kind::Done,
                             id,
-                            &json!({"size": size, "sha256": digest}),
+                            &json!({"size": digest.size, "sha256": digest.sha256}),
                         ))?,
-                        Err((code, message)) => {
-                            let _ = std::fs::remove_file(&temporary);
-                            sink.error(id, code, &message);
-                        }
+                        Err(error) => sink.fail(id, &error),
                     }
                 }
                 None => {}
@@ -338,10 +285,7 @@ fn handle(
             if let Some(process) = running.lock().unwrap().get(&id) {
                 process.cancelled.store(true, Ordering::SeqCst);
                 kill_group(process.group);
-            } else if let Some(request) = pending.remove(&id) {
-                if let Pending::Write { temporary, .. } = request {
-                    let _ = std::fs::remove_file(temporary);
-                }
+            } else if pending.remove(&id).is_some() {
                 sink.error(id, "cancelled", "cancelled before its end frame");
             }
         }
@@ -362,23 +306,11 @@ fn handle(
     Ok(())
 }
 
-/// Resolve a guest path the way `scp` resolves a remote path: `~` and
-/// relative paths are taken from the home directory.
-pub fn resolve(path: &str, home: &Path) -> PathBuf {
-    if path == "~" {
-        home.to_path_buf()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        home.join(path)
-    }
-}
-
-fn open_write(value: &Value, home: &Path, id: u64) -> Result<Pending, (&'static str, String)> {
+fn open_write(value: &Value, home: &Path, id: u64) -> Result<AtomicFile, ActionError> {
     let path = value
         .get("path")
         .and_then(Value::as_str)
-        .ok_or(("invalid_request", "write needs path".to_string()))?;
+        .ok_or_else(|| ActionError::new("invalid_request", "write needs path"))?;
     let name = value
         .get("name")
         .and_then(Value::as_str)
@@ -387,87 +319,29 @@ fn open_write(value: &Value, home: &Path, id: u64) -> Result<Pending, (&'static 
         .get("mode")
         .and_then(Value::as_u64)
         .map(|mode| mode as u32);
-    let mut destination = resolve(path, home);
-    // `scp` copies into an existing directory under the source's own name.
-    if destination.is_dir() {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err((
-                "invalid_request",
-                "a directory destination needs a plain file name".into(),
-            ));
-        }
-        destination = destination.join(name);
-    }
-    let parent = destination
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .ok_or((
-            "not_found",
-            format!("no such directory for {}", destination.display()),
-        ))?;
-    let file_name = destination.file_name().ok_or((
-        "invalid_request",
-        "destination has no file name".to_string(),
-    ))?;
-    let temporary = parent.join(format!(
-        ".{}.guest-session-{}-{id}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    let file = File::create(&temporary).map_err(|error| ("write_failed", error.to_string()))?;
-    Ok(Pending::Write {
-        temporary,
-        destination,
-        mode,
-        file,
-        hasher: Sha256::new(),
-        size: 0,
-    })
+    AtomicFile::create(path, name, mode, home, "guest-session", id)
 }
 
 fn read_file(sink: &Sink, id: u64, path: &Path) {
-    let mut file = match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {
-            return sink.error(
-                id,
-                "is_directory",
-                &format!("{} is a directory", path.display()),
-            )
-        }
-        Ok(_) => match File::open(path) {
-            Ok(file) => file,
-            Err(error) => return sink.error(id, "read_failed", &error.to_string()),
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return sink.error(id, "not_found", &format!("no such file {}", path.display()))
-        }
-        Err(error) => return sink.error(id, "read_failed", &error.to_string()),
+    let file = match guest_actions::open_read(path) {
+        Ok(file) => file,
+        Err(error) => return sink.fail(id, &error),
     };
-    let mut hasher = Sha256::new();
-    let mut size = 0u64;
-    let mut buffer = vec![0u8; CHUNK];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                hasher.update(&buffer[..count]);
-                size += count as u64;
-                if sink
-                    .send(&Frame::new(Kind::Data, id, buffer[..count].to_vec()))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return sink.error(id, "read_failed", &error.to_string()),
+    let sent = guest_actions::read_chunks(file, CHUNK, |bytes| {
+        sink.send(&Frame::new(Kind::Data, id, bytes.to_vec()))
+            .is_ok()
+    });
+    match sent {
+        Ok(digest) => {
+            let _ = sink.send(&Frame::json(
+                Kind::End,
+                id,
+                &json!({"size": digest.size, "sha256": digest.sha256}),
+            ));
         }
+        Err(error) if error.code == "stopped" => {}
+        Err(error) => sink.fail(id, &error),
     }
-    let _ = sink.send(&Frame::json(
-        Kind::End,
-        id,
-        &json!({"size": size, "sha256": hex(&hasher.finalize())}),
-    ));
 }
 
 fn start_exec(
@@ -479,105 +353,32 @@ fn start_exec(
     stdin: Option<Vec<u8>>,
     timeout: Duration,
 ) {
-    let (mut reader, writer) = match io::pipe() {
-        Ok(pipe) => pipe,
-        Err(error) => return sink.error(id, "spawn_failed", &error.to_string()),
-    };
-    let mut process = Command::new(&options.shell);
-    // `sshd` names the shell by its file name, which the shell then uses in
-    // its own messages ("bash: line 1: ...").
-    if let Some(name) = options.shell.file_name() {
-        process.arg0(name);
-    }
-    process
-        .arg("-c")
-        .arg(command)
-        .current_dir(&options.home)
-        .process_group(0);
-    process.stdin(if stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    match writer.try_clone() {
-        Ok(copy) => process.stdout(copy).stderr(writer),
-        Err(error) => return sink.error(id, "spawn_failed", &error.to_string()),
-    };
-    let spawned = process.spawn();
-    // The command holds the parent's copies of the pipe's write end; drop them
-    // so the reader sees the end of output when the command's group exits.
-    drop(process);
-    let mut child = match spawned {
-        Ok(child) => child,
+    let spawned = match spawn_shell(&options.shell, &options.home, command, stdin.is_some()) {
+        Ok(spawned) => spawned,
         Err(error) => return sink.error(id, "spawn_failed", &error.to_string()),
     };
     let process = Arc::new(Running {
-        group: child.id() as i32,
+        group: spawned.group,
         cancelled: AtomicBool::new(false),
     });
     running.lock().unwrap().insert(id, Arc::clone(&process));
-    if let (Some(bytes), Some(mut input)) = (stdin, child.stdin.take()) {
-        thread::spawn(move || {
-            let _ = input.write_all(&bytes);
-        });
-    }
     let sink = sink.clone();
     let running = Arc::clone(running);
     thread::spawn(move || {
-        let (finished, watch) = mpsc::channel::<()>();
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let watchdog = {
-            let timed_out = Arc::clone(&timed_out);
-            let group = process.group;
-            thread::spawn(move || {
-                if let Err(mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(timeout) {
-                    timed_out.store(true, Ordering::SeqCst);
-                    kill_group(group);
-                }
-            })
-        };
-        let mut buffer = vec![0u8; 64 << 10];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if sink
-                        .send(&Frame::new(Kind::Output, id, buffer[..count].to_vec()))
-                        .is_err()
-                    {
-                        kill_group(process.group);
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        let status = child.wait();
-        let _ = finished.send(());
-        let _ = watchdog.join();
+        let exit = spawned.supervise(stdin, timeout, |bytes| {
+            sink.send(&Frame::new(Kind::Output, id, bytes.to_vec()))
+                .is_ok()
+        });
         running.lock().unwrap().remove(&id);
-        let (rc, signal) = match status {
-            Ok(status) => (status.code(), status.signal()),
-            Err(_) => (None, None),
-        };
         let _ = sink.send(&Frame::json(
             Kind::Exit,
             id,
             &json!({
-                "rc": rc,
-                "signal": signal,
-                "timed_out": timed_out.load(Ordering::SeqCst),
+                "rc": exit.rc,
+                "signal": exit.signal,
+                "timed_out": exit.timed_out,
                 "cancelled": process.cancelled.load(Ordering::SeqCst),
             }),
         ));
     });
-}
-
-fn kill_group(group: i32) {
-    if group > 0 {
-        // SAFETY: `killpg` takes plain integers and has no memory effects.
-        unsafe {
-            libc::killpg(group, libc::SIGKILL);
-        }
-    }
 }

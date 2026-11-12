@@ -12,6 +12,7 @@
 pub mod catalog_description;
 pub mod installer;
 pub mod migration;
-pub mod plist;
+pub use machine_service_core::plist;
+pub mod relay_agent;
 
 pub use installer::{main_entry, Action, Cli, Exposure, InstallError};

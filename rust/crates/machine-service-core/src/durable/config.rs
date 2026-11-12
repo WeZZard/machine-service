@@ -113,6 +113,14 @@ impl DurableConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config/machine-service"));
         let lock_dir = lock_dir_from(std::env::var_os(LOCK_DIR_VARIABLE).map(PathBuf::from))?;
+        // A test build touches no installed folder and never the host-wide
+        // lease lock that an installed instance holds (DC-251).
+        service_layout::test_build::owned_path(CONFIG_DIR_VARIABLE, &config_dir)?;
+        if service_layout::test_build::is_isolated() && lock_dir == Path::new(HOST_LOCK_DIR) {
+            return Err(format!(
+                "this is a test build, which never takes the host-wide lease lock {HOST_LOCK_DIR}; a test names its own {LOCK_DIR_VARIABLE}"
+            ));
+        }
         let disk_warn_bytes = parse_disk_warn(std::env::var(DISK_WARN_VARIABLE).ok().as_deref())?;
         Ok(Self {
             exposed,
@@ -126,8 +134,12 @@ impl DurableConfig {
             log_file: log_file.to_path_buf(),
             config_dir,
             lock_dir,
-            login_shell: PathBuf::from("/bin/zsh"),
-            grace_hours: crate::ops::GRACE_HOURS as f64,
+            login_shell: service_layout::tools::path(service_layout::tools::Tool::Zsh)?,
+            grace_hours: crate::ops::parse_grace_hours(
+                std::env::var(crate::ops::GRACE_HOURS_VARIABLE)
+                    .ok()
+                    .as_deref(),
+            )?,
             stop_grace: STOP_GRACE,
             inventory_timeout: INVENTORY_TIMEOUT,
             fact_timeout: FACT_TIMEOUT,
@@ -218,15 +230,28 @@ pub fn read_instance_name() -> Result<String, String> {
         }
         return Ok(name.to_string());
     }
+    // A test build never reads the Mac's own name, which another Mac on
+    // the network could match (DC-255).
+    if service_layout::test_build::is_isolated() {
+        return Err(
+            "this is a test build, which reads its name only from MACHINE_SERVICE_NAME_FILE"
+                .to_string(),
+        );
+    }
     Ok(instance_id())
 }
 
 /// The Mac's local host name (MM-2), falling back to the short host name.
 pub fn instance_id() -> String {
-    let scutil = std::process::Command::new("/usr/sbin/scutil")
-        .args(["--get", "LocalHostName"])
-        .stdin(std::process::Stdio::null())
-        .output();
+    let scutil = service_layout::tools::command(service_layout::tools::Tool::Scutil).and_then(
+        |mut command| {
+            command
+                .args(["--get", "LocalHostName"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| error.to_string())
+        },
+    );
     if let Ok(output) = scutil {
         let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if output.status.success() && !name.is_empty() {

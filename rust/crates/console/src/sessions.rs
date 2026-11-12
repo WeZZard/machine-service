@@ -781,7 +781,8 @@ impl Manager {
         // The delivered agent must match the guest's OS, not the host's.
         let bytes = guest::agent_bytes_for(kind).map_err(|_| ConsoleError::PreparationFailed)?;
         let argv = self.ssh_command(record, key_dir, &guest::upload_command())?;
-        let mut command = Command::new(&argv[0]);
+        let mut command = service_layout::tools::command_for(&argv[0])
+            .map_err(|_| ConsoleError::PreparationFailed)?;
         command.args(&argv[1..]);
         command
             .stdin(Stdio::piped())
@@ -1342,7 +1343,9 @@ enum ProbeStep {
 }
 
 fn run_probe(argv: &[String]) -> ProbeStep {
-    let mut command = Command::new(&argv[0]);
+    let Ok(mut command) = service_layout::tools::command_for(&argv[0]) else {
+        return ProbeStep::Failed;
+    };
     command.args(&argv[1..]);
     command
         .stdin(Stdio::null())

@@ -2,7 +2,15 @@
 //!
 //! The port of `tests/unit/test_console_install.py` runs the built
 //! `machine-service-install` binary against an isolated `HOME`, a fake Tart, and a
-//! `launchctl` stub, exactly as the Python test runs the shell script.
+//! `launchctl` stub, exactly as the Python test runs the shell script. The
+//! stub reaches the installer through the test build's seam
+//! (`machine_service_core::launchd`), never `PATH`, and a test build without
+//! it refuses to run any `launchctl` (DC-242).
+//!
+//! The isolated `HOME` lies under Cargo's own temporary folder for the
+//! tests, never under the account's home, and the installer runs as an
+//! isolated test child with a tool table of its own (DC-251,
+//! DC-254, DC-257).
 
 #![allow(dead_code)]
 
@@ -22,7 +30,8 @@ home="$HOME"
 printf '%s\n' "$*" >> "$home/launchctl.log"
 op="$1"
 case "$op" in
-  print) label="${2##*/}" ;;
+  print|bootout) label="${2##*/}" ;;
+  bootstrap) label="$(basename "${3:-}" .plist)" ;;
   *) label="$(basename "${2:-}" .plist)" ;;
 esac
 if [ "$label" = com.wezzard.machine-service ]; then job="$home/loaded-job"; else job="$home/loaded-job-$label"; fi
@@ -34,6 +43,12 @@ case "$op" in
     fi
     if [ -e "$home/user-domain" ]; then expected="user/"; else expected="gui/"; fi
     target="${2:-}"
+    case "$target" in
+      gui/[0-9]*/*) ;;
+      gui/[0-9]*)
+        if [ -e "$home/no-gui" ]; then echo "Could not find domain" >&2; exit 113; fi
+        echo "domain = gui"; exit 0 ;;
+    esac
     case "$target" in
       "$expected"*) ;;
       *) echo "Could not find service \"$label\" in domain" >&2; exit 113 ;;
@@ -53,12 +68,83 @@ case "$op" in
   load)
     : > "$job"
     ;;
+  bootstrap)
+    if [ -e "$home/bootstrap-fails" ]; then echo "Bootstrap failed: 5" >&2; exit 5; fi
+    cp "$3" "$home/bootstrapped-$label.plist"
+    : > "$job"
+    ;;
+  bootout)
+    rm -f "$job"
+    ;;
   *)
     exit 99
     ;;
 esac
 exit 0
 "#;
+
+/// A relay agent release in `folder`, as `scripts/build-relay-agent.sh`
+/// makes it without a Developer ID identity: the macOS archive holds a copy
+/// of a system executable signed ad hoc with the release identifier
+/// (DC-135), the Linux one a stand-in, and the version is the pre-release
+/// an ad hoc build names itself (DC-224).
+pub fn write_release(folder: &Path, signed: bool) {
+    write_release_of(folder, "9.9.9-adhoc", signed);
+}
+
+/// [`write_release`] with the version `version`.
+pub fn write_release_of(folder: &Path, version: &str, signed: bool) {
+    use service_layout::release;
+    let _ = fs::remove_dir_all(folder);
+    fs::create_dir_all(folder).unwrap();
+    let mut sums = String::new();
+    for kind in ["macos", "linux"] {
+        let platform = release::platform_for(kind);
+        let stage = tempfile::tempdir().unwrap();
+        let member = stage.path().join(release::MEMBER);
+        if kind == "macos" {
+            fs::copy("/usr/bin/true", &member).unwrap();
+            if signed {
+                let status = Command::new("/usr/bin/codesign")
+                    .args([
+                        "--force",
+                        "--sign",
+                        "-",
+                        "--identifier",
+                        "com.wezzard.relay-agent",
+                    ])
+                    .arg(&member)
+                    .output()
+                    .unwrap()
+                    .status;
+                assert!(status.success());
+            }
+        } else {
+            fs::write(&member, "ELF stand-in\n").unwrap();
+        }
+        let file = format!("relay-agent-{version}-{platform}.tar.gz");
+        let status = Command::new("/usr/bin/tar")
+            .arg("-C")
+            .arg(stage.path())
+            .arg("-czf")
+            .arg(folder.join(&file))
+            .arg(release::MEMBER)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = fs::read(folder.join(&file)).unwrap();
+        sums.push_str(&format!("{}  {file}\n", release::sha256_hex(&bytes)));
+    }
+    fs::write(folder.join(release::SUMS), sums).unwrap();
+}
+
+/// The macOS executable a release in `folder` holds.
+pub fn release_executable(folder: &Path) -> Vec<u8> {
+    service_layout::release::Release::open(folder)
+        .unwrap()
+        .executable(&service_layout::release::platform_for("macos"))
+        .unwrap()
+}
 
 pub fn write_exec(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
@@ -76,6 +162,9 @@ pub struct Harness {
     pub config: PathBuf,
     pub viewer: PathBuf,
     pub installer: PathBuf,
+    /// The `launchctl` stub, which the installer is given through the test
+    /// build's seam and never finds on `PATH`.
+    pub launchctl: PathBuf,
     pub extra_env: Vec<(String, String)>,
     /// The fake Tart is neither on `PATH` nor named by `TART` (AC-38).
     pub no_tart: bool,
@@ -83,10 +172,13 @@ pub struct Harness {
 
 impl Harness {
     pub fn new() -> Self {
-        let parent = std::env::var("HOME").expect("HOME is set for the test runner");
+        // The build's own temporary folder, resolved, since the installer
+        // refuses a linked parent folder (DC-257).
+        let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        fs::create_dir_all(parent).unwrap();
         let tmp = tempfile::Builder::new()
-            .prefix(".machine-service-install-test-")
-            .tempdir_in(parent)
+            .prefix("machine-service-install-test-")
+            .tempdir_in(parent.canonicalize().unwrap())
             .unwrap();
         let home = tmp.path().to_path_buf();
         let bin = home.join("bin");
@@ -99,7 +191,11 @@ impl Harness {
             &tart,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/tart.log\"\n[ \"$1\" = --version ] || exit 99\nprintf '2.32.1\\n'\n",
         );
-        write_exec(&bin.join("launchctl"), LAUNCHCTL_STUB);
+        // The stub lies off `PATH`: the installer is given it through the
+        // test build's seam only (DC-242).
+        let launchctl = home.join("launchd/launchctl");
+        fs::create_dir_all(launchctl.parent().unwrap()).unwrap();
+        write_exec(&launchctl, LAUNCHCTL_STUB);
 
         let installer = bin.join("machine-service-install");
         fs::copy(env!("CARGO_BIN_EXE_machine-service-install"), &installer).unwrap();
@@ -113,6 +209,7 @@ impl Harness {
             }
             write_exec(&bin.join(&name), &format!("#!/bin/sh\n# {name}\nexit 0\n"));
         }
+        write_release(&bin.join(service_layout::release::FOLDER), true);
         let viewer = bin.join("vncviewer");
         write_exec(&viewer, "#!/bin/sh\nexit 99\n");
 
@@ -137,6 +234,7 @@ impl Harness {
             config,
             viewer,
             installer,
+            launchctl,
             extra_env: Vec::new(),
             no_tart: false,
         }
@@ -175,15 +273,44 @@ impl Harness {
     }
 
     pub fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(&self.installer);
+        self.run_given(args, true)
+    }
+
+    /// Run the installer named no `launchctl` through the test build's seam
+    /// (DC-242).
+    pub fn run_without_launchctl(&self, args: &[&str]) -> Output {
+        self.run_given(args, false)
+    }
+
+    /// The installer's tool table (DC-254): the read-only system
+    /// tools and the fake Tart, when it has one.
+    pub fn tools(&self) -> PathBuf {
+        use service_layout::test_build::{link_system_tools, READ_ONLY_TOOLS};
+        let tools = self.home.join("tools");
+        let _ = fs::remove_dir_all(&tools);
+        link_system_tools(&tools, &READ_ONLY_TOOLS).unwrap();
+        if self.tart.exists() {
+            std::os::unix::fs::symlink(&self.tart, tools.join("tart")).unwrap();
+        }
+        tools
+    }
+
+    fn run_given(&self, args: &[&str], named: bool) -> Output {
+        let mut command = service_layout::test_build::harness::command(&self.installer);
         command.args(args);
-        command.env_clear();
         command.env("HOME", &self.home);
+        command.env(service_layout::tools::TEST_VARIABLE, self.tools());
         command.env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()));
         if !self.no_tart {
             command.env("TART", &self.tart);
         }
         command.env("PYTHONDONTWRITEBYTECODE", "1");
+        if named {
+            command.env(
+                machine_service_core::launchd::TEST_VARIABLE,
+                &self.launchctl,
+            );
+        }
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }

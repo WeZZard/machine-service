@@ -1,8 +1,17 @@
 usage: machctl capabilities
        [-h]
+       [--local]
+       [--instance INSTANCE]
 
 options:
   -h, --help
     show this help
     message and
     exit
+  --local
+    ask only the
+    local instance
+  --instance INSTANCE
+    ask only this
+    instance (ID
+    or address)

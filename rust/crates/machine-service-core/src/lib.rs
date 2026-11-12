@@ -10,18 +10,23 @@ pub mod guest_link;
 pub mod host;
 pub mod image_capabilities;
 pub mod isolation;
+pub mod launchd;
 pub mod lines;
 pub mod network;
 pub mod ops;
 pub mod packs;
+pub mod plist;
 pub mod proc;
 pub mod python;
 pub mod reentrant;
+pub mod relay;
+pub mod second;
 pub mod service;
 pub mod snapshot;
 pub mod ssh;
 pub mod state;
 pub mod tart;
+pub mod test_guard;
 
 /// Python-compatible JSON number handling, re-exported for the daemon.
 pub use environment::python_json;
@@ -38,6 +43,9 @@ pub use control_only;
 pub use environment;
 pub use guest_firewall;
 pub use lease_keys;
+pub use relay_broker;
+pub use remote_session;
+pub use service_layout;
 
 pub use error::{OpError, OpResult};
 pub use host::{BootProcess, Host, RealHost, TartOutput};

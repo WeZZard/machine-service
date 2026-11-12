@@ -1,9 +1,12 @@
 //! MI-4/MI-5 and AC-52 to AC-54 at TL-2: real daemons and the real CLI.
-//! DNS-SD stays local-only; the Consul fixture publishes installer output.
+//! DNS-SD is the test build's folder, which the daemon on loopback and the
+//! CLI share, so nothing is advertised or browsed beyond this test and no
+//! daemon binds outside loopback (DC-252); the Consul fixture
+//! publishes installer output.
 
 mod common;
 
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 use common::LegacyFixture;
@@ -26,12 +29,8 @@ impl Instance {
         )
         .unwrap();
         let daemon = fixture.start_daemon_with(&[
-            ("MACHINE_SERVICE_HOST".into(), "0.0.0.0".into()),
+            ("MACHINE_SERVICE_HOST".into(), "127.0.0.1".into()),
             ("MACHINE_SERVICE_DISCOVERY".into(), "consul".into()),
-            (
-                "MACHINE_SERVICE_DISCOVERY_SCOPE".into(),
-                "local-only".into(),
-            ),
             (
                 "MACHINE_SERVICE_NAME_FILE".into(),
                 name_file.display().to_string(),
@@ -70,18 +69,23 @@ impl Instance {
         }
     }
 
-    fn cli(&self) -> Command {
-        let mut command = Command::new(common::machctl_bin());
+    fn bonjour(&self) -> discovery::dnssd::Scope {
+        discovery::dnssd::Scope::Folder(self.fixture.root.join("bonjour"))
+    }
+
+    fn cli(&self) -> common::Isolated {
+        let mut command = common::machctl_command();
         command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env(
+                "MACHINE_SERVICE_TEST_BONJOUR",
+                self.fixture.root.join("bonjour"),
+            )
             .env("HOME", &self.fixture.home)
             .env(
                 "MACHINE_SERVICE_STATE",
                 self.fixture.state_dir.join("client"),
             )
             .env("MACHINE_SERVICE_PORT", common::free_port().to_string())
-            .env("MACHINE_SERVICE_DISCOVERY_SCOPE", "local-only")
             .env(
                 "CONSUL_HTTP_ADDR",
                 format!("http://127.0.0.1:{}", common::free_port()),
@@ -95,7 +99,7 @@ impl Instance {
             discovery::SERVICE_TYPE,
             self.fixture.port(),
             &discovery::txt_entries(name, machine_id, &["durable", "virtual"]),
-            discovery::dnssd::Scope::LocalOnly,
+            self.bonjour(),
             Duration::from_secs(5),
         )
         .unwrap()
@@ -253,6 +257,7 @@ fn ac53_remembered_lease_executes_across_advertisement_gap() {
         instance.rename(new);
         let port = instance.fixture.port();
         let machine_id = id.clone();
+        let scope = instance.bonjour();
         let ready = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(gap));
             discovery::dnssd::register(
@@ -260,7 +265,7 @@ fn ac53_remembered_lease_executes_across_advertisement_gap() {
                 discovery::SERVICE_TYPE,
                 port,
                 &discovery::txt_entries(new, &machine_id, &["durable"]),
-                discovery::dnssd::Scope::LocalOnly,
+                scope,
                 Duration::from_secs(5),
             )
             .unwrap()

@@ -41,7 +41,7 @@ flowchart LR
 - The local instance and a found instance are the same instance when their machine IDs and ports match (or their names and ports match when either side predates machine IDs). The CLI lists it once. A second instance on the same Mac stays separate, and the CLI then names both `<instance ID>:<port>` (DC-61).
 - The local instance's ID is the `instance` of its `/health`. Before an instance reports it, the CLI uses the Mac's local host name (DC-80).
 - `--local` limits the CLI to the local instance. `--instance <ID or address>` limits it to one instance.
-- A program that lists or leases machines, such as mcp-relay, follows the same rule in the same mode: the local instance, then the instances that Bonjour or Consul lists, each confirmed by its `/health` (DC-85).
+- A program that lists or leases machines, or asks a catalog question, such as mcp-relay, follows the same rule in the same mode: the local instance, then the instances that Bonjour or Consul lists, each confirmed by its `/health` (DC-85, [FD-7](#fd-7-catalog-questions-and-image-acquisition)).
 
 ## FD-3: Aggregation
 
@@ -51,6 +51,7 @@ flowchart LR
 - In Consul mode, when the Consul agent does not answer, the CLI says so on standard error and lists the local instance. In Bonjour mode, when the browse finds no other instance, the CLI says on standard error how many instances answered, so an empty list is never mistaken for a network without machines.
 - An instance that does not answer stays in the list as `unreachable`, with the error, and in Consul mode with its Consul health status. In Bonjour mode a stopped instance withdraws its advertisement and leaves the list; one that crashed stays `unreachable` until its records expire. An empty answer would read as "this Mac has no machines" and send someone to rebuild what already exists, which the service-catalog design warns against.
 - The merged list is a view at one moment. A machine shown as available may be leased by the time a client asks for it, and the acquisition then fails with its usual refusal.
+- The same rules hold for every catalog question, `GET /images`, `GET /applications`, `GET /capabilities` and `GET /acquisition-capabilities`, and for the choice of an instance for an image acquisition ([FD-7](#fd-7-catalog-questions-and-image-acquisition)). The machine list is not the only answer that is federated.
 
 ## FD-4: Working on a remote instance
 
@@ -78,3 +79,27 @@ flowchart LR
 
 - An instance leases only its own durable machine and its own virtual machines.
 - A client chooses the machine. The CLI helps by filtering the merged list by capability ([CL-2](../ux/cli/list.md#cl-2-acquire-by-capability)), and it then acquires from the instance that owns the chosen machine.
+
+## FD-7: Catalog questions and image acquisition
+
+### Why
+
+- Before this section, only `GET /machines` was federated. `machctl images`, `machctl capabilities` and `machctl acquisition-capabilities` asked only the local instance, and so did mcp-relay's search, probe, acquisition capabilities and image acquisition ([CN-1](consumers.md#cn-1-mcp-relay)).
+- A Mac may run an instance that offers nothing (DC-93), such as a laptop that only uses the lab. That instance answers its catalog questions successfully, with an empty catalog. A client on that Mac therefore saw no images and no applications, although the instances that host the virtual machines listed them. An empty answer from one instance was taken for the answer of the whole network, which FD-3 forbids for the machine list.
+
+### The rules
+
+- A catalog question is a `GET` of `/images`, `/applications`, `/capabilities` or `/acquisition-capabilities`. A client asks a catalog question of every instance that discovery finds and confirms, in the same mode and with the same confirmation, budget and second look as the machine list ([FD-2](#fd-2-discovery), [FD-3](#fd-3-aggregation), [MI-5](identity.md#mi-5-clients)).
+- The client reports each instance's answer unchanged, under the instance's name and `machine_id`. It does not merge two instances' catalogs into one, because two instances may serve different generations of the same image line, for example while one Mac has not yet pulled a change.
+- An instance that does not answer is reported as unreachable, with its error. It is never left out, and its silence is never shown as an empty catalog. An instance that answers with an empty catalog is reported as answering with an empty catalog.
+- `--instance <ID or address>` in machctl, and `instance` in the relay's tools, narrow a question to one instance. A former name or a `machine_id` names the instance too. `--local` in machctl narrows it to the local instance.
+- A selected environment pins its own instance, so a question under a selected environment asks only that instance (DC-64).
+- The gathering keeps FD-3's budget of 5 seconds for each instance. A question to an instance that answered the gathering waits up to 35 seconds, because an instance may wait 30 seconds for a catalog rebuild before it answers ([IC-3](image-catalog.md#ic-3-when-the-catalog-is-rebuilt)).
+- The opt-in live test `machctl/tests/questions_live.rs` and mcp-relay's `scripts/live-federation.ts` check these rules against the instances that the network holds at run time, read-only (DC-282).
+
+### Image acquisition
+
+- An image acquisition that names no instance chooses one. The candidates are the instances whose offer of the image has its base VM built (`base_available` is not `false`). An offer that is acquirable comes before one that is not. Within each group the local instance comes first, then the other instances by name. This is the order of CL-2 for offers ([CL-2](../ux/cli/list.md#cl-2-acquire-by-capability)).
+- The client prints, or reports, the instance it chose and why before each attempt. A capacity refusal passes to the next candidate. Any other refusal ends the acquisition with its error. When every candidate is refused for capacity, the acquisition fails naming each refusal, or, in the relay, waits for capacity as DC-22 sets.
+- An acquisition that names an instance asks only that instance.
+- The lease belongs to the instance that granted it. Every later request for the lease goes to that instance ([FD-4](#fd-4-working-on-a-remote-instance)), which the client finds again by `machine_id` after a rename or a change of address ([MI-5](identity.md#mi-5-clients)).

@@ -8,10 +8,18 @@
 //! up is an executable the installer requires and installs; a helper added to
 //! the daemon without an entry here has no way to be resolved.
 //!
+//! The relay agent is not built here: the installation holds its published
+//! release, a folder of signed archives, which [`release`] reads (DC-140).
+//!
 //! This crate is a leaf: `console` must not depend on `machine-service-core`,
 //! and both resolve through it.
 
 use std::path::{Path, PathBuf};
+
+pub mod release;
+pub mod signing;
+pub mod test_build;
+pub mod tools;
 
 /// When an installation needs an executable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -21,7 +21,9 @@
 //! The job's environment is read with `launchctl print`, which shows every
 //! variable of the job. Only the one variable is parsed out, in memory; the
 //! output is never logged or stored, because the job inherits whatever the
-//! caller's environment held.
+//! caller's environment held. It is always the system `launchctl`
+//! ([`crate::launchd::LAUNCHCTL`]) (DC-242); a test build of the default
+//! suite reads its fixture's jobs instead and runs none (DC-253).
 //!
 //! A matched application is first asked to quit, as the Dock's Quit does
 //! (`NSRunningApplication.terminate`, an Apple event), and is given the
@@ -77,7 +79,7 @@ pub fn parse_job_lease(text: &str) -> Option<String> {
 }
 
 fn launchctl_print(target: &str) -> Option<String> {
-    let mut command = Command::new("/bin/launchctl");
+    let mut command = Command::new(crate::launchd::LAUNCHCTL);
     command.args(["print", target]);
     let output = crate::proc::run_capture(&mut command, None, CALL_TIMEOUT).ok()?;
     output
@@ -100,6 +102,11 @@ impl JobReader {
 
     /// The lease ID of `pid`'s launchd job, when its job carries one.
     pub fn lease_of(&mut self, pid: i32) -> Option<String> {
+        // A test build reads no launchd job; its fixture names them
+        // (DC-253).
+        if super::seam::active() {
+            return super::seam::job_lease(pid);
+        }
         let uid = self.uid;
         let labels = self.labels.get_or_insert_with(|| {
             launchctl_print(&format!("gui/{uid}"))
@@ -174,6 +181,9 @@ pub fn inventory_pids(inventory: Option<&Value>) -> HashSet<i32> {
 /// Ask one application to quit, as the Dock's Quit does. Answers whether
 /// the request was delivered.
 pub fn ask_to_quit(info: &ProcessInfo) -> bool {
+    if super::seam::active() && super::seam::is_fixture(info.pid) {
+        return super::seam::quit(info.pid);
+    }
     if info.pid <= 1 || !process::still_alive(info) {
         return false;
     }
@@ -183,7 +193,10 @@ pub fn ask_to_quit(info: &ProcessInfo) -> bool {
          (app.isNil() ? 'gone' : (app.terminate ? 'asked' : 'refused'))",
         info.pid
     );
-    let mut command = Command::new("/usr/bin/osascript");
+    let Ok(mut command) = service_layout::tools::command(service_layout::tools::Tool::Osascript)
+    else {
+        return false;
+    };
     command.args(["-l", "JavaScript", "-e", &script]);
     crate::proc::run_capture(&mut command, None, CALL_TIMEOUT).is_ok_and(|output| {
         output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "asked"

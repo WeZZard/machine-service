@@ -1,0 +1,123 @@
+#!/bin/sh
+# A fake launchctl for test builds (DC-254): it runs a job the way launchd
+# does for what RA-10 relies on, and never touches the Mac's real launchd.
+#
+#   launchctl bootstrap <domain> <plist>   start the plist's program, with its
+#                                          StandardIn/Out/ErrorPath, in a
+#                                          process group of its own
+#   launchctl print <domain>/<label>       state, last exit code or signal
+#   launchctl bootout <domain>/<label>     kill the job's group and forget it
+#   launchctl list                         the labels it knows
+#
+# Its state lives in FAKE_LAUNCHD_STATE, else in the temporary folder.
+set -u
+state="${FAKE_LAUNCHD_STATE:-${TMPDIR:-/tmp}/fake-launchd-$(id -u)}"
+mkdir -p "$state"
+plutil=/usr/bin/plutil
+
+label_of() { printf %s "${1##*/}"; }
+
+case "${1:-}" in
+bootstrap)
+    plist="${3:?plist}"
+    label=$("$plutil" -extract Label raw -o - "$plist" 2>/dev/null) || {
+        echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+    [ -e "$state/$label.label" ] && { echo "Bootstrap failed: 37: Operation already in progress" >&2; exit 37; }
+    count=$("$plutil" -extract ProgramArguments raw -o - "$plist") || exit 5
+    out=$("$plutil" -extract StandardOutPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
+    err=$("$plutil" -extract StandardErrorPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
+    in=$("$plutil" -extract StandardInPath raw -o - "$plist" 2>/dev/null || echo /dev/null)
+    # launchd kills a job's leftover group when its shell exits, unless
+    # AbandonProcessGroup is set (measured on macOS 26, DC-316).
+    abandon=$("$plutil" -extract AbandonProcessGroup raw -o - "$plist" 2>/dev/null || echo false)
+    printf %s "$abandon" > "$state/$label.abandon"
+    i=0; set --
+    while [ "$i" -lt "$count" ]; do
+        set -- "$@" "$("$plutil" -extract "ProgramArguments.$i" raw -o - "$plist")"
+        i=$((i + 1))
+    done
+    : > "$state/$label.label"
+    # A supervisor that, like launchd, belongs to no caller: it leaves the
+    # caller's session, waits until this script is gone and reaped so that
+    # the job never descends from the caller, gives the job its own process
+    # group, records its PID, waits for it, and records how it ended.
+    PIDF="$state/$label.pid" ENDF="$state/$label.end" ABANDON="$abandon" \
+    /usr/bin/perl -MPOSIX -MTime::HiRes=sleep -e '
+        POSIX::setsid();
+        my $waited = 0;
+        while (getppid() != 1 && $waited < 10) { sleep(0.005); $waited += 0.005; }
+        my $pid = fork();
+        if ($pid == 0) {
+            setpgrp(0, 0);
+            # A job gets its domain'"'"'s environment, not its caller'"'"'s.
+            my %keep = map { $_ => $ENV{$_} } grep { defined $ENV{$_} } qw(HOME USER LOGNAME SHELL TMPDIR);
+            %ENV = (%keep, PATH => "/usr/bin:/bin:/usr/sbin:/sbin");
+            # launchd hands a job no descriptor above 2: what the caller
+            # left open moves out of the way, so the job may use any low
+            # descriptor and a test still sees what it inherited.
+            for my $fd (3 .. 19) {
+                if (defined POSIX::dup2($fd, $fd + 100)) { POSIX::close($fd); }
+            }
+            exec { $ARGV[0] } @ARGV; exit 127;
+        }
+        open(my $f, ">", $ENV{PIDF}); print $f $pid; close($f);
+        waitpid($pid, 0);
+        my $status = $?;
+        kill("KILL", -$pid) unless $ENV{ABANDON} eq "true";
+        open(my $e, ">", $ENV{ENDF});
+        if ($status & 127) { print $e "signal " . ($status & 127); } else { print $e "exit " . ($status >> 8); }
+        close($e);
+    ' "$@" < "$in" > "$out" 2> "$err" &
+    exit 0
+    ;;
+print)
+    label=$(label_of "${2:?target}")
+    [ -e "$state/$label.label" ] || { echo "Could not find service \"$label\"" >&2; exit 113; }
+    echo "$2 = {"
+    if [ -s "$state/$label.end" ]; then
+        echo "	state = not running"
+        read -r kind value < "$state/$label.end"
+        if [ "$kind" = signal ]; then
+            echo "	last terminating signal = Signal: $value"
+        else
+            echo "	last exit code = $value"
+        fi
+    else
+        echo "	state = running"
+        echo "	pid = $(cat "$state/$label.pid" 2>/dev/null)"
+    fi
+    echo "}"
+    ;;
+bootout)
+    label=$(label_of "${2:?target}")
+    [ -e "$state/$label.label" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+    # A job registered a moment ago may not have started yet.
+    i=0
+    while [ ! -s "$state/$label.pid" ] && [ ! -s "$state/$label.end" ] && [ "$i" -lt 1000 ]; do sleep 0.01; i=$((i + 1)); done
+    pid=$(cat "$state/$label.pid" 2>/dev/null)
+    if [ -n "$pid" ] && [ ! -s "$state/$label.end" ]; then
+        # With AbandonProcessGroup, bootout ends only the job's own process
+        # (measured on macOS 26); without it, the whole group.
+        if [ "$(cat "$state/$label.abandon" 2>/dev/null)" = true ]; then
+            kill -KILL "$pid" 2>/dev/null
+        else
+            kill -KILL -- "-$pid" 2>/dev/null
+        fi
+        i=0
+        while [ ! -s "$state/$label.end" ] && [ "$i" -lt 300 ]; do sleep 0.01; i=$((i + 1)); done
+    fi
+    rm -f "$state/$label.label" "$state/$label.pid" "$state/$label.end" "$state/$label.abandon"
+    ;;
+list)
+    echo "PID	Status	Label"
+    for f in "$state"/*.label; do
+        [ -e "$f" ] || continue
+        l=$(basename "$f" .label)
+        printf -- '-\t0\t%s\n' "$l"
+    done
+    ;;
+*)
+    echo "fake launchctl: unsupported: $*" >&2
+    exit 64
+    ;;
+esac

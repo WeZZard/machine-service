@@ -285,7 +285,8 @@ fn authority_of(base: &str) -> &str {
 /// the local instance does not name itself. Consul's node name never stands
 /// in for it: the node name need not be the Mac's name (DC-80).
 fn local_host_name() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/scutil")
+    let output = service_layout::tools::command(service_layout::tools::Tool::Scutil)
+        .ok()?
         .args(["--get", "LocalHostName"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -521,7 +522,8 @@ fn disambiguate(instances: &mut [Instance]) {
 }
 
 /// Whether `instance` is the one `wanted` names: its label, its ID, its
-/// `host:port`, its host, or its base URL.
+/// machine ID, a former name, its `host:port`, its host, or its base URL
+/// (FD-7).
 pub fn names(instance: &Instance, wanted: &str) -> bool {
     let wanted = wanted.trim_end_matches('/');
     let authority = authority_of(&instance.address);
@@ -531,6 +533,7 @@ pub fn names(instance: &Instance, wanted: &str) -> bool {
         .unwrap_or(authority);
     instance.label == wanted
         || instance.id.as_deref() == Some(wanted)
+        || instance.machine_id.as_deref() == Some(wanted)
         || instance.former_names.iter().any(|name| name == wanted)
         || instance.address == wanted
         || authority == wanted

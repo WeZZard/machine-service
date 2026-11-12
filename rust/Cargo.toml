@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/lease-keys",
   "crates/service-layout",
+  "crates/second-instance",
   "crates/byte-transfer",
   "crates/discovery",
   "crates/environment",
@@ -17,13 +18,20 @@ members = [
   "crates/machctl",
   "crates/console-worker",
   "crates/guest-console-agent",
+  "crates/guest-actions",
   "crates/guest-session",
+  "crates/relay-agent",
   "crates/machine-service-install",
   "crates/runtime-launcher",
+  "crates/remote-session",
+  "crates/network-rig",
+  "crates/relay-broker",
+  "crates/relay-acceptance",
+  "crates/lab-runners",
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0-rc.4"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -44,3 +52,8 @@ tar = { version = "0.4", default-features = false }
 
 [profile.release]
 strip = true
+
+# The tests hash and move gigabytes (RP-15); an unoptimized SHA-256 would
+# take minutes over them.
+[profile.dev.package.sha2]
+opt-level = 3

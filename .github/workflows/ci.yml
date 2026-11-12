@@ -35,3 +35,64 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # The release workflow runs this script only on a tag; building the
+      # archives here keeps it working between releases.
+      - name: relay agent release archives
+        run: |
+          rustup target add aarch64-unknown-linux-musl && rustup component add llvm-tools
+          scripts/build-relay-agent.sh "$RUNNER_TEMP/relay-agent" darwin-arm64 linux-arm64
+          # Without a Developer ID identity the build is ad hoc and records it.
+          jq -e '.signature == "adhoc" and (.version | contains("-"))' "$RUNNER_TEMP/relay-agent/SIGNING.json"
+
+  # The TL-7 network rig's opt-in self-tests run the pinned Toxiproxy and
+  # mitmproxy on every platform the rig pins, so the Linux pins and launch
+  # path stay verified on every change (DC-138).
+  network-rig:
+    name: Network rig self-tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-aarch64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # The rig's tool cache is named, never a default under the runner's home
+    # (DC-257).
+    env:
+      NETWORK_RIG_CACHE: ${{ github.workspace }}/.network-rig-cache
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust
+
+      # The cache key is the pinned versions and SHA-256 hashes, so a new pin
+      # fetches again; the rig checks every hash before use either way.
+      - name: pinned tool key
+        id: pins
+        run: |
+          key=$(grep -E 'VERSION: &str|sha256: "' crates/network-rig/src/tools.rs | shasum -a 256 | cut -c1-16)
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # The rig's named cache folder (DC-131, DC-257).
+          path: ${{ github.workspace }}/.network-rig-cache
+          key: network-rig-tools-${{ matrix.platform }}-${{ steps.pins.outputs.key }}
+
+      - name: cargo test -p network-rig --test rig_live -- --ignored
+        run: cargo test -p network-rig --test rig_live -- --ignored --nocapture

@@ -558,8 +558,17 @@ impl Host for FakeHost {
     }
 
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>> {
+        self.spawn_run_allowing(vm, network, &[])
+    }
+
+    fn spawn_run_allowing(
+        &self,
+        vm: &str,
+        network: GuestNetwork,
+        softnet_allow: &[String],
+    ) -> OpResult<Box<dyn BootProcess>> {
         // Record the arguments after `run`, as the real `tart run` gets them.
-        let args = machine_service_core::network::run_args(vm, network);
+        let args = machine_service_core::network::run_args_allowing(vm, network, softnet_allow);
         self.tart
             .calls
             .lock()
@@ -598,6 +607,10 @@ impl Host for FakeHost {
             Some(reason) => Err(reason),
             None => Ok(machine_service_core::isolation::GuestFirewall {
                 table: self.firewall_table(),
+                broker_port: Some(machine_service_core::guest_firewall::DEFAULT_BROKER_PORT),
+                egress: Some(machine_service_core::guest_firewall::EgressFiles::beside(
+                    &self.firewall_table(),
+                )),
             }),
         }
     }
@@ -960,6 +973,28 @@ impl Fixture {
             "base",
             None,
             false,
+            false,
+        )
+    }
+
+    /// Acquire `ubuntu2404` with `env: none` on the `internet` network with
+    /// the egress allowlist (DC-267).
+    pub fn try_acquire_egress(&self, purpose: &str) -> OpResult<Value> {
+        self.service.acquire(
+            purpose,
+            "ubuntu2404",
+            "none",
+            &json!(24),
+            None,
+            None,
+            None,
+            true,
+            "internet",
+            None,
+            "base",
+            None,
+            false,
+            true,
         )
     }
 
@@ -975,6 +1010,7 @@ impl Fixture {
     ) -> OpResult<Value> {
         self.service.acquire(
             purpose, image, env, ttl_hours, None, None, None, wait, "nat", None, "base", None, vnc,
+            false,
         )
     }
 

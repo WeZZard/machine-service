@@ -4,7 +4,8 @@
 //! Cheap facts are read on every request: free disk, the display, the CI
 //! runner and the agent keys. Expensive facts are read at startup, once a
 //! day, at the start and the end of every durable lease and on refresh: the
-//! OS, the hardware, the GPU, the software and the privacy permissions. A
+//! OS, the hardware, the GPU and the software; never a privacy permission,
+//! which the service knows nothing about (DC-309). A
 //! refresh runs only read-only commands, each with a timeout.
 //!
 //! A fact the instance could not observe is `null`, and its reason is listed
@@ -35,7 +36,6 @@ struct Expensive {
     hardware: Value,
     gpu: Value,
     software: Value,
-    permissions: Value,
     unknown: Map<String, Value>,
     observed_at: Map<String, Value>,
     refreshed_at: Option<f64>,
@@ -44,7 +44,7 @@ struct Expensive {
 impl Default for Expensive {
     fn default() -> Self {
         let mut unknown = Map::new();
-        for section in ["os", "hardware", "gpu", "software", "permissions"] {
+        for section in ["os", "hardware", "gpu", "software"] {
             unknown.insert(section.to_string(), json!(NOT_YET));
         }
         Self {
@@ -52,7 +52,6 @@ impl Default for Expensive {
             hardware: json!({"chip": null, "cpu_cores": null, "memory_bytes": null, "hardware_uuid": null}),
             gpu: gpu_unknown(),
             software: Value::Null,
-            permissions: json!({"screen_recording": "unknown", "accessibility": "unknown", "post_event": "unknown"}),
             unknown,
             observed_at: Map::new(),
             refreshed_at: None,
@@ -132,49 +131,26 @@ impl Capabilities {
         let hardware = hardware_facts(&mut unknown);
         observed_at.insert("hardware".to_string(), json!(now));
 
-        let (gpu, permissions) = match &config.probe {
+        let gpu = match &config.probe {
             None => {
-                let reason = "no host probe configured";
-                unknown.insert("gpu".to_string(), json!(reason));
-                unknown.insert("permissions".to_string(), json!(reason));
-                (
-                    gpu_unknown(),
-                    json!({"screen_recording": "unknown", "accessibility": "unknown", "post_event": "unknown"}),
-                )
+                unknown.insert("gpu".to_string(), json!("no host probe configured"));
+                gpu_unknown()
             }
             Some(command) => match run_probe(command, timeout) {
-                Ok(answer) => {
-                    let gpu = match answer.get("gpu") {
-                        Some(gpu) if gpu.is_object() => gpu.clone(),
-                        _ => {
-                            unknown.insert(
-                                "gpu".to_string(),
-                                json!("the probe found no Metal device"),
-                            );
-                            gpu_unknown()
-                        }
-                    };
-                    let permissions = answer.get("permissions").cloned().unwrap_or_else(|| {
-                        unknown.insert(
-                            "permissions".to_string(),
-                            json!("the probe answered no permissions"),
-                        );
-                        json!({"screen_recording": "unknown", "accessibility": "unknown", "post_event": "unknown"})
-                    });
-                    (gpu, permissions)
-                }
+                Ok(answer) => match answer.get("gpu") {
+                    Some(gpu) if gpu.is_object() => gpu.clone(),
+                    _ => {
+                        unknown.insert("gpu".to_string(), json!("the probe found no Metal device"));
+                        gpu_unknown()
+                    }
+                },
                 Err(reason) => {
-                    unknown.insert("gpu".to_string(), json!(reason.clone()));
-                    unknown.insert("permissions".to_string(), json!(reason));
-                    (
-                        gpu_unknown(),
-                        json!({"screen_recording": "unknown", "accessibility": "unknown", "post_event": "unknown"}),
-                    )
+                    unknown.insert("gpu".to_string(), json!(reason));
+                    gpu_unknown()
                 }
             },
         };
         observed_at.insert("gpu".to_string(), json!(now));
-        observed_at.insert("permissions".to_string(), json!(now));
 
         let software = software_facts(login_env, timeout);
         observed_at.insert("software".to_string(), json!(unix_now()));
@@ -185,7 +161,6 @@ impl Capabilities {
                 hardware,
                 gpu,
                 software,
-                permissions,
                 unknown,
                 observed_at,
                 refreshed_at: Some(unix_now()),
@@ -230,7 +205,6 @@ impl Capabilities {
             "gpu": facts.gpu,
             "display": display,
             "software": facts.software,
-            "permissions": facts.permissions,
             "agents": agents.capability(),
             "ci_runner": ci_runner,
             "observed_at": observed_at,
@@ -272,7 +246,7 @@ pub fn display(config: &DurableConfig, unknown: &mut Map<String, Value>) -> Valu
 
 /// `ioreg -n Root -d1`, whose `IOConsoleUsers` lists the GUI sessions.
 fn ioreg_root() -> Option<String> {
-    let mut command = std::process::Command::new("/usr/sbin/ioreg");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::Ioreg).ok()?;
     command.args(["-n", "Root", "-d1"]);
     let output =
         crate::proc::run_capture(&mut command, None, std::time::Duration::from_secs(5)).ok()?;
@@ -367,7 +341,7 @@ pub fn disk(path: &str) -> Result<(u64, u64), String> {
 }
 
 fn os_facts(timeout: Duration) -> Result<Value, String> {
-    let mut command = Command::new("/usr/bin/sw_vers");
+    let mut command = service_layout::tools::command(service_layout::tools::Tool::SwVers)?;
     let output = crate::proc::run_capture(&mut command, None, timeout)
         .map_err(|error| format!("sw_vers: {error}"))?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -488,7 +462,7 @@ fn run_probe(command: &[String], timeout: Duration) -> Result<Value, String> {
     let (program, arguments) = command
         .split_first()
         .ok_or_else(|| "empty host probe command".to_string())?;
-    let mut process = Command::new(program);
+    let mut process = service_layout::tools::command_for(program)?;
     process.args(arguments);
     let output = crate::proc::run_capture(&mut process, None, timeout)
         .map_err(|error| format!("host probe: {error}"))?;
@@ -668,7 +642,6 @@ mod tests {
             "gpu",
             "display",
             "software",
-            "permissions",
             "agents",
             "ci_runner",
             "observed_at",
@@ -690,8 +663,9 @@ mod tests {
         assert!(capabilities.refreshed_at().is_some());
     }
 
-    /// MM-3 (TL-2): the probe's answer fills the GPU and permission
-    /// sections; a failing probe leaves them unknown with its reason.
+    /// MM-3 (TL-2): the probe's answer fills the GPU section, and the report
+    /// holds no permissions (DC-309); a failing probe leaves the GPU unknown
+    /// with its reason.
     #[test]
     fn mm3_probe_answer_and_failure() {
         let script = r#"printf '{"gpu":{"name":"Fake GPU","metal_families":["apple9","metal3"],"metal3":true,"argument_buffers_tier":2},"permissions":{"screen_recording":"granted","accessibility":"denied","post_event":"granted"}}'"#;
@@ -706,7 +680,7 @@ mod tests {
         let report = capabilities.report(&config, &agents);
         assert_eq!(report["gpu"]["metal3"], true);
         assert_eq!(report["gpu"]["argument_buffers_tier"], 2);
-        assert_eq!(report["permissions"]["accessibility"], "denied");
+        assert!(report.get("permissions").is_none(), "{report}");
         assert!(report["unknown"].get("gpu").is_none());
 
         let (_root, config) = config_with_failing_probe();

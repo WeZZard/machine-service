@@ -157,6 +157,19 @@ pub trait Host: Send + Sync {
     /// a guest on the `internet` network.
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>>;
 
+    /// Spawn `tart run` as [`Host::spawn_run`] does, letting Softnet pass
+    /// `softnet_allow`, the lab hosts of an egress guest (DC-267). A
+    /// host that cannot pass them boots without them.
+    fn spawn_run_allowing(
+        &self,
+        vm: &str,
+        network: GuestNetwork,
+        softnet_allow: &[String],
+    ) -> OpResult<Box<dyn BootProcess>> {
+        let _ = softnet_allow;
+        self.spawn_run(vm, network)
+    }
+
     /// The Softnet executable Tart would run for a guest on the `internet`
     /// network, or the reason, naming Softnet, that Tart cannot run it.
     ///
@@ -433,12 +446,28 @@ impl Host for RealHost {
     }
 
     fn spawn_run(&self, vm: &str, network: GuestNetwork) -> OpResult<Box<dyn BootProcess>> {
-        let child = crate::tart::spawn_run(&self.config, vm, network)?;
+        self.spawn_run_allowing(vm, network, &[])
+    }
+
+    fn spawn_run_allowing(
+        &self,
+        vm: &str,
+        network: GuestNetwork,
+        softnet_allow: &[String],
+    ) -> OpResult<Box<dyn BootProcess>> {
+        let child = crate::tart::spawn_run(&self.config, vm, network, softnet_allow)?;
         Ok(Box::new(ChildBootProcess { child }))
     }
 
     fn softnet(&self) -> Result<PathBuf, String> {
-        crate::network::softnet_executable(crate::tart::tart_path(&self.config).as_deref())
+        // A test build looks for Softnet only in its tool table
+        // (DC-254).
+        let search = if service_layout::test_build::is_isolated() {
+            service_layout::test_build::tools_folder().map(std::ffi::OsString::from)
+        } else {
+            crate::tart::tart_path(&self.config)
+        };
+        crate::network::softnet_executable(search.as_deref())
     }
 
     fn guest_firewall(&self) -> Result<crate::isolation::GuestFirewall, String> {
@@ -450,7 +479,8 @@ impl Host for RealHost {
     }
 
     fn open_probe(&self) -> OpResult<Box<dyn ProbeListener>> {
-        let listener = std::net::TcpListener::bind(("0.0.0.0", 0))?;
+        let listener =
+            std::net::TcpListener::bind((service_layout::test_build::listener_host(), 0))?;
         listener.set_nonblocking(true)?;
         Ok(Box::new(TcpProbeListener { listener }))
     }

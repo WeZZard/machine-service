@@ -558,12 +558,14 @@ fn release_closes_an_idle_session() {
 fn the_guest_link_names_are_parsed_strictly() {
     assert_eq!(GuestLink::parse("ssh"), Ok(GuestLink::Ssh));
     assert_eq!(GuestLink::parse("ssh-session"), Ok(GuestLink::SshSession));
+    assert_eq!(GuestLink::parse("relay"), Ok(GuestLink::Relay));
+    assert_eq!(GuestLink::Relay.name(), "relay");
     assert_eq!(GuestLink::default(), GuestLink::Ssh);
     for value in ["tart-session", "SSH", "", "websocket"] {
         assert_eq!(
             GuestLink::parse(value),
             Err(format!(
-                "MACHINE_SERVICE_GUEST_LINK must be one of ssh, ssh-session; got {value:?}"
+                "MACHINE_SERVICE_GUEST_LINK must be one of ssh, ssh-session, relay; got {value:?}"
             ))
         );
     }

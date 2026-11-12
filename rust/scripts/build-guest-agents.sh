@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the guest console agent and the guest session agent for every guest
 # OS this host can serve, and install each build under the name the daemon
-# looks for.
+# looks for. The relay agent is not built here: an installation holds its
+# release archives, which scripts/build-relay-agent.sh makes (DC-140).
 #
 # The Python original shipped `guest-console-agent.py`: one artifact that runs
 # on any guest with an interpreter. The native port streams machine code, so a
@@ -43,8 +44,26 @@ done
 target=aarch64-unknown-linux-musl
 if rustup target list --installed | grep -qx "$target"; then
     echo "building linux agents ($target) -> $out"
-    export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+    if command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+        export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+    else
+        # Without a musl cross toolchain: the host's clang compiles ring's C
+        # for the gnu triple (the same aarch64 ABI; clang's musl triple wants
+        # a musl sysroot), the toolchain's llvm-ar archives the ELF objects
+        # (Apple's ar drops them), and rust-lld links against Rust's own musl
+        # (`rustup component add llvm-tools` provides llvm-ar).
+        llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+        if [ ! -x "$llvm_bin/llvm-ar" ]; then
+            echo "error: no aarch64-linux-musl-gcc and no llvm-ar;" >&2
+            echo "       run: rustup component add llvm-tools" >&2
+            exit 1
+        fi
+        export CC_aarch64_unknown_linux_musl=clang
+        export CFLAGS_aarch64_unknown_linux_musl="--target=aarch64-unknown-linux-gnu"
+        export AR_aarch64_unknown_linux_musl="$llvm_bin/llvm-ar"
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+    fi
     cargo build --release -p guest-console-agent --target "$target"
     cargo build --release -p guest-session --bin guest-session-agent --target "$target"
     for agent in $agents; do

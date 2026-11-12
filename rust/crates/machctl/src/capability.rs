@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 /// The capability names `--require` accepts (CL-2).
-pub const NAMES: [&str; 11] = [
+pub const NAMES: [&str; 10] = [
     "metal3",
     "durable",
     "virtual",
@@ -18,7 +18,6 @@ pub const NAMES: [&str; 11] = [
     "cua-driver",
     "claude-code",
     "codex",
-    "screen-recording",
     "ci-idle",
 ];
 
@@ -100,12 +99,6 @@ pub fn has(record: &Value, name: &str) -> bool {
         "cua-driver" => installed(record, "cua_driver"),
         "claude-code" => agent_ready(record, "claude_code", "claude_code"),
         "codex" => agent_ready(record, "codex", "codex"),
-        "screen-recording" => {
-            section(record, "permissions")
-                .and_then(|permissions| permissions.get("screen_recording"))
-                .and_then(Value::as_str)
-                == Some("granted")
-        }
         "ci-idle" => ci_idle(record),
         _ => false,
     }
@@ -229,7 +222,6 @@ mod tests {
                              "cua_driver": "0.19.3", "claude_code": "2.1.0", "codex": null},
                 "agents": {"claude_code": {"key": "present", "endpoint": "present"},
                            "codex": {"key": "absent", "endpoint": "present"}},
-                "permissions": {"screen_recording": "granted"},
                 "ci_runner": match busy {
                     None => json!({"present": false, "busy": null, "name": null}),
                     Some(busy) => json!({"present": true, "busy": busy, "name": "runner"}),
@@ -262,7 +254,6 @@ mod tests {
             "xcode",
             "cua-driver",
             "claude-code",
-            "screen-recording",
             "ci-idle",
         ] {
             assert!(has(&mac, name), "{name}");
@@ -286,7 +277,7 @@ mod tests {
     #[test]
     fn cl2_unknown_facts_never_match() {
         let unknown = json!({"name": "m", "kind": "durable", "state": "available",
-            "capabilities": {"gpu": null, "software": null, "permissions": null,
+            "capabilities": {"gpu": null, "software": null,
                              "ci_runner": null, "unknown": ["gpu: helper failed"]}});
         for name in NAMES {
             if name != "durable" {
@@ -308,7 +299,9 @@ mod tests {
     fn cl2_validate_names_the_choices() {
         assert!(validate(&strings(&["metal3", "ci-idle"])).is_ok());
         let error = validate(&strings(&["metal"])).unwrap_err();
-        assert!(error.contains("\"metal\"") && error.contains("screen-recording"));
+        assert!(error.contains("\"metal\"") && error.contains("ci-idle"));
+        // The report holds no privacy permissions (DC-309).
+        assert!(validate(&strings(&["screen-recording"])).is_err());
     }
 
     /// CL-2: an idle durable machine first, then any available durable

@@ -118,6 +118,9 @@ curl -s localhost:6240/health
   `guest-session-agent-linux`, `vm-service-dot-forwarder` and
   `vm-service-guest-firewall`. A guest agent runs inside the guest as machine
   code, so a Linux guest needs the `-linux` build.
+- The macOS relay agent of a release is signed with Developer ID; how the
+  owner signs a release and how a durable Mac's operator grants it its
+  permissions once is in [signing](docs/signing.md).
 - `install --prefix DIR` checks that every one is beside the installer and
   refuses by name, before anything changes, when one is missing. After the old
   job has stopped it copies exactly those files into `DIR`, and the LaunchAgent
@@ -558,8 +561,8 @@ screen is locked, from `ioreg`'s `IOConsoleUsers`), `software`
 instance could not observe is `null` with its reason under `unknown`. Disk,
 display, CI runner and agents are read on every request; the rest at
 startup, daily, at the start and end of each lease and on `refresh`. The GPU
-and permission facts come from `machine-service --probe-host`, which the
-service runs as its own child so macOS attributes the checks to it.
+facts come from `machine-service --probe-host`, which the service runs as
+its own child. The report holds no privacy permissions (DC-309).
 
 ### Hygiene
 
@@ -738,7 +741,7 @@ instance never hangs the list.
 - `--instance <ID or address>`, `--kind durable|virtual` and
   `--require <capability>` (repeatable; `metal3`, `durable`, `virtual`,
   `unity`, `unreal`, `xcode`, `cua-driver`, `claude-code`, `codex`,
-  `screen-recording`, `ci-idle`) filter the list.
+  `ci-idle`) filter the list.
 - The exit status is 0 when any instance answered and 2 when none did.
 - `machctl list` and `machctl images` print one warning line above an
   instance's rows while its catalog is `stale` or `unavailable`, naming the

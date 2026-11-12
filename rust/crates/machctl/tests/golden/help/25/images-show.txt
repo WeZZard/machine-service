@@ -1,5 +1,7 @@
 usage: machctl images-show
-       [-h] image
+       [-h] [--local]
+       [--instance INSTANCE]
+       image
 
 positional arguments:
   image
@@ -8,3 +10,10 @@ options:
   -h, --help
     show this help
     message and exit
+  --local
+    ask only the local
+    instance
+  --instance INSTANCE
+    ask only this
+    instance (ID or
+    address)

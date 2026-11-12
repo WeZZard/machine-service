@@ -87,6 +87,15 @@ pub fn txt_entries(instance: &str, machine_id: &str, kinds: &[&str]) -> Vec<(Str
     ]
 }
 
+/// The TXT keys of an instance's broker (BK-4, RP-11), added to
+/// [`txt_entries`] when the instance runs one.
+pub fn relay_txt_entries(relay_url: &str, relay_ca_sha256: &str) -> Vec<(String, String)> {
+    vec![
+        ("relay_url".to_string(), relay_url.to_string()),
+        ("relay_ca_sha256".to_string(), relay_ca_sha256.to_string()),
+    ]
+}
+
 /// Encode `key=value` pairs as a DNS TXT record's character-strings, each
 /// prefixed by its length (RFC 6763 §6). A pair longer than 255 bytes is
 /// refused.
@@ -163,6 +172,17 @@ impl Found {
     }
 
     /// The kinds it advertises.
+    /// The instance's broker URL, when it advertises one (BK-4).
+    pub fn relay_url(&self) -> Option<&str> {
+        self.txt_value("relay_url").filter(|url| !url.is_empty())
+    }
+
+    /// The fingerprint of the instance's broker authority (RP-1).
+    pub fn relay_ca_sha256(&self) -> Option<&str> {
+        self.txt_value("relay_ca_sha256")
+            .filter(|hash| !hash.is_empty())
+    }
+
     pub fn kinds(&self) -> Vec<String> {
         self.txt_value("kinds")
             .unwrap_or_default()
@@ -203,6 +223,19 @@ mod tests {
         assert_eq!(found.txt_value("txtvers"), Some("1"));
         assert_eq!(found.instance(), "Mac-A");
         assert_eq!(found.kinds(), ["durable"]);
+        assert_eq!(found.relay_url(), None);
+        let mut with_relay = entries.clone();
+        with_relay.extend(relay_txt_entries(
+            "wss://mac-a.local:6241/relay",
+            &"a".repeat(64),
+        ));
+        let relayed = Found {
+            txt: decode_txt(&encode_txt(&with_relay).unwrap()),
+            ..found.clone()
+        };
+        assert_eq!(relayed.relay_url(), Some("wss://mac-a.local:6241/relay"));
+        assert_eq!(relayed.relay_ca_sha256(), Some("a".repeat(64).as_str()));
+        assert_eq!(relayed.machine_id(), Some(machine_id));
         assert_eq!(
             Found {
                 txt: Vec::new(),

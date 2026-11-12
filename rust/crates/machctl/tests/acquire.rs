@@ -6,7 +6,7 @@
 //! so no test reaches a real instance or the real Consul agent.
 
 use std::collections::HashMap;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -172,11 +172,9 @@ impl Intranet {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(MACHCTL)
+        service_layout::test_build::harness::command(MACHCTL)
             .args(args)
-            .env_clear()
             .env("HOME", self.home.path())
-            .env("PATH", "/usr/bin:/bin")
             .env("MACHINE_SERVICE_PORT", self.local.port.to_string())
             .env("MACHINE_SERVICE_STATE", self.home.path().join("state"))
             .env("CONSUL_HTTP_ADDR", self.consul.base())
@@ -370,6 +368,13 @@ fn mi5_virtual_lease_saves_machine_identity_from_health() {
             "/health",
             200,
             json!({"instance":"Mac-A","machine_id":"machine-a"}),
+        ),
+        // An image acquisition asks an instance that offers the image (FD-7).
+        (
+            "/machines",
+            200,
+            json!({"machines": {}, "offers": [{"name": "macos26", "kind": "virtual",
+                "state": "offer", "concurrency": {"acquirable": true}}]}),
         ),
         (
             "/acquire",

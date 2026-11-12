@@ -6,7 +6,6 @@
 //! the byte comparison fails instead of silently reformatting the CLI.
 
 use std::path::Path;
-use std::process::Command;
 
 const MACHCTL: &str = env!("CARGO_BIN_EXE_machctl");
 
@@ -113,7 +112,7 @@ fn check_colored(directory: &Path, name: &str, args: &[&str], columns: &str) {
     let expected = std::fs::read(directory.join(format!("{name}.txt")))
         .unwrap_or_else(|error| panic!("read {name}.txt: {error}"));
 
-    let output = Command::new(MACHCTL)
+    let output = service_layout::test_build::harness::command(MACHCTL)
         .args(args)
         .env("COLUMNS", columns)
         // The fixture tests FORCE_COLOR, whose documented precedence is
@@ -161,7 +160,7 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn capture(args: &[&str], columns: &str) -> Vec<u8> {
-    let output = Command::new(MACHCTL)
+    let output = service_layout::test_build::harness::command(MACHCTL)
         .args(args)
         .env("COLUMNS", columns)
         // Pin plain output so an inherited `FORCE_COLOR` cannot colour the
@@ -182,7 +181,7 @@ fn check(directory: &Path, name: &str, args: &[&str], columns: &str) {
     let expected = std::fs::read(directory.join(format!("{name}.txt")))
         .unwrap_or_else(|error| panic!("read {name}.txt: {error}"));
 
-    let output = Command::new(MACHCTL)
+    let output = service_layout::test_build::harness::command(MACHCTL)
         .args(args)
         .env("COLUMNS", columns)
         // Pin plain output so an inherited `FORCE_COLOR` cannot colour the

@@ -1,8 +1,9 @@
 //! The guest network over the real daemon (DC-13; `docs/acquisition-contract.md`,
 //! "Guest network").
 //!
-//! The fixture's `bin` comes first on the daemon's `PATH`, so a `softnet`
-//! placed there is the one the daemon checks, as Tart would. A symlink to
+//! A `softnet` placed in the fixture's `bin` enters the daemon's tool table,
+//! where a test build looks for it instead of Tart's `PATH`
+//! (DC-254), so it is the one the daemon checks. A symlink to
 //! `/usr/bin/sudo` stands in for a setuid-root Softnet; a plain file stands in
 //! for one that Tart cannot run unattended.
 //!
@@ -52,7 +53,7 @@ impl Live {
         if !matches!(firewall, Firewall::Missing) {
             std::fs::write(
                 &anchor,
-                machine_service_core::guest_firewall::anchor_rules(&table),
+                machine_service_core::guest_firewall::anchor_rules(&table, Some(6241)),
             )
             .expect("anchor file");
         }

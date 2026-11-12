@@ -18,10 +18,12 @@ positional arguments:
                   after --no-wait)
     list          list every machine
                   from every instance
-    images        query available
-                  images and capacity
+    images        query every
+                  instance's images
+                  and capacity
     images-show   show one image's
-                  full record (JSON)
+                  full record on every
+                  instance (JSON)
     status        show one lease
     exec          run a command in the
                   guest
@@ -32,12 +34,15 @@ positional arguments:
     release       end a lease; a VM is
                   stopped, deleted and
                   unregistered
-    capabilities  show supported and
-                  unavailable network
-                  capabilities
+    capabilities  show every
+                  instance's supported
+                  and unavailable
+                  network capabilities
     acquisition-capabilities
-                  describe acquisition
-                  and console
+                  describe every
+                  instance's
+                  acquisition and
+                  console
                   prerequisites
                   without allocating a
                   VM

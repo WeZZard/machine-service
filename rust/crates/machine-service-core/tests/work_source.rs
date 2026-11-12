@@ -256,6 +256,7 @@ impl WorkService {
             "work",
             expected,
             false,
+            false,
         )
     }
 
@@ -363,6 +364,7 @@ fn rejects_credentials_and_arbitrary_source() {
             None,
             source,
             None,
+            false,
             false,
         );
         assert!(result.is_err(), "source={source} env={env}");

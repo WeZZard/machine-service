@@ -64,7 +64,8 @@ fn test_discovery_is_inert_and_cli_can_read_it() {
         String::from_utf8_lossy(&output.stderr)
     );
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("capabilities json");
-    assert_eq!(parsed["schemaVersion"], 1);
+    // One object per instance, its answer unchanged (CL-4).
+    assert_eq!(parsed[0]["answer"]["schemaVersion"], 1);
     // Deviation: the Python in-process fixture never started `serve()`, so no
     // GC loop existed to persist an empty state file. The real daemon (Python
     // and Rust alike) does. The observable intent is that discovery created no

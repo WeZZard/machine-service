@@ -50,6 +50,25 @@ pub fn validate_request(body: &Value) -> OpResult<RequestedNetwork> {
     Ok(RequestedNetwork::Guest(network))
 }
 
+/// The one egress an acquisition may ask for: the host's egress allowlist
+/// (`docs/arch/lab-runners.md`, LR-5, DC-267).
+pub const EGRESS_ALLOWLIST: &str = "allowlist";
+
+/// Validate an acquisition's `egress`: absent, or `"allowlist"` on the
+/// `internet` network. Returns whether the guest is an egress guest.
+pub fn validate_egress(body: &Value) -> OpResult<bool> {
+    let Some(egress) = body.get("egress") else {
+        return Ok(false);
+    };
+    if egress.as_str() != Some(EGRESS_ALLOWLIST) {
+        return Err(OpError::new("egress must be allowlist"));
+    }
+    if body.get("network").and_then(Value::as_str) != Some("internet") {
+        return Err(OpError::new("egress allowlist needs network internet"));
+    }
+    Ok(true)
+}
+
 /// The control-only network's request value.
 const CONTROL_ONLY: &str = "control-only";
 
@@ -62,6 +81,29 @@ pub fn run_args(vm: &str, network: GuestNetwork) -> Vec<String> {
     ];
     if network == GuestNetwork::Internet {
         args.push("--net-softnet".to_string());
+    }
+    args
+}
+
+/// The arguments of `tart run` for a guest on `network` that Softnet must
+/// also let reach `allow`, each an address it would otherwise drop as
+/// private: an egress guest's lab hosts (DC-267). Each address is
+/// passed as its own `/32`, a network as written.
+pub fn run_args_allowing(vm: &str, network: GuestNetwork, allow: &[String]) -> Vec<String> {
+    let mut args = run_args(vm, network);
+    if network == GuestNetwork::Internet && !allow.is_empty() {
+        let list = allow
+            .iter()
+            .map(|entry| {
+                if entry.contains('/') {
+                    entry.clone()
+                } else {
+                    format!("{entry}/32")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push(format!("--net-softnet-allow={list}"));
     }
     args
 }
@@ -187,6 +229,65 @@ mod tests {
         assert_eq!(error.message, "wait must be a boolean");
         let error = validate_request(&json!([])).unwrap_err();
         assert_eq!(error.message, "acquisition must be an object");
+    }
+
+    #[test]
+    fn egress_is_the_allowlist_on_the_internet_network_only() {
+        assert!(!validate_egress(&json!({"network": "internet"})).unwrap());
+        assert!(validate_egress(&json!({"network": "internet", "egress": "allowlist"})).unwrap());
+        for body in [
+            json!({"network": "internet", "egress": "open"}),
+            json!({"network": "internet", "egress": true}),
+        ] {
+            assert_eq!(
+                validate_egress(&body).unwrap_err().message,
+                "egress must be allowlist"
+            );
+        }
+        for body in [
+            json!({"egress": "allowlist"}),
+            json!({"network": "nat", "egress": "allowlist"}),
+        ] {
+            assert_eq!(
+                validate_egress(&body).unwrap_err().message,
+                "egress allowlist needs network internet"
+            );
+        }
+        // The ordinary validator accepts the field.
+        assert_eq!(
+            validate_request(&json!({"network": "internet", "egress": "allowlist"})).unwrap(),
+            RequestedNetwork::Guest(GuestNetwork::Internet)
+        );
+    }
+
+    #[test]
+    fn softnet_lets_an_egress_guest_reach_its_lab_hosts() {
+        assert_eq!(
+            run_args_allowing(
+                "si-lab-a",
+                GuestNetwork::Internet,
+                &[
+                    "192.0.2.3".into(),
+                    "192.0.2.4".into(),
+                    "198.51.100.0/24".into()
+                ]
+            ),
+            vec![
+                "run",
+                "si-lab-a",
+                "--no-graphics",
+                "--net-softnet",
+                "--net-softnet-allow=192.0.2.3/32,192.0.2.4/32,198.51.100.0/24"
+            ]
+        );
+        assert_eq!(
+            run_args_allowing("si-lab-a", GuestNetwork::Internet, &[]),
+            run_args("si-lab-a", GuestNetwork::Internet)
+        );
+        assert_eq!(
+            run_args_allowing("pilot-a", GuestNetwork::Nat, &["192.0.2.3".into()]),
+            run_args("pilot-a", GuestNetwork::Nat)
+        );
     }
 
     #[test]

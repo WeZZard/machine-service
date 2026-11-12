@@ -1,26 +1,32 @@
 //! Durable-machine leases through the real daemon (`docs/arch/test-layers.md`,
 //! TL-2; AC-20 to AC-27, AC-30, AC-31, AC-33, AC-43, AC-44).
 //!
-//! Each test starts the real `machine-service` binary with a cleared
-//! environment, a fixture `HOME` whose login profile sets `PATH` and fake
-//! owner credentials, its own state and configuration folders with fake
-//! agent keys and a placeholder endpoint, and its own lease-lock folder
+//! Each test starts the real `machine-service` binary as an isolated test
+//! child (`common::daemon_command`): a cleared environment, a fixture
+//! `HOME` whose login profile sets `PATH` and fake owner credentials, its
+//! own state and configuration folders with fake agent keys and a
+//! placeholder endpoint, its own lease-lock folder
 //! (`MACHINE_SERVICE_DURABLE_LOCK_DIR`, honoured only by debug builds), so
 //! no test shares the host-wide lock with another or with an installed
-//! instance.
+//! instance, its own name file and its own tool table.
 //!
 //! Commands really run on this Mac, as this user, in their own process
-//! sessions. Every release sweep is proved against stand-in processes that
-//! the lease did not start, which must survive.
+//! sessions, and end with the test. The release sweep of a test build sees
+//! only the processes the daemon started and the rows of the test's process
+//! fixture, and signals nothing else (DC-253): stand-in processes the
+//! lease did not start survive, and the fixture's rows prove the rules
+//! without any real application or process of the owner's session. The
+//! applications a real lease opens are proved only in the opt-in live layer
+//! (`live_durable.rs`).
 
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{canonical_dir, free_port, http_timeout, try_http, write_exec, DAEMON};
+use common::{canonical_dir, free_port, http_timeout, try_http, write_exec};
 use serde_json::{json, Value};
 
 const CLAUDE_KEY: &str = "sk-fake-claude-code-key-0123456789";
@@ -30,6 +36,9 @@ const LONG: Duration = Duration::from_secs(180);
 
 /// One isolated durable-machine fixture.
 struct Fixture {
+    /// One lifeline for every daemon of the fixture: what a stopped daemon
+    /// started, a restarted one sweeps (DC-256).
+    lifeline: common::Lifeline,
     _dir: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
@@ -39,7 +48,7 @@ struct Fixture {
 
 /// A running daemon.
 struct Daemon {
-    child: Option<Child>,
+    child: Option<common::Owned>,
     port: u16,
     state: PathBuf,
     err: PathBuf,
@@ -85,6 +94,7 @@ exit 0
         );
         std::fs::write(root.join("brew-formulae"), "jq 1.7\n").unwrap();
         let fixture = Self {
+            lifeline: common::Lifeline::new(),
             _dir: dir,
             root,
             home,
@@ -159,14 +169,12 @@ exit 0
         for _ in 0..16 {
             let port = free_port();
             let err = state_dir.join(format!("daemon-{port}.err"));
-            let mut command = Command::new(DAEMON);
+            let mut command = common::daemon_command_on(&self.root, &self.lifeline);
             command
-                .env_clear()
                 .env("HOME", &self.home)
                 .env("USER", user())
                 .env("LOGNAME", user())
                 .env("SHELL", "/bin/zsh")
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .env("MACHINE_SERVICE_STATE", &state_dir)
                 .env("MACHINE_SERVICE_PORT", port.to_string())
                 .env("MACHINE_SERVICE_HOST", "127.0.0.1")
@@ -199,8 +207,6 @@ exit 0
                     }
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -284,13 +290,17 @@ impl Daemon {
             .map(str::to_string)
     }
 
-    /// Stop the daemon with SIGTERM only; the lease's sessions survive.
-    fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // SAFETY: the PID is this handle's own child.
-            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-            let _ = child.wait();
-        }
+    /// Stop the daemon with SIGTERM only; the lease's sessions survive
+    /// until the answered handle drops, which ends what the daemon started.
+    fn stop(&mut self) -> Option<common::Owned> {
+        let mut child = self.child.take()?;
+        child.signal(libc::SIGTERM, Duration::from_secs(30));
+        Some(child)
+    }
+
+    /// The process fixture of the daemon's sweep (DC-253).
+    fn processes(&self) -> PathBuf {
+        self.state.parent().unwrap().join("processes.json")
     }
 }
 
@@ -313,7 +323,9 @@ impl Drop for Daemon {
                 }
             }
         }
-        self.stop();
+        if let Some(mut child) = self.child.take() {
+            child.terminate(Duration::from_secs(5));
+        }
     }
 }
 
@@ -347,36 +359,26 @@ fn kill(pid: i32) {
     unsafe { libc::kill(pid, libc::SIGKILL) };
 }
 
-/// A stand-in process this test started itself, killed with its children
-/// when the test ends, even on a failed assertion.
+/// A stand-in process this test started itself, ended with everything it
+/// started when the test ends, even on a failed assertion.
 struct StandIn {
-    child: Child,
+    child: common::Owned,
 }
 
 impl StandIn {
     fn spawn(program: &str, arguments: &[&str]) -> Self {
-        let child = Command::new(program)
+        let mut command = common::harness::command(program);
+        command
             .args(arguments)
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn stand-in");
-        Self { child }
+            .stderr(Stdio::null());
+        Self {
+            child: command.spawn().expect("spawn stand-in"),
+        }
     }
 
     fn pid(&self) -> i32 {
         self.child.id() as i32
-    }
-}
-
-impl Drop for StandIn {
-    fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-P", &self.pid().to_string()])
-            .status();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -991,7 +993,7 @@ fn ac33_service_restart_keeps_the_durable_lease() {
         .trim()
         .parse()
         .unwrap();
-    daemon.stop();
+    let _stopped = daemon.stop();
     assert!(
         alive(background),
         "the lease's process died with the service"
@@ -1481,159 +1483,117 @@ fn ac28_byte_transfers_to_and_from_a_durable_machine() {
     assert_eq!(daemon.release(&name, &lease).status, 200);
 }
 
-/// Whether this process runs in a logged-in GUI (Aqua) session, where
-/// Launch Services can open an application.
-fn in_gui_session() -> bool {
-    Command::new("/bin/launchctl")
-        .arg("managername")
-        .output()
-        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "Aqua")
+/// Seconds since the epoch, as the process fixture's start times.
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
-/// Build a minimal regular application, signed ad hoc, that quits when
-/// asked as any application does. Answers its bundle and executable.
-fn stand_in_app(root: &Path, name: &str, bundle_id: &str) -> (PathBuf, PathBuf) {
-    let app = root.join(format!("{name}.app"));
-    let macos = app.join("Contents/MacOS");
-    std::fs::create_dir_all(&macos).unwrap();
-    let source = root.join(format!("{name}.m"));
-    std::fs::write(
-        &source,
-        "#import <Cocoa/Cocoa.h>\nint main(void) { @autoreleasepool { [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]; [NSApp run]; } return 0; }\n",
-    )
-    .unwrap();
-    let executable = macos.join(name);
-    // The system's own toolchain and SDK: a `DEVELOPER_DIR` chosen for the
-    // Rust build may name an Xcode older than the running macOS.
-    let built = Command::new("/usr/bin/clang")
-        .env_remove("DEVELOPER_DIR")
-        .env_remove("SDKROOT")
-        .args(["-fobjc-arc", "-framework", "Cocoa", "-o"])
-        .arg(&executable)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
-    std::fs::write(
-        app.join("Contents/Info.plist"),
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\
-<key>CFBundleIdentifier</key><string>{bundle_id}</string>\
-<key>CFBundleExecutable</key><string>{name}</string>\
-<key>CFBundleName</key><string>{name}</string>\
-<key>CFBundlePackageType</key><string>APPL</string>\
-<key>CFBundleVersion</key><string>1</string>\
-</dict></plist>\n"
-        ),
-    )
-    .unwrap();
-    let signed = Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&app)
-        .output()
-        .unwrap();
-    assert!(
-        signed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&signed.stderr)
-    );
-    (app, executable)
+/// One row of the sweep's process fixture (DC-253), run by this
+/// account, started at `start`.
+fn row(pid: i32, start: u64, path: &str, env: &[String], job_lease: Option<&str>) -> Value {
+    // SAFETY: `geteuid` only reads process state.
+    let uid = unsafe { libc::geteuid() };
+    json!({
+        "pid": pid, "ppid": 1, "pgid": pid, "sid": pid, "uid": uid,
+        "start": [start, 0],
+        "comm": path.rsplit('/').next().unwrap(),
+        "path": path,
+        "argv": [path],
+        "env": env,
+        "job_lease": job_lease,
+    })
 }
 
-/// The PIDs running `executable`.
-fn pids_of(executable: &Path) -> Vec<i32> {
-    let output = Command::new("/usr/bin/pgrep")
-        .arg("-f")
-        .arg(executable)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .filter_map(|pid| pid.parse().ok())
+/// A regular application of the fixture, as `lsappinfo` lists it.
+fn application(pid: i32, name: &str) -> Value {
+    json!({"name": name, "bundle_id": format!("dev.machine-service.test.{name}"),
+           "path": format!("/Applications/{name}.app"), "pid": pid})
+}
+
+/// The signals the sweep sent to the fixture's rows, `(pid, signal)`.
+fn signals(daemon: &Daemon) -> Vec<(i64, String)> {
+    std::fs::read_to_string(daemon.processes().with_extension("signals"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(pid, signal)| (pid.parse().unwrap(), signal.to_string()))
         .collect()
 }
 
-fn wait_for_pid(executable: &Path) -> i32 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(pid) = pids_of(executable).first() {
-            return *pid;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} never started",
-            executable.display()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// Removes a stand-in application's Launch Services registration.
-struct Registered(PathBuf);
-
-impl Drop for Registered {
-    fn drop(&mut self) {
-        let _ = Command::new(
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-        )
-        .arg("-u")
-        .arg(&self.0)
-        .output();
-    }
-}
-
-/// AC-30, HY-3 (DC-73): an application the lease opened with `open` is
-/// asked to quit at release and recorded with the `application` rule; an
-/// application the owner opened during the lease, which no rule may
-/// touch, keeps running.
+/// AC-30, HY-3 (DC-73): an application the lease opened is asked to quit
+/// at release and recorded with the `application` rule; an application the
+/// owner opened, before or during the lease, and one already running before
+/// it, keep running; a process that carries the lease's ID is ended by the
+/// environment rule and an untagged one is not. Proved through the test
+/// build's process seam (DC-253): the applications and processes are
+/// rows of the test's fixture, so no application of this Mac is opened,
+/// asked to quit or signalled; the real applications are proved in the
+/// opt-in live layer (`live_durable.rs`).
 #[test]
 fn ac30_release_quits_the_applications_the_lease_opened_and_only_those() {
-    if !in_gui_session() {
-        eprintln!("skipped: no logged-in GUI session to open applications in");
-        return;
-    }
     let fixture = Fixture::new();
-    let tag = &uuid_like();
-    let (lease_app, lease_exe) = stand_in_app(
-        &fixture.root,
-        "LeaseStandIn",
-        &format!("dev.machine-service.test.lease.{tag}"),
-    );
-    let (owner_app, owner_exe) = stand_in_app(
-        &fixture.root,
-        "OwnerStandIn",
-        &format!("dev.machine-service.test.owner.{tag}"),
-    );
-    let _registrations = (Registered(lease_app.clone()), Registered(owner_app.clone()));
     let daemon = fixture.start("state", true);
-    let (name, lease) = daemon.acquired("apps", "none");
-
-    // The owner opens an application during the lease, outside it.
-    let opened = Command::new("/usr/bin/open")
-        .args(["-g", "-n"])
-        .arg(&owner_app)
-        .env_remove("MACHINE_SERVICE_LEASE_ID")
-        .status()
-        .unwrap();
-    assert!(opened.success());
-    let owner_pid = wait_for_pid(&owner_exe);
-    let _owner_guard = Leftover(owner_pid);
-    // The lease opens one through Launch Services.
-    let output = daemon.output(
-        &name,
-        &lease,
-        &format!(
-            "/usr/bin/open -g -n '{}' && echo opened",
-            lease_app.display()
-        ),
+    let before = now_s();
+    // Running before the lease: the owner's application, and one that the
+    // lease will only activate, whose job carries no lease.
+    let early = row(
+        990_002,
+        before - 100,
+        "/Applications/Owner.app/Contents/MacOS/Owner",
+        &[],
+        None,
     );
-    assert_eq!(output.trim(), "opened");
-    let lease_pid = wait_for_pid(&lease_exe);
-    let _lease_guard = Leftover(lease_pid);
+    let running = row(
+        990_004,
+        before + 2,
+        "/Applications/Running.app/Contents/MacOS/Running",
+        &[],
+        None,
+    );
+    std::fs::write(
+        daemon.processes(),
+        json!({"processes": [early, running],
+               "applications": [application(990_002, "Owner"), application(990_004, "Running")]})
+        .to_string(),
+    )
+    .unwrap();
+    let (name, lease) = daemon.acquired("apps", "none");
+    let during = now_s() + 1;
+    let tag = format!("MACHINE_SERVICE_LEASE_ID={lease}");
+    let opened = row(
+        990_001,
+        during,
+        "/Applications/Lease.app/Contents/MacOS/Lease",
+        &[],
+        Some(&lease),
+    );
+    let owner = row(
+        990_003,
+        during,
+        "/Applications/OwnerDuring.app/Contents/MacOS/OwnerDuring",
+        &[],
+        None,
+    );
+    let running_now = row(
+        990_004,
+        before + 2,
+        "/Applications/Running.app/Contents/MacOS/Running",
+        &[],
+        Some(&lease),
+    );
+    let tagged = row(990_005, during, "/usr/bin/tagged-helper", &[tag], None);
+    let untagged = row(990_006, during, "/usr/bin/owner-helper", &[], None);
+    std::fs::write(
+        daemon.processes(),
+        json!({"processes": [early, running_now, opened, owner, tagged, untagged],
+               "applications": [application(990_001, "Lease"), application(990_002, "Owner"),
+                                application(990_003, "OwnerDuring"), application(990_004, "Running")]})
+        .to_string(),
+    )
+    .unwrap();
 
     let released = daemon.release(&name, &lease);
     assert_eq!(released.status, 200, "{}", released.body);
@@ -1641,28 +1601,24 @@ fn ac30_release_quits_the_applications_the_lease_opened_and_only_those() {
         .as_array()
         .unwrap()
         .clone();
-    let entry = swept
-        .iter()
-        .find(|entry| entry["pid"] == lease_pid)
+    let entry = |pid: i64| swept.iter().find(|entry| entry["pid"] == pid);
+    let app = entry(990_001)
         .unwrap_or_else(|| panic!("the lease's application was not swept: {swept:?}"));
-    assert_eq!(entry["rule"], "application");
-    assert_eq!(entry["ended"], true);
-    assert_eq!(entry["signal"], "QUIT", "asked to quit first: {entry}");
-    assert!(!alive(lease_pid));
-    assert!(alive(owner_pid), "the owner's application was ended");
-    assert!(swept.iter().all(|entry| entry["pid"] != owner_pid));
-}
-
-/// A short random tag for bundle identifiers.
-fn uuid_like() -> String {
-    format!(
-        "{:x}{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    )
+    assert_eq!(app["rule"], "application");
+    assert_eq!(app["ended"], true);
+    assert_eq!(app["signal"], "QUIT", "asked to quit first: {app}");
+    let helper =
+        entry(990_005).unwrap_or_else(|| panic!("the tagged process was not swept: {swept:?}"));
+    assert_eq!(helper["rule"], "environment");
+    assert_eq!(helper["signal"], "TERM");
+    for pid in [990_002, 990_003, 990_004, 990_006] {
+        assert!(entry(pid).is_none(), "{pid} was swept: {swept:?}");
+    }
+    assert_eq!(
+        signals(&daemon),
+        vec![(990_001, "QUIT".to_string()), (990_005, "TERM".to_string())],
+        "the sweep signalled only the lease's own rows, and refused nothing"
+    );
 }
 
 /// HY-6 (DC-76): below `MACHINE_SERVICE_DISK_WARN_GB` the machine record
@@ -1702,41 +1658,23 @@ fn hy6_low_free_disk_warning() {
 
 /// HY-5, AC-32 (DC-75): the CI runner is sampled at acquisition, on every
 /// GC pass and at release; the hygiene record carries the intervals during
-/// which a job ran. The stand-in runner is the test's own and survives.
+/// which a job ran. The job is a row of the sweep's process fixture
+/// (DC-253), which the release never signals.
 #[test]
 fn hy5_ci_busy_intervals_are_recorded() {
     let fixture = Fixture::new();
-    let source = fixture.root.join("worker.c");
-    std::fs::write(
-        &source,
-        "#include <unistd.h>\nint main(void) { sleep(3600); return 0; }\n",
-    )
-    .unwrap();
-    // A copied platform binary is refused at launch, so it is compiled.
-    let worker = fixture.root.join("Runner.Worker");
-    let built = Command::new("/usr/bin/cc")
-        .env_remove("DEVELOPER_DIR")
-        .env_remove("SDKROOT")
-        .arg("-o")
-        .arg(&worker)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
     let daemon = fixture.start("state", true);
     let (name, lease) = daemon.acquired("ci-coexist", "none");
-    let job = StandIn::spawn(worker.to_str().unwrap(), &[]);
+    let worker = fixture.home.join("actions-runner/bin/Runner.Worker");
+    let job = row(990_100, now_s(), &worker.to_string_lossy(), &[], None);
+    std::fs::write(daemon.processes(), json!({"processes": [job]}).to_string()).unwrap();
     let gc = daemon.request("POST", "/gc", Some(&json!({})));
     assert_eq!(gc.status, 200, "{}", gc.body);
     assert_eq!(
         daemon.machine(&name)["capabilities"]["ci_runner"]["busy"],
         true
     );
-    drop(job);
+    std::fs::write(daemon.processes(), json!({"processes": []}).to_string()).unwrap();
     let gc = daemon.request("POST", "/gc", Some(&json!({})));
     assert_eq!(gc.status, 200, "{}", gc.body);
     let released = daemon.release(&name, &lease);
@@ -1751,4 +1689,5 @@ fn hy5_ci_busy_intervals_are_recorded() {
     assert!(from <= to, "{hygiene}");
     assert!(hygiene["ci_sampling"]["samples"].as_u64().unwrap() >= 4);
     assert_eq!(hygiene["ci_sampling"]["interval_s"], 60);
+    assert!(signals(&daemon).is_empty(), "{:?}", signals(&daemon));
 }
