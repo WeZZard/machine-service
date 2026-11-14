@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use network_rig::cell::{run_cell, Cell, Verdict};
 use network_rig::Profile;
+use relay_acceptance::matrix;
 use relay_acceptance::mcp::McpSettings;
 use relay_acceptance::scenarios;
 use relay_acceptance::target::{HostControl, RealTarget, TargetSettings};
@@ -29,7 +30,10 @@ fn usage() -> ! {
     eprintln!(
         "usage: relay-acceptance run --cell <cell> --profile <N0..N3> --instance <http://name:port> \
 [--image <image>] [--host-shell <command>] [--host-script <path>] [--agent-rig manage|external] \
-[--seed <n>] [--only <ids>] [--purpose <text>] --evidence <dir>\n       relay-acceptance summary <dir>"
+[--seed <n>] [--only <ids>] [--purpose <text>] [--client mcp|suite] [--mcp-server <path>] --evidence <dir>\n       \
+relay-acceptance summary <dir>\n       \
+relay-acceptance plan [--exclude <instance,...>]   (reads `machctl list --json`; RELAY_ACCEPTANCE_EXCLUDE too)\n       \
+relay-acceptance matrix-summary --plan <plan.json> <dir>"
     );
     std::process::exit(2)
 }
@@ -53,6 +57,8 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("run") => std::process::exit(run(&args[1..])),
         Some("summary") => summary(Path::new(args.get(1).unwrap_or_else(|| usage()))),
+        Some("plan") => std::process::exit(plan(&args[1..])),
+        Some("matrix-summary") => std::process::exit(matrix_summary(&args[1..])),
         _ => usage(),
     }
 }
@@ -196,5 +202,100 @@ fn summary(dir: &Path) {
     }
     for row in rows {
         println!("{row}");
+    }
+}
+
+/// Discover the machines this network offers now and print the matrix's
+/// plan: each run's target and client instance, or why it is missing
+/// (TL-7, DC-341). Exclusions are the operator's run-time setting.
+fn plan(args: &[String]) -> i32 {
+    let exclude: Vec<String> = flag(args, "exclude")
+        .or_else(|| std::env::var("RELAY_ACCEPTANCE_EXCLUDE").ok())
+        .map(|s| {
+            s.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let machctl = std::env::var("MACHCTL").unwrap_or_else(|_| "machctl".into());
+    let output = match std::process::Command::new(&machctl)
+        .args(["list", "--json"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            eprintln!(
+                "relay-acceptance: {machctl} list --json failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("relay-acceptance: {machctl}: {error}");
+            return 1;
+        }
+    };
+    let list: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(list) => list,
+        Err(error) => {
+            eprintln!("relay-acceptance: machctl's list is not JSON: {error}");
+            return 1;
+        }
+    };
+    let found = matrix::discover(&list, &exclude);
+    let assignments = matrix::plan(&matrix::Matrix::builtin(), &found);
+    let missing = assignments.iter().filter(|a| a.missing.is_some()).count();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &serde_json::json!({"found": found, "assignments": assignments, "missing": missing})
+        )
+        .unwrap_or_default()
+    );
+    0
+}
+
+/// Read a plan and the runs under `dir`, write `<dir>/summary.json`, and
+/// exit 0 only when the acceptance is complete.
+fn matrix_summary(args: &[String]) -> i32 {
+    let plan_path = need(args, "plan");
+    let Some(dir) = args
+        .iter()
+        .rev()
+        .find(|a| !a.starts_with("--") && **a != plan_path)
+    else {
+        usage()
+    };
+    let plan: Value = match std::fs::read_to_string(&plan_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        Some(plan) => plan,
+        None => {
+            eprintln!("relay-acceptance: {plan_path} is not a plan");
+            return 2;
+        }
+    };
+    let assignments: Vec<matrix::Assignment> = plan["assignments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| matrix::Assignment {
+            cell: a["cell"].as_str().unwrap_or_default().into(),
+            profile: a["profile"].as_str().unwrap_or_default().into(),
+            target_instance: a["target_instance"].as_str().map(str::to_string),
+            client_instance: a["client_instance"].as_str().map(str::to_string),
+            missing: a["missing"].as_str().map(str::to_string),
+        })
+        .collect();
+    let summary = matrix::summary(Path::new(dir), &assignments);
+    let text = serde_json::to_string_pretty(&summary).unwrap_or_default();
+    let _ = std::fs::write(Path::new(dir).join("summary.json"), &text);
+    println!("{text}");
+    if summary["complete"] == true {
+        0
+    } else {
+        1
     }
 }

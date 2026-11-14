@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profiles": ["N0", "N1", "N2", "N3"],
+  "cells": [
+    { "cell": "macos-client.ubuntu-vm", "client": "macos", "target": { "image": "ubuntu2404" } },
+    { "cell": "macos-client.macos-vm", "client": "macos", "target": { "image": "macos26" } },
+    { "cell": "macos-client.durable-mac", "client": "macos", "target": { "durable": true } },
+    { "cell": "ubuntu-client.ubuntu-vm", "client": "ubuntu", "target": { "image": "ubuntu2404" } },
+    { "cell": "ubuntu-client.macos-vm", "client": "ubuntu", "target": { "image": "macos26" } },
+    { "cell": "ubuntu-client.durable-mac", "client": "ubuntu", "target": { "durable": true } }
+  ]
+}
