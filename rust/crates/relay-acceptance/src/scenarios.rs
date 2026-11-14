@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::client::{exec_op, hex, new_id, sha256_hex, Answer, RelayClient};
 use crate::guest::Os;
+use crate::mcp::Actions;
 use crate::stats::Summary;
 use crate::target::RealTarget;
 
@@ -120,6 +121,13 @@ pub fn select(only: &[String]) -> Vec<Scenario<RealTarget>> {
         .into_iter()
         .filter(|s| only.is_empty() || only.iter().any(|id| id.eq_ignore_ascii_case(s.id)))
         .collect()
+}
+
+/// The lease's actions: through mcp-relay when it is the cell's client
+/// (TL-7, DC-341), else through the suite's own session.
+fn lease_actions(ctx: &mut Ctx<'_>) -> Result<Arc<dyn Actions>, Stop> {
+    let rig = ctx.client.clone();
+    ctx.target.actions(&rig)
 }
 
 fn lease_client(ctx: &mut Ctx<'_>) -> Result<Arc<RelayClient>, Stop> {
@@ -256,8 +264,92 @@ fn ac68(ctx: &mut Ctx<'_>) -> Verdict {
 }
 
 /// AC-55's checks on the lease's guest, so that AC-65 can repeat them.
+/// DC-339, DC-340: a script that sends an Apple Event raises macOS's
+/// permission prompt, which the suite approves itself, as one of its own
+/// steps: the script starts in the background, because a waiting script
+/// would hold the lease's next call, and Return, sent by cua-driver to the
+/// prompt's process, chooses its default button, Allow (a click by position
+/// does not reach the prompt). The script must then answer. An approval the
+/// suite made is recorded for the run's checklist; on a durable Mac it stays
+/// until the Mac can be erased.
+fn approve_a_permission_prompt(
+    ctx: &mut Ctx<'_>,
+    client: &dyn Actions,
+    name: &dyn Fn(&str) -> String,
+) {
+    // One script does it all, in one job: a relayed command's job takes its
+    // process group with it when it ends, so the Apple Event's script and
+    // the approval live and end together. Return goes to the prompt only
+    // while the script still waits, after 3 s.
+    let script = r#"OUT=/private/tmp/acc-ae-$$.out
+( osascript -e 'tell application "Finder" to get name of startup disk' > $OUT 2>&1; echo exit=$? >> $OUT ) &
+job=$!
+sleep 3
+p=$(pgrep -f "osascript -e tell application" | head -1); c=""
+while [ -n "$p" ] && [ "$p" -gt 1 ]; do c="$c $(ps -o comm= -p "$p" | sed 's#.*/##')"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
+echo "chain:$c"
+pressed=no; i=0
+while kill -0 $job 2>/dev/null && [ $i -lt 40 ]; do
+  P=$(pgrep -x UserNotificationCenter | head -1)
+  if [ -n "$P" ] && cua-driver call press_key "{\"pid\": $P, \"key\": \"return\"}" >/dev/null 2>&1; then pressed=yes; fi
+  sleep 1; i=$((i+1))
+done
+kill -0 $job 2>/dev/null && { kill $job; echo "gave up after 40 s"; }
+wait $job 2>/dev/null
+echo "pressed=$pressed"
+cat $OUT 2>/dev/null; rm -f $OUT"#;
+    let answer = client.exec(script, 120.0, Duration::from_secs(300));
+    let text = answer
+        .as_ref()
+        .map(|a| a.text())
+        .unwrap_or_else(|e| e.clone());
+    let chain = text
+        .lines()
+        .find_map(|l| l.strip_prefix("chain:"))
+        .unwrap_or_default()
+        .to_string();
+    let pressed = text.contains("pressed=yes");
+    let completed = text.contains("exit=0");
+    // The program macOS asks about is the first one in the script's chain
+    // that is not osascript or a shell (DC-310, DC-315).
+    let program = chain
+        .split_whitespace()
+        .find(|p| !["osascript", "sh", "zsh", "bash", "launchd", "nohup"].contains(p))
+        .unwrap_or("/bin/zsh")
+        .to_string();
+    if pressed && completed {
+        let machine = ctx
+            .target
+            .lease
+            .as_ref()
+            .map(|lease| lease.name.clone())
+            .unwrap_or_default();
+        ctx.record(
+            &name("approved permission prompt"),
+            json!({
+                "machine": machine,
+                "durable": ctx.target.durable(),
+                "program": program,
+                "permission": "Apple Events (Automation)",
+                "app": "Finder",
+                "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            }),
+        );
+    }
+    ctx.check(
+        &name("an Apple Event script completes after the suite approves its permission prompt"),
+        expect(completed, || {
+            format!(
+                "pressed={pressed} chain={} output={}",
+                chain.trim(),
+                text.trim()
+            )
+        }),
+    );
+}
+
 fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let name = |what: &str| format!("{prefix}{what}");
     match os {
@@ -358,10 +450,12 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
             )?;
             let ok =
                 capture.rc()? == Some(0) && capture.text().trim_end().ends_with("89504e470d0a1a0a");
-            if ok {
+            // The suite's own session can bring the picture home; through
+            // mcp-relay the check stands on cua-driver's answer alone.
+            if let Some(session) = ok.then(|| ctx.target.current_client()).flatten() {
                 let call =
-                    client.call(&new_id("read"), Op::Read { path: png.clone() }, b"", true)?;
-                if let Ok(answer) = client.wait(call, Duration::from_secs(600)) {
+                    session.call(&new_id("read"), Op::Read { path: png.clone() }, b"", true)?;
+                if let Ok(answer) = session.wait(call, Duration::from_secs(600)) {
                     let _ = std::fs::write(
                         ctx.run_dir.join(format!("{tag}ac55-screen.png")),
                         &answer.bytes,
@@ -372,6 +466,7 @@ fn desktop_session_checks(ctx: &mut Ctx<'_>, prefix: &str) -> Verdict {
                 &name("cua-driver captures the screen"),
                 expect(ok, || format!("cua-driver: {}", capture.text().trim())),
             );
+            approve_a_permission_prompt(ctx, client.as_ref(), &name);
         }
         Os::Linux => {
             let session = client.exec(

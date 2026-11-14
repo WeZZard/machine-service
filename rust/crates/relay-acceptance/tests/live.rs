@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use network_rig::cell::{run_cell, Cell, Verdict};
 use network_rig::Profile;
+use relay_acceptance::mcp::McpSettings;
 use relay_acceptance::scenarios;
 use relay_acceptance::target::{HostControl, RealTarget, TargetSettings};
 
@@ -40,6 +41,22 @@ fn one_cell_under_one_profile_passes() {
                 .unwrap_or_else(|| "relay-acceptance-host.sh".into()),
         }),
         purpose: "relay-acceptance".into(),
+        // The cell's client is mcp-relay when its server is named (TL-7).
+        mcp: var("RELAY_ACCEPTANCE_MCP_SERVER").map(|server| {
+            let run = PathBuf::from(need("RELAY_ACCEPTANCE_EVIDENCE"))
+                .join(cell.id())
+                .join(&profile.id);
+            McpSettings {
+                node: PathBuf::from(var("RELAY_ACCEPTANCE_NODE").unwrap_or_else(|| "node".into())),
+                server: PathBuf::from(server),
+                project: run.join("mcp-project"),
+                env: vec![(
+                    "MCP_RELAY_STATE_DIR".into(),
+                    run.join("mcp-state").display().to_string(),
+                )],
+                log: run.join("mcp-relay.log"),
+            }
+        }),
     };
     let only: Vec<String> = var("RELAY_ACCEPTANCE_ONLY")
         .map(|s| s.split(',').map(|id| id.trim().to_string()).collect())
