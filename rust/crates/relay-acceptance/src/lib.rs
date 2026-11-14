@@ -16,6 +16,7 @@
 pub mod client;
 pub mod guest;
 pub mod instance;
+pub mod matrix;
 pub mod mcp;
 pub mod scenarios;
 pub mod stats;
