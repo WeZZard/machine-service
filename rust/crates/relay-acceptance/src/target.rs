@@ -346,12 +346,33 @@ impl RealTarget {
             "acquired through mcp-relay",
             json!({"guest": guest, "seconds": acquired_in.as_secs_f64(), "os": format!("{os:?}")}),
         );
+        // mcp-relay keeps the lease's record and its relay grant in the
+        // guest's lease.json (mcp-relay DC-47); the credential checks
+        // (AC-60, AC-66) present that grant to the broker themselves.
+        // The guest's record holds machine-service's lease record as `lease`
+        // and the broker grant beside it as `relay` (mcp-relay's Enclosure).
+        let enclosure = mcp_lease_record(&settings, &guest).unwrap_or(Value::Null);
+        let record = enclosure.get("lease").cloned().unwrap_or(Value::Null);
+        let relay = enclosure.get("relay").cloned().unwrap_or(Value::Null);
+        let field = |key: &str| {
+            relay
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if record.get("link").and_then(Value::as_str) == Some("relay") {
+            self.facts.insert(
+                "ready_agent".into(),
+                json!("registered: mcp-relay leased it on the relay link"),
+            );
+        }
         self.lease = Some(Lease {
             name: guest,
-            record: json!({}),
-            credential: String::new(),
-            url: String::new(),
-            ca_pem: String::new(),
+            record,
+            credential: field("credential"),
+            url: field("url"),
+            ca_pem: field("ca_pem"),
             acquired_in,
             agent_credential: None,
             os,
@@ -560,7 +581,13 @@ impl RealTarget {
                 json!({"guest": guest.guest, "answer": format!("{answer:?}")}),
             );
             if let Some(lease) = lease {
-                self.released = Some((lease.credential, None));
+                // As the suite's own release: a durable Mac's agent
+                // credential is the machine's and outlives the lease (RA-4);
+                // a virtual machine's ends with it.
+                let agent = (self.kind != Some(TargetKind::DurableMac))
+                    .then_some(lease.agent_credential)
+                    .flatten();
+                self.released = Some((lease.credential, agent));
             }
             return answer;
         }
@@ -948,4 +975,26 @@ mod tests {
         assert_eq!(credential_until(1000.0, 24.0, 6.0), 1000.0 + 6.0 * 3600.0);
         assert_eq!(credential_until(1000.0, 0.1, 0.0), 1000.0);
     }
+}
+
+/// The lease record mcp-relay keeps for `guest` under its state folder
+/// (`<state>/<session>/guests/<guest>/lease.json`): machine-service's lease
+/// record as `lease`, the broker grant as `relay`.
+fn mcp_lease_record(settings: &McpSettings, guest: &str) -> Option<Value> {
+    let state = settings
+        .env
+        .iter()
+        .find(|(key, _)| key == "MCP_RELAY_STATE_DIR")
+        .map(|(_, value)| std::path::PathBuf::from(value))?;
+    // The newest record of that guest: an earlier session under the same
+    // state folder may hold an older one.
+    std::fs::read_dir(&state)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("guests").join(guest).join("lease.json"))
+        .filter_map(|path| Some((std::fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max_by_key(|(modified, _)| *modified)
+        .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|value| !value.is_null())
 }

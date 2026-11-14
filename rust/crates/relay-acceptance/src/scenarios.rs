@@ -1177,20 +1177,15 @@ fn ac58_tree(client: &RelayClient, os: crate::guest::Os) -> Result<(), Stop> {
 
 // AC-59: a long action completes.
 fn ac59(ctx: &mut Ctx<'_>) -> Verdict {
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let minutes = minutes_from_env("RELAY_ACCEPTANCE_LONG_MINUTES", 30.0).round() as u64;
     ctx.record("minutes", json!(minutes));
-    let call = client.call(
-        &new_id("ac59"),
-        exec_op(
-            &format!("i=1; while [ $i -le {minutes} ]; do echo \"line $i\"; i=$((i+1)); sleep 60; done; exit 7"),
-            false,
-            (minutes * 60 + 900) as f64,
-        ),
-        b"",
-        true,
+    let events_before = mcp_session_events(ctx).len();
+    let answer = client.exec(
+        &format!("i=1; while [ $i -le {minutes} ]; do echo \"line $i\"; i=$((i+1)); sleep 60; done; exit 7"),
+        (minutes * 60 + 900) as f64,
+        Duration::from_secs(minutes * 60 + 1800),
     )?;
-    let answer = client.wait(call, Duration::from_secs(minutes * 60 + 1800))?;
     let lines: Vec<String> = answer.text().lines().map(str::to_string).collect();
     let want: Vec<String> = (1..=minutes).map(|i| format!("line {i}")).collect();
     ctx.record(
@@ -1201,7 +1196,16 @@ fn ac59(ctx: &mut Ctx<'_>) -> Verdict {
             .map(|(at, _)| at.as_secs())
             .collect::<Vec<_>>()),
     );
-    ctx.record("resumes", json!(client.resumes()));
+    match ctx.target.current_client() {
+        Some(session) => ctx.record("resumes", json!(session.resumes())),
+        None => {
+            let events: Vec<String> = mcp_session_events(ctx)
+                .into_iter()
+                .skip(events_before)
+                .collect();
+            ctx.record("mcp_session_events", json!(events));
+        }
+    }
     ctx.check(
         "every line arrives once and in order",
         expect(lines == want, || {
@@ -1219,7 +1223,11 @@ fn ac59(ctx: &mut Ctx<'_>) -> Verdict {
 
 // AC-60: registration before running, refusal after release.
 fn ac60(ctx: &mut Ctx<'_>) -> Verdict {
-    let agent = lease_client(ctx).map(drop);
+    let agent = if ctx.target.mcp_mode() {
+        lease_actions(ctx).map(drop)
+    } else {
+        lease_client(ctx).map(drop)
+    };
     let client = ctx.target.current_client();
     let (name, record, acquired_in) = {
         let lease = ctx.target.lease.as_ref().ok_or("no lease")?;
@@ -2001,6 +2009,10 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
 
 // AC-66: credentials and ports are guarded.
 fn ac66(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        // The lease is mcp-relay's; its grant is what the hellos present.
+        lease_actions(ctx)?;
+    }
     let refused = |result: Result<_, SessionError>| match result {
         Err(SessionError::Rejected {
             code: RejectCode::Unauthorized,
