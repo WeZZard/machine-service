@@ -422,6 +422,7 @@ impl Actions for RelayClient {
 /// `relay_script`.
 pub struct McpGuest {
     relay: Mutex<McpRelay>,
+    log: PathBuf,
     /// The guest's name in mcp-relay's session.
     pub guest: String,
 }
@@ -430,6 +431,7 @@ impl McpGuest {
     /// A guest of `relay`.
     pub fn new(relay: McpRelay, guest: String) -> McpGuest {
         McpGuest {
+            log: relay.log_path().to_path_buf(),
             relay: Mutex::new(relay),
             guest,
         }
@@ -449,6 +451,11 @@ impl McpGuest {
             .lock()
             .map_err(|_| "mcp-relay is poisoned")?
             .extract(&self.guest, name)
+    }
+
+    /// mcp-relay's log file, which a check may watch while a call runs.
+    pub fn log_path(&self) -> &Path {
+        &self.log
     }
 
     /// mcp-relay's log so far.

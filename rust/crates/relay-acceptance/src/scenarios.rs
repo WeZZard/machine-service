@@ -1511,7 +1511,78 @@ fn first_disconnect_after(client: &RelayClient, since: Duration) -> Option<Durat
 }
 
 // AC-62: a silent connection is detected and resumed.
+/// AC-62 through mcp-relay: both directions go silent while a `relay_script`
+/// runs; mcp-relay must log the loss within 15 s, then resume and bring the
+/// one answer home (DC-345).
+fn ac62_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let guest = ctx.target.mcp_guest().ok_or("no mcp-relay guest")?;
+    let log = guest.log_path().to_path_buf();
+    let lost = |path: &std::path::Path| {
+        crate::mcp::session_events(&std::fs::read_to_string(path).unwrap_or_default())
+            .iter()
+            .filter(|e| e.contains("lost"))
+            .count()
+    };
+    let base = lost(&log);
+    let events_before = mcp_session_events(ctx).len();
+    let control = ctx.rig.control().clone();
+    let (answer, detected) = std::thread::scope(|scope| {
+        let watcher = scope.spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let holes = [Stream::Upstream, Stream::Downstream].map(|stream| Fault::Blackhole {
+                stream,
+                duration_ms: 0,
+            });
+            for hole in &holes {
+                let _ = control.apply(hole);
+            }
+            let at = Instant::now();
+            let mut detected = None;
+            while at.elapsed() < Duration::from_secs(40) {
+                if lost(&log) > base {
+                    detected = Some(at.elapsed());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for hole in &holes {
+                let _ = control.revert(hole);
+            }
+            detected
+        });
+        let answer = client.exec("sleep 25; echo done", 600.0, Duration::from_secs(900));
+        (answer, watcher.join().ok().flatten())
+    });
+    ctx.record("detected_after_s", json!(detected.map(|d| d.as_secs_f64())));
+    let events: Vec<String> = mcp_session_events(ctx)
+        .into_iter()
+        .skip(events_before)
+        .collect();
+    ctx.record("mcp_session_events", json!(events));
+    let detected = detected
+        .ok_or_else(|| Stop::Failed("mcp-relay did not log the dead connection in 40 s".into()))?;
+    ctx.check(
+        "the dead connection is detected within 15 seconds",
+        expect(detected <= Duration::from_millis(15_500), || {
+            format!("detected after {detected:?}")
+        }),
+    );
+    let answer = answer?;
+    ctx.check(
+        "the session resumes and the result arrives once",
+        expect(
+            answer.text() == "done\n" && events.iter().any(|e| e.contains("resumed")),
+            || format!("events {events:?}, output {:?}", answer.text()),
+        ),
+    );
+    Ok(())
+}
+
 fn ac62(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac62_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let call = client.call(
         &new_id("ac62"),
@@ -1571,7 +1642,131 @@ fn ac62(ctx: &mut Ctx<'_>) -> Verdict {
 }
 
 // AC-63: a client that changes its address keeps its session.
+/// AC-63 through mcp-relay: the client's address changes while a
+/// `relay_script` runs; mcp-relay's session must resume and the one answer
+/// arrive (DC-345).
+fn ac63_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let events_before = mcp_session_events(ctx).len();
+    let control = ctx.rig.control().clone();
+    let (answer, changed) = std::thread::scope(|scope| {
+        let changer = scope.spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let changed = control.change_address().map_err(|e| e.to_string());
+            (changed, format!("{:?}", control.address_change()))
+        });
+        let answer = client.exec("sleep 12; echo done", 600.0, Duration::from_secs(900));
+        (answer, changer.join().ok())
+    });
+    ctx.record("address_change", json!(format!("{changed:?}")));
+    let answer = answer?;
+    let events: Vec<String> = mcp_session_events(ctx)
+        .into_iter()
+        .skip(events_before)
+        .collect();
+    ctx.record("mcp_session_events", json!(events));
+    ctx.check(
+        "the broker resumes the same session",
+        expect(events.iter().any(|e| e.contains("resumed")), || {
+            format!("mcp-relay logged {events:?}")
+        }),
+    );
+    ctx.check(
+        "the result arrives once",
+        expect(answer.text() == "done\n", || answer.text()),
+    );
+    Ok(())
+}
+
+/// AC-64 through mcp-relay: the broker restarts while a `relay_script` runs;
+/// mcp-relay asks for the execution's outcome again, so its answer arrives
+/// and the script ran once (DC-345). The relay agent's restart is started
+/// from inside the guest during the script, which mcp-relay, one call at a
+/// time on a guest, cannot do yet.
+fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let host = ctx.target.host()?.clone();
+    client.run("rm -f ~/acc64-broker.txt")?;
+    let (answer, restarted) = std::thread::scope(|scope| {
+        let restarter = scope.spawn(move || {
+            std::thread::sleep(Duration::from_secs(4));
+            host.run(&["restart"])
+        });
+        let answer = client.exec(
+            "sleep 15; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
+            600.0,
+            Duration::from_secs(900),
+        );
+        (answer, restarter.join().ok())
+    });
+    ctx.record("broker_restart", json!(format!("{restarted:?}")));
+    ctx.record(
+        "broker_answer",
+        json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
+    );
+    let lines =
+        client.run("wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.txt")?;
+    ctx.check(
+        "after a broker restart the answer arrives and the action ran once",
+        expect(
+            answer.as_ref().is_ok_and(|a| a.text() == "done\n") && lines.trim() == "1",
+            || {
+                format!(
+                    "answer {:?}, {} lines",
+                    answer.as_ref().map(|a| a.text()),
+                    lines.trim()
+                )
+            },
+        ),
+    );
+    ctx.check(
+        "the relay agent restart",
+        Err(Stop::Blocked(
+            "the agent's restart is started from inside the guest during the script, which mcp-relay does not do yet".into(),
+        )),
+    );
+    Ok(())
+}
+
+/// AC-69 through mcp-relay: a script stays silent for minutes; mcp-relay's
+/// session must stay open through its heartbeats, outside N3's chaos, and the
+/// exit status arrive (DC-345).
+fn ac69_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let seconds = minutes_from_env("RELAY_ACCEPTANCE_SILENT_SECONDS", 300.0).round() as u64;
+    ctx.record("silent_s", json!(seconds));
+    let events_before = mcp_session_events(ctx).len();
+    let answer = client.exec(
+        &format!("sleep {seconds}; exit 3"),
+        (seconds + 600) as f64,
+        Duration::from_secs(seconds + 1800),
+    )?;
+    let events: Vec<String> = mcp_session_events(ctx)
+        .into_iter()
+        .skip(events_before)
+        .collect();
+    ctx.record("mcp_session_events", json!(events));
+    if ctx.profile != "N3" {
+        ctx.check(
+            "the session stays open through heartbeats",
+            expect(!events.iter().any(|e| e.contains("lost")), || {
+                format!("mcp-relay logged {events:?}")
+            }),
+        );
+    }
+    ctx.check(
+        "the exit status arrives",
+        expect(answer.rc()? == Some(3), || {
+            format!("{:?}", answer.outcome())
+        }),
+    );
+    Ok(())
+}
+
 fn ac63(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac63_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let call = client.call(
         &new_id("ac63"),
@@ -1692,6 +1887,9 @@ fn restart_case(
 
 // AC-64: a restart of the broker or the relay agent never replays an action.
 fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac64_through_mcp_relay(ctx);
+    }
     let host = ctx.target.host()?.clone();
     let broker = restart_case(ctx, "broker", &|_ctx| Ok(host.run(&["restart"])?));
     if let Err(stop) = broker {
@@ -2041,6 +2239,9 @@ fn ac67(ctx: &mut Ctx<'_>) -> Verdict {
 
 // AC-69: a silent action survives the edge's idle close.
 fn ac69(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac69_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let seconds = minutes_from_env("RELAY_ACCEPTANCE_SILENT_SECONDS", 300.0).round() as u64;
     ctx.record("silent_s", json!(seconds));
