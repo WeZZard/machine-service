@@ -22,6 +22,7 @@ The owner's goals, taste and standing defaults for machine-service. This page ov
 
 ## Standing defaults
 
+- A decision is brought to the owner in a document that holds its whole context, its options with their consequences and the evidence, never as a bare question (DC-341).
 - The agent makes the technical choices, writes the reason into the design, and reports its concerns, their consequences and its actions in plain language (DC-7).
 - Every change ships with unit and integration tests on the layer that owns the behaviour. Live tests run on second instances and never touch the installed instance (DC-2, DC-5, DC-40).
 - The final end-to-end relay suite is the acceptor: 6 cells under 4 network profiles, with no SSH (DC-103).
