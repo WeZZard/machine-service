@@ -900,6 +900,28 @@ impl Target for RealTarget {
     }
 }
 
+/// The lease record mcp-relay keeps for `guest` under its state folder
+/// (`<state>/<session>/guests/<guest>/lease.json`): machine-service's lease
+/// record as `lease`, the broker grant as `relay`.
+fn mcp_lease_record(settings: &McpSettings, guest: &str) -> Option<Value> {
+    let state = settings
+        .env
+        .iter()
+        .find(|(key, _)| key == "MCP_RELAY_STATE_DIR")
+        .map(|(_, value)| std::path::PathBuf::from(value))?;
+    // The newest record of that guest: an earlier session under the same
+    // state folder may hold an older one.
+    std::fs::read_dir(&state)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("guests").join(guest).join("lease.json"))
+        .filter_map(|path| Some((std::fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max_by_key(|(modified, _)| *modified)
+        .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|value| !value.is_null())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,26 +997,4 @@ mod tests {
         assert_eq!(credential_until(1000.0, 24.0, 6.0), 1000.0 + 6.0 * 3600.0);
         assert_eq!(credential_until(1000.0, 0.1, 0.0), 1000.0);
     }
-}
-
-/// The lease record mcp-relay keeps for `guest` under its state folder
-/// (`<state>/<session>/guests/<guest>/lease.json`): machine-service's lease
-/// record as `lease`, the broker grant as `relay`.
-fn mcp_lease_record(settings: &McpSettings, guest: &str) -> Option<Value> {
-    let state = settings
-        .env
-        .iter()
-        .find(|(key, _)| key == "MCP_RELAY_STATE_DIR")
-        .map(|(_, value)| std::path::PathBuf::from(value))?;
-    // The newest record of that guest: an earlier session under the same
-    // state folder may hold an older one.
-    std::fs::read_dir(&state)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("guests").join(guest).join("lease.json"))
-        .filter_map(|path| Some((std::fs::metadata(&path).ok()?.modified().ok()?, path)))
-        .max_by_key(|(modified, _)| *modified)
-        .and_then(|(_, path)| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(|value| !value.is_null())
 }
