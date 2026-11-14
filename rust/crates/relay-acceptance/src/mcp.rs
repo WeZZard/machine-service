@@ -19,10 +19,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use relay_agent::protocol::{CallResult, Digest, Outcome};
+use relay_agent::protocol::{CallResult, Digest, Op, Outcome};
 use serde_json::{json, Value};
 
-use crate::client::{sha256_hex, Answer, RelayClient};
+use crate::client::{exec_op, new_id, sha256_hex, Answer, RelayClient};
+
+/// The outputs the suite's checks bring home with `relay_extract`, declared
+/// when the lease is acquired, as mcp-relay requires: (name, path in the
+/// guest's workspace).
+pub const EXTRACTIONS: [(&str, &str); 1] = [("ac57-output", "acc/ac57.bin")];
 
 /// The MCP protocol version the suite speaks.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -218,7 +223,11 @@ impl McpRelay {
         what: Acquire<'_>,
         ttl_hours: f64,
     ) -> Result<String, String> {
-        let mut arguments = json!({"task": task, "extractions": [], "ttlHours": ttl_hours});
+        let declared: Vec<Value> = EXTRACTIONS
+            .iter()
+            .map(|(name, path)| json!({"name": name, "path": path}))
+            .collect();
+        let mut arguments = json!({"task": task, "extractions": declared, "ttlHours": ttl_hours});
         match what {
             Acquire::Image(image) => arguments["image"] = json!(image),
             Acquire::Machine(machine) => arguments["machine"] = json!(machine),
@@ -261,6 +270,79 @@ impl McpRelay {
         script_answer(&answer, started.elapsed())
     }
 
+    /// `relay_script` of a shell script that the suite cancels after `after`,
+    /// as an agent cancels a tool call: MCP's `notifications/cancelled` for
+    /// the call, which mcp-relay turns into a cancel for the execution
+    /// (mcp-relay DC-50). A cancelled request need not be answered, so any
+    /// answer within `drain` is read and dropped.
+    pub fn script_cancelled(
+        &mut self,
+        guest: &str,
+        code: &str,
+        after: Duration,
+        drain: Duration,
+    ) -> Result<(), String> {
+        let id = self.next;
+        self.next += 1;
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "relay_script", "arguments": {
+                "guest": guest, "language": "shell", "inline": true, "code": code, "timeoutMs": 600_000,
+            }},
+        }))?;
+        std::thread::sleep(after);
+        self.notify(
+            "notifications/cancelled",
+            json!({"requestId": id, "reason": "relay acceptance cancels the call"}),
+        )?;
+        let until = Instant::now() + drain;
+        while let Ok(line) = self
+            .lines
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+        {
+            let answered = serde_json::from_str::<Value>(&line)
+                .ok()
+                .is_some_and(|message| message.get("id").and_then(Value::as_u64) == Some(id));
+            if answered {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `relay_extract` of one declared output; answers where it landed.
+    pub fn extract(&mut self, guest: &str, name: &str) -> Result<PathBuf, String> {
+        let answer = self.call(
+            "relay_extract",
+            json!({"guest": guest, "names": [name]}),
+            Duration::from_secs(60 * 60),
+        )?;
+        if answer.is_error {
+            return Err(format!("relay_extract refused: {:?}", answer.parts));
+        }
+        answer
+            .parts
+            .iter()
+            .flat_map(|part| match part {
+                Value::Array(items) => items.clone(),
+                Value::Object(map) => map
+                    .get("extractions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| vec![part.clone()]),
+                _ => Vec::new(),
+            })
+            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|item| {
+                item.get("destination")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+            })
+            .ok_or_else(|| format!("relay_extract named no destination: {:?}", answer.parts))
+    }
+
     /// `relay_release` of the guest.
     pub fn release(&mut self, guest: &str) -> Result<(), String> {
         let answer = self.call(
@@ -299,6 +381,10 @@ pub trait Actions: Send + Sync {
     /// Run a command line within `timeout_s`, waiting at most `wait`.
     fn exec(&self, command: &str, timeout_s: f64, wait: Duration) -> Result<Answer, String>;
 
+    /// Start a command line and cancel it after `after`, as the client
+    /// cancels its call; answers what the cancel reported, when anything did.
+    fn cancel_after(&self, command: &str, after: Duration) -> Result<String, String>;
+
     /// Run a command line, fail unless it exits 0, and return its output.
     fn run(&self, command: &str) -> Result<String, String> {
         let answer = self.exec(command, 600.0, Duration::from_secs(900))?;
@@ -315,6 +401,20 @@ pub trait Actions: Send + Sync {
 impl Actions for RelayClient {
     fn exec(&self, command: &str, timeout_s: f64, wait: Duration) -> Result<Answer, String> {
         RelayClient::exec(self, command, timeout_s, wait)
+    }
+
+    fn cancel_after(&self, command: &str, after: Duration) -> Result<String, String> {
+        let target = new_id("cancel-target");
+        let running = self.call(&target, exec_op(command, false, 600.0), b"", true)?;
+        std::thread::sleep(after);
+        let cancel = self.call(&new_id("cancel"), Op::Cancel { target }, b"", true)?;
+        let cancel = self.wait(cancel, Duration::from_secs(300))?;
+        let ran = self.wait(running, Duration::from_secs(300))?;
+        Ok(format!(
+            "cancel {:?}, command {:?}",
+            cancel.outcome(),
+            ran.outcome()
+        ))
     }
 }
 
@@ -343,6 +443,14 @@ impl McpGuest {
             .release(&self.guest)
     }
 
+    /// Bring a declared output home through mcp-relay.
+    pub fn extract(&self, name: &str) -> Result<PathBuf, String> {
+        self.relay
+            .lock()
+            .map_err(|_| "mcp-relay is poisoned")?
+            .extract(&self.guest, name)
+    }
+
     /// mcp-relay's log so far.
     pub fn log(&self) -> String {
         self.relay
@@ -359,6 +467,14 @@ impl Actions for McpGuest {
             .lock()
             .map_err(|_| "mcp-relay is poisoned")?
             .script(&self.guest, command, timeout)
+    }
+
+    fn cancel_after(&self, command: &str, after: Duration) -> Result<String, String> {
+        self.relay
+            .lock()
+            .map_err(|_| "mcp-relay is poisoned")?
+            .script_cancelled(&self.guest, command, after, Duration::from_secs(60))?;
+        Ok("cancelled through MCP's notifications/cancelled".into())
     }
 }
 
@@ -407,11 +523,22 @@ pub fn script_answer(answer: &ToolAnswer, elapsed: Duration) -> Result<Answer, S
         size: bytes.len() as u64,
         sha256: sha256_hex(&bytes),
     };
+    // A script past its timeout is `uncertain` with `timedOut` and its
+    // termination confirmed: it was killed, so it is an exit that timed out.
+    let timed_out = result
+        .get("timedOut")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let confirmed = result
+        .get("terminationConfirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let rc = match outcome.get("kind").and_then(Value::as_str) {
         Some("completed") => outcome
             .pointer("/exitStatus/code")
             .and_then(Value::as_i64)
             .map(|code| code as i32),
+        Some("uncertain") if timed_out && confirmed => None,
         Some(other) => return Err(format!("relay_script ended {other}: {outcome}")),
         None => return Err(format!("relay_script outcome has no kind: {outcome}")),
     };
@@ -434,10 +561,7 @@ pub fn script_answer(answer: &ToolAnswer, elapsed: Duration) -> Result<Answer, S
             outcome: Outcome::Exit {
                 rc,
                 signal,
-                timed_out: result
-                    .get("timedOut")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                timed_out,
                 cancelled: false,
                 output: digest,
             },
@@ -473,6 +597,25 @@ mod tests {
         assert_eq!(answer.rc().unwrap(), Some(3));
         assert_eq!(answer.text(), "out\nerr\n");
         assert_eq!(answer.result.unwrap().execution, "execution-1");
+    }
+
+    #[test]
+    fn a_script_killed_at_its_timeout_is_an_exit_that_timed_out() {
+        let answer = ToolAnswer {
+            is_error: true,
+            parts: vec![
+                json!({"outcome": {"kind": "uncertain", "diagnostic": "execution timed out"}, "timedOut": true, "terminationConfirmed": true, "stdout": ""}),
+            ],
+        };
+        let answer = script_answer(&answer, Duration::ZERO).unwrap();
+        assert!(matches!(
+            answer.outcome().unwrap(),
+            Outcome::Exit {
+                timed_out: true,
+                rc: None,
+                ..
+            }
+        ));
     }
 
     #[test]

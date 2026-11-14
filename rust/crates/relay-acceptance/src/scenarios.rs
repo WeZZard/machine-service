@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use network_rig::cell::{CellContext, Outcome as Verdict, Scenario, Stop};
 use network_rig::{Fault, Select, Side, Stream};
-use relay_agent::protocol::{CancelFound, ExecutionState, Op, Outcome};
+use relay_agent::protocol::{ExecutionState, Op, Outcome};
 use remote_session::{Error as SessionError, LinkEvent, RejectCode};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
@@ -548,7 +548,7 @@ fn ac55(ctx: &mut Ctx<'_>) -> Verdict {
 
 // AC-56: a command behaves as it would in a terminal of the desktop session.
 fn ac56(ctx: &mut Ctx<'_>) -> Verdict {
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     for (command, want) in [
         ("exit 0", 0),
@@ -571,19 +571,38 @@ fn ac56(ctx: &mut Ctx<'_>) -> Verdict {
             .ok();
         bytes
     };
-    let call = client.call(
-        &new_id("stdin"),
-        exec_op(os.sha256_stdin(), true, 300.0),
-        &input,
-        true,
-    )?;
-    let answer = client.wait(call, Duration::from_secs(900))?;
-    ctx.check(
-        "1 MiB on standard input hashes to the sent bytes",
-        expect(answer.text().trim() == sha256_hex(&input), || {
-            format!("the guest printed {:?}", answer.text().trim())
-        }),
-    );
+    if let Some(session) = ctx.target.current_client() {
+        let call = session.call(
+            &new_id("stdin"),
+            exec_op(os.sha256_stdin(), true, 300.0),
+            &input,
+            true,
+        )?;
+        let answer = session.wait(call, Duration::from_secs(900))?;
+        ctx.check(
+            "1 MiB on standard input hashes to the sent bytes",
+            expect(answer.text().trim() == sha256_hex(&input), || {
+                format!("the guest printed {:?}", answer.text().trim())
+            }),
+        );
+    } else {
+        // An agent gives mcp-relay a script, not a command's standard input,
+        // so the bytes travel inside the script, within its 1 MiB limit
+        // (DC-345).
+        let part = &input[..600 << 10];
+        let script = format!(
+            "base64 -d <<'ACC56' | {}\n{}\nACC56",
+            os.sha256_stdin(),
+            base64(part)
+        );
+        let answer = client.exec(&script, 300.0, Duration::from_secs(900))?;
+        ctx.check(
+            "600 KiB carried in a script hash to the sent bytes",
+            expect(answer.text().trim() == sha256_hex(part), || {
+                format!("the guest printed {:?}", answer.text().trim())
+            }),
+        );
+    }
 
     let no_survivors = |pattern: &str| -> Result<(), Stop> {
         let mut last = String::new();
@@ -616,61 +635,53 @@ fn ac56(ctx: &mut Ctx<'_>) -> Verdict {
         no_survivors("sleep 356[1]"),
     );
 
-    let target = new_id("cancel-target");
-    let running = client.call(
-        &target,
-        exec_op(
-            "sleep 3562 & sleep 3562 & (sleep 3562 &); wait",
-            false,
-            600.0,
-        ),
-        b"",
-        true,
-    )?;
-    std::thread::sleep(Duration::from_secs(3));
-    let cancel = client.call(
-        &new_id("cancel"),
-        Op::Cancel {
-            target: target.clone(),
-        },
-        b"",
-        true,
-    )?;
-    let cancel = client.wait(cancel, Duration::from_secs(300))?;
-    let cancelled = client.wait(running, Duration::from_secs(300))?;
-    ctx.check(
-        "a cancel signals the running command",
-        expect(
-            matches!(
-                cancel.outcome()?,
-                Outcome::Cancel {
-                    found: CancelFound::Signalled,
-                    ..
-                }
-            ) && matches!(
-                cancelled.outcome()?,
-                Outcome::Exit {
-                    cancelled: true,
-                    ..
-                }
+    let command = "sleep 3562 & sleep 3562 & (sleep 3562 &); wait";
+    let detail = client.cancel_after(command, Duration::from_secs(3))?;
+    ctx.record("cancel", json!(detail));
+    if ctx.target.current_client().is_some() {
+        // The suite's own session sees the cancel's and the command's
+        // outcomes; through mcp-relay the cancel is MCP's, and the check
+        // stands on its effect.
+        ctx.check(
+            "a cancel signals the running command",
+            expect(
+                detail.contains("Signalled") && detail.contains("cancelled: true"),
+                || detail.clone(),
             ),
-            || {
-                format!(
-                    "cancel {:?}, command {:?}",
-                    cancel.outcome(),
-                    cancelled.outcome()
-                )
-            },
-        ),
-    );
+        );
+    }
     ctx.check(
         "every process of a cancelled group exits",
         no_survivors("sleep 356[2]"),
     );
     if ctx.target.durable() {
-        durable_lease_checks(ctx, &client)?;
+        match ctx.target.current_client() {
+            Some(session) => durable_lease_checks(ctx, &session)?,
+            None => return Err(Stop::Blocked(
+                "AC-56's durable lease checks need the suite's own session, and are not yet driven through mcp-relay".into(),
+            )),
+        }
     }
     Ok(())
+}
+
+/// Standard base64 with padding, for bytes a script carries.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for (k, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if k <= chunk.len() {
+                out.push(TABLE[((n >> shift) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// What a durable lease's command sees: its lease, its working directory
@@ -765,7 +776,60 @@ fn durable_lease_checks(ctx: &mut Ctx<'_>, client: &RelayClient) -> Verdict {
 }
 
 // AC-57: large output arrives whole.
+/// AC-57 through mcp-relay: a script's own output is bounded on the agent's
+/// path (64 KiB in the guest, 50 KiB in a tool result), so large output goes
+/// as an agent sends it, a file in the workspace that `relay_extract` brings
+/// home, which must arrive whole (DC-345).
+fn ac57_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let guest = ctx.target.mcp_guest().ok_or("no mcp-relay guest")?;
+    let os = ctx.target.os();
+    let written = client.run(&format!(
+        "mkdir -p acc && head -c 201000000 /dev/urandom > acc/ac57.bin && \
+         wc -c < acc/ac57.bin | tr -d ' ' && {} < acc/ac57.bin",
+        os.sha256_stdin()
+    ))?;
+    let mut lines = written.lines().map(str::trim);
+    let (size, want) = (
+        lines.next().unwrap_or_default().to_string(),
+        lines.next().unwrap_or_default().to_string(),
+    );
+    let started = Instant::now();
+    let landed = guest.extract("ac57-output")?;
+    let seconds = started.elapsed().as_secs_f64();
+    let file = if landed.is_dir() {
+        std::fs::read_dir(&landed)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .ok_or_else(|| format!("{} holds no file", landed.display()))?
+    } else {
+        landed.clone()
+    };
+    let mut hasher = Sha256::new();
+    let mut reader = std::fs::File::open(&file).map_err(|e| e.to_string())?;
+    let copied = std::io::copy(&mut reader, &mut hasher).map_err(|e| e.to_string())?;
+    let got = hex(&hasher.finalize());
+    ctx.record(
+        "ac57_extract",
+        json!({"seconds": seconds, "bytes": copied, "landed": file.display().to_string()}),
+    );
+    ctx.check(
+        "201,000,000 bytes a script wrote arrive whole through relay_extract",
+        expect(
+            size == "201000000" && copied == 201_000_000 && got == want,
+            || format!("guest {size} bytes {want}; home {copied} bytes {got}"),
+        ),
+    );
+    let _ = std::fs::remove_file(&file);
+    Ok(())
+}
+
 fn ac57(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac57_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
     let sha = os.sha256_stdin();
@@ -1998,5 +2062,23 @@ fn ac70(ctx: &mut Ctx<'_>) -> Verdict {
             trips.len()
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_rfc_4648() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(super::base64(plain.as_bytes()), encoded);
+        }
     }
 }

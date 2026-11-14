@@ -284,6 +284,11 @@ impl RealTarget {
         Ok(Arc::clone(self.mcp.as_ref().expect("an mcp-relay guest")) as Arc<dyn Actions>)
     }
 
+    /// The guest mcp-relay acquired, when it is the cell's client.
+    pub fn mcp_guest(&self) -> Option<Arc<McpGuest>> {
+        self.mcp.as_ref().map(Arc::clone)
+    }
+
     /// mcp-relay's log, when it is the cell's client: its session's losses
     /// and resumes (mcp-relay DC-85).
     pub fn mcp_log(&self) -> Option<String> {
