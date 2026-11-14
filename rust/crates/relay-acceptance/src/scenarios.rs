@@ -227,18 +227,35 @@ fn ac68(ctx: &mut Ctx<'_>) -> Verdict {
         }),
     );
     let base = crate::instance::base_host(ctx.target.instance().base());
-    ctx.check(
-        "the instance was named, not addressed",
-        expect(base.parse::<std::net::IpAddr>().is_err(), || {
-            format!("the instance was given as {base}")
-        }),
-    );
+    let loopback = base
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    if ctx.target.mcp_mode() && loopback {
+        // mcp-relay reaches the instance on its own host by its loopback
+        // origin and every other one by the name discovery finds (CN-1).
+        ctx.record(
+            "instance_origin",
+            json!("mcp-relay's loopback origin on the client's host"),
+        );
+    } else {
+        ctx.check(
+            "the instance was named, not addressed",
+            expect(base.parse::<std::net::IpAddr>().is_err(), || {
+                format!("the instance was given as {base}")
+            }),
+        );
+    }
     // A session through the rig opens even when the lease's relay agent has
     // none, which other scenarios judge.
-    let opened = lease_client(ctx);
+    let opened = if ctx.target.mcp_mode() {
+        lease_actions(ctx).map(drop)
+    } else {
+        lease_client(ctx).map(drop)
+    };
     let session_opened = opened.is_ok() || ctx.target.facts.contains_key("ready_agent");
     let lease_url = ctx.target.lease.as_ref().map(|l| l.url.clone());
     ctx.record("acquisition_url", json!(lease_url));
+    // mcp-relay dials the URL of the grant it was given, as the suite does.
     let dials = ctx.target.options_for(&ctx.client, "", "client").url;
     ctx.record("client_dials", json!(dials));
     ctx.check(
