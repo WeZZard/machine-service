@@ -473,7 +473,7 @@ impl Actions for McpGuest {
         self.relay
             .lock()
             .map_err(|_| "mcp-relay is poisoned")?
-            .script_cancelled(&self.guest, command, after, Duration::from_secs(60))?;
+            .script_cancelled(&self.guest, command, after, Duration::from_secs(10))?;
         Ok("cancelled through MCP's notifications/cancelled".into())
     }
 }

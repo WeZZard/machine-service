@@ -786,7 +786,7 @@ fn ac57_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let os = ctx.target.os();
     let written = client.run(&format!(
         "mkdir -p acc && head -c 201000000 /dev/urandom > acc/ac57.bin && \
-         wc -c < acc/ac57.bin | tr -d ' ' && {} < acc/ac57.bin",
+         wc -c < acc/ac57.bin | tr -d ' ' && cat acc/ac57.bin | {}",
         os.sha256_stdin()
     ))?;
     let mut lines = written.lines().map(str::trim);
