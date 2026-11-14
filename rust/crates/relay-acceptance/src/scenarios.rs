@@ -1342,8 +1342,92 @@ fn agent_connections(ctx: &mut Ctx<'_>) -> Result<Value, Stop> {
     serde_json::from_str(text.trim()).map_err(|e| Stop::Failed(format!("rig-ctl: {e}: {text}")))
 }
 
+/// The session events mcp-relay has logged so far (mcp-relay DC-85).
+fn mcp_session_events(ctx: &Ctx<'_>) -> Vec<String> {
+    ctx.target
+        .mcp_log()
+        .map(|log| crate::mcp::session_events(&log))
+        .unwrap_or_default()
+}
+
+/// AC-61 through mcp-relay: both the client's and the agent's connections
+/// are cut while a `relay_script` runs; mcp-relay must resume its session
+/// and bring the script's one answer home, and the script must have run
+/// once (DC-345).
+fn ac61_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    client.run("rm -f ~/acc61.txt")?;
+    let before = agent_connections(ctx)?;
+    let events_before = mcp_session_events(ctx).len();
+    let control = ctx.rig.control().clone();
+    let host = ctx.target.host()?.clone();
+    let (answer, cuts) = std::thread::scope(|scope| {
+        let cutter = scope.spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let cut = control.cut(Select::All, Side::Both);
+            let agent_cut = host.run(&["rig-ctl", "{\"cut\":{\"side\":\"both\"}}"]);
+            (format!("{cut:?}"), format!("{agent_cut:?}"))
+        });
+        let answer = client.exec(
+            "sleep 8; echo once >> ~/acc61.txt; sleep 8; echo done",
+            600.0,
+            Duration::from_secs(900),
+        );
+        (answer, cutter.join().unwrap_or_default())
+    });
+    ctx.record("client_cut", json!(cuts.0));
+    ctx.record("agent_cut", json!(cuts.1));
+    let answer = answer?;
+    let after = agent_connections(ctx)?;
+    let events: Vec<String> = mcp_session_events(ctx)
+        .into_iter()
+        .skip(events_before)
+        .collect();
+    ctx.record("mcp_session_events", json!(events));
+    ctx.record(
+        "agent_connections",
+        json!({"before": before, "after": after}),
+    );
+    ctx.check(
+        "mcp-relay resumed its session",
+        expect(
+            events.iter().any(|e| e.contains("lost"))
+                && events.iter().any(|e| e.contains("resumed")),
+            || format!("mcp-relay logged {events:?}"),
+        ),
+    );
+    let ids = |v: &Value| -> Vec<u64> {
+        v["connections"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| c["id"].as_u64()).collect())
+            .unwrap_or_default()
+    };
+    ctx.check(
+        "the relay agent reconnected and resumed",
+        expect(
+            ids(&after).iter().any(|id| !ids(&before).contains(id)),
+            || format!("agent connections {before} -> {after}"),
+        ),
+    );
+    ctx.check(
+        "the result arrives once",
+        expect(answer.text() == "done\n" && answer.rc()? == Some(0), || {
+            answer.text()
+        }),
+    );
+    let lines = client.run("wc -l < ~/acc61.txt; rm -f ~/acc61.txt")?;
+    ctx.check(
+        "the file holds one line",
+        expect(lines.trim() == "1", || format!("{} lines", lines.trim())),
+    );
+    Ok(())
+}
+
 // AC-61: a cut during an action does not run it twice.
 fn ac61(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac61_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     client.run("rm -f ~/acc61.txt")?;
     let before = agent_connections(ctx)?;
