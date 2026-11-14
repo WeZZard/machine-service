@@ -1,6 +1,8 @@
 Feature: Actions through the relay agent and the broker
   Every scenario runs in the 6 cells of TL-7, under the network profiles its tags name.
+  The client in every cell is mcp-relay, which the suite drives over MCP as an agent does.
   In every cell, sshd is off in the guest after acquisition and before the first action.
+  A run that finds no machine for its cell is missing, and an acceptance with a missing run is incomplete.
 
   @AC-55 @TL-7 @N0 @N1 @N2 @N3
   Scenario: An action runs in the desktop session
@@ -9,6 +11,10 @@ Feature: Actions through the relay agent and the broker
     Then the action reads a test item from the login keychain without unlocking it
     And the action's process is not a descendant of the relay agent, so it holds none of the agent's privacy permissions
     And the action captures the screen through cua-driver
+    When the client starts, in the background, an action that sends an Apple Event to Finder
+    And the suite presses Return on the permission prompt that macOS raises
+    Then the action completes with Finder's answer
+    And on a durable Mac the approval is listed in the run's checklist of approved permission prompts
     When the client runs an action on an Ubuntu target
     Then the action sees the desktop session's display and session bus
     And the action reads a test item from the login keyring
