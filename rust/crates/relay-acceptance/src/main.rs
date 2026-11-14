@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use network_rig::cell::{run_cell, Cell, Verdict};
 use network_rig::Profile;
+use relay_acceptance::mcp::McpSettings;
 use relay_acceptance::scenarios;
 use relay_acceptance::target::{HostControl, RealTarget, TargetSettings};
 use serde_json::Value;
@@ -78,6 +79,35 @@ fn run(args: &[String]) -> i32 {
     let only: Vec<String> = flag(args, "only")
         .map(|s| s.split(',').map(|id| id.trim().to_string()).collect())
         .unwrap_or_default();
+    let evidence = PathBuf::from(need(args, "evidence"));
+    // The cell's client is mcp-relay (TL-7, DC-341); `--client suite` runs
+    // the suite's own client instead, for diagnosis.
+    let mcp = match flag(args, "client").as_deref().unwrap_or("mcp") {
+        "suite" => None,
+        "mcp" => {
+            let server = flag(args, "mcp-server")
+                .or_else(|| std::env::var("RELAY_ACCEPTANCE_MCP_SERVER").ok())
+                .unwrap_or_else(|| {
+                    eprintln!("relay-acceptance: name mcp-relay's dist/server.mjs with --mcp-server or RELAY_ACCEPTANCE_MCP_SERVER, or run --client suite");
+                    std::process::exit(2)
+                });
+            let run = evidence.join(cell.id()).join(&profile.id);
+            Some(McpSettings {
+                node: PathBuf::from(flag(args, "node").unwrap_or_else(|| "node".into())),
+                server: PathBuf::from(server),
+                project: run.join("mcp-project"),
+                env: vec![(
+                    "MCP_RELAY_STATE_DIR".into(),
+                    run.join("mcp-state").display().to_string(),
+                )],
+                log: run.join("mcp-relay.log"),
+            })
+        }
+        other => {
+            eprintln!("relay-acceptance: --client is mcp or suite, not {other}");
+            std::process::exit(2)
+        }
+    };
     let settings = TargetSettings {
         instance: need(args, "instance"),
         image: flag(args, "image"),
@@ -92,8 +122,8 @@ fn run(args: &[String]) -> i32 {
                 .to_ascii_lowercase()
                 .replace('.', "-")
         }),
+        mcp,
     };
-    let evidence = PathBuf::from(need(args, "evidence"));
     let mut target = RealTarget::new(settings);
     let suite = scenarios::select(&only);
     eprintln!(

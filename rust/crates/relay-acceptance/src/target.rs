@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use crate::client::{ClientOptions, RelayClient};
 use crate::guest::{shell_quote, Os};
 use crate::instance::{url_host_port, Discovery, Instance};
+use crate::mcp::{Acquire, Actions, McpGuest, McpRelay, McpSettings};
 
 /// How the suite reaches the target's host: a command that runs the host
 /// script there, such as `ssh <host> <dir>/relay-acceptance-host.sh`. The
@@ -80,6 +81,10 @@ pub struct TargetSettings {
     pub manage_agent_rig: bool,
     /// The lease's purpose.
     pub purpose: String,
+    /// When set, the cell's client is mcp-relay, driven over MCP (TL-7,
+    /// DC-341): it acquires, runs and releases the lease. The route to the
+    /// broker through the rig is added when the lease is acquired.
+    pub mcp: Option<McpSettings>,
 }
 
 /// A lease the suite holds.
@@ -160,6 +165,8 @@ pub struct RealTarget {
     /// Why the lease cannot serve the suite, once known.
     pub blocked: Option<Stop>,
     client: Option<Arc<RelayClient>>,
+    /// The guest mcp-relay acquired, when the cell's client is mcp-relay.
+    mcp: Option<Arc<McpGuest>>,
     /// Facts found while setting the lease up, for the scenarios that judge
     /// them.
     pub facts: Map<String, Value>,
@@ -181,6 +188,7 @@ impl RealTarget {
             lease: None,
             blocked: None,
             client: None,
+            mcp: None,
             facts: Map::new(),
             released: None,
             log: Vec::new(),
@@ -231,6 +239,11 @@ impl RealTarget {
     /// The lease's client session, acquiring the lease and setting it up on
     /// first use.
     pub fn client(&mut self, rig: &ClientSide) -> Result<Arc<RelayClient>, Stop> {
+        if self.mcp_mode() {
+            return Err(Stop::Blocked(
+                "this check needs the suite's own session with the broker, and is not yet driven through mcp-relay".into(),
+            ));
+        }
         if let Some(stop) = &self.blocked {
             return Err(stop.clone());
         }
@@ -245,6 +258,101 @@ impl RealTarget {
             self.client = Some(Arc::new(RelayClient::connect(&options)?));
         }
         Ok(Arc::clone(self.client.as_ref().expect("a client")))
+    }
+
+    /// Whether the cell's client is mcp-relay.
+    pub fn mcp_mode(&self) -> bool {
+        self.settings.mcp.is_some()
+    }
+
+    /// The lease's actions: commands run through mcp-relay when it is the
+    /// cell's client, else through the suite's own session. Acquires and
+    /// sets the lease up on first use.
+    pub fn actions(&mut self, rig: &ClientSide) -> Result<Arc<dyn Actions>, Stop> {
+        if !self.mcp_mode() {
+            return Ok(self.client(rig)? as Arc<dyn Actions>);
+        }
+        if let Some(stop) = &self.blocked {
+            return Err(stop.clone());
+        }
+        if self.mcp.is_none() {
+            if let Err(stop) = self.acquire_mcp(rig) {
+                self.blocked = Some(stop.clone());
+                return Err(stop);
+            }
+        }
+        Ok(Arc::clone(self.mcp.as_ref().expect("an mcp-relay guest")) as Arc<dyn Actions>)
+    }
+
+    /// mcp-relay's log, when it is the cell's client: its session's losses
+    /// and resumes (mcp-relay DC-85).
+    pub fn mcp_log(&self) -> Option<String> {
+        self.mcp.as_ref().map(|guest| guest.log())
+    }
+
+    /// Acquire the lease through mcp-relay, which reaches the broker through
+    /// the rig by its route (mcp-relay DC-84), stage it and set it up.
+    fn acquire_mcp(&mut self, rig: &ClientSide) -> Result<(), Stop> {
+        let started = Instant::now();
+        let durable = self.kind == Some(TargetKind::DurableMac);
+        let mut settings = self.settings.mcp.clone().expect("mcp settings");
+        settings.env.extend([
+            ("MCP_RELAY_URL".to_string(), self.settings.instance.clone()),
+            (
+                "MCP_RELAY_BROKER_RESOLVE".to_string(),
+                format!("{}={}", rig.host, rig.connect),
+            ),
+            (
+                "MCP_RELAY_BROKER_CA".to_string(),
+                rig.ca_bundle.display().to_string(),
+            ),
+            ("MCP_RELAY_ON_EXIT".to_string(), "release".to_string()),
+        ]);
+        let mut relay = McpRelay::start(&settings)?;
+        let machine = self
+            .discovery
+            .as_ref()
+            .and_then(|d| d.health.get("instance"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let image = self.settings.image.clone();
+        let what = if durable {
+            Acquire::Machine(machine.as_deref().ok_or("discovery names no machine")?)
+        } else {
+            Acquire::Image(
+                image
+                    .as_deref()
+                    .ok_or("a virtual machine target needs --image")?,
+            )
+        };
+        let task: String = self.settings.purpose.chars().take(36).collect();
+        let guest = relay.acquire(&task, what, 6.0)?;
+        relay.stage(&guest)?;
+        let acquired_in = started.elapsed();
+        let mcp = Arc::new(McpGuest::new(relay, guest.clone()));
+        self.mcp = Some(Arc::clone(&mcp));
+        let kernel = mcp.run("uname -s")?;
+        let os = Os::from_agent(if kernel.trim() == "Darwin" {
+            "macos"
+        } else {
+            "linux"
+        });
+        self.note(
+            "acquired through mcp-relay",
+            json!({"guest": guest, "seconds": acquired_in.as_secs_f64(), "os": format!("{os:?}")}),
+        );
+        self.lease = Some(Lease {
+            name: guest,
+            record: json!({}),
+            credential: String::new(),
+            url: String::new(),
+            ca_pem: String::new(),
+            acquired_in,
+            agent_credential: None,
+            os,
+            agent: AgentPlace::guest(),
+        });
+        self.set_up(os, durable)
     }
 
     /// The current client session, if one is open.
@@ -395,7 +503,11 @@ impl RealTarget {
 
     /// Turn sshd off in a VM and gather the facts the scenarios judge.
     fn set_up(&mut self, os: Os, durable: bool) -> Result<(), Stop> {
-        let client = Arc::clone(self.client.as_ref().expect("a client"));
+        let client: Arc<dyn Actions> = match (&self.mcp, &self.client) {
+            (Some(guest), _) => Arc::clone(guest) as Arc<dyn Actions>,
+            (None, Some(client)) => Arc::clone(client) as Arc<dyn Actions>,
+            (None, None) => return Err(Stop::Failed("no client to set the lease up with".into())),
+        };
         if !durable {
             let off = client.exec(os.sshd_off(), 120.0, Duration::from_secs(600))?;
             let text = off.text();
@@ -435,6 +547,18 @@ impl RealTarget {
 
     /// Release the lease, keeping its credentials for the refusal checks.
     pub fn release(&mut self) -> Result<Value, String> {
+        if let Some(guest) = self.mcp.take() {
+            let lease = self.lease.take();
+            let answer = guest.release().map(|()| json!({"released": guest.guest}));
+            self.note(
+                "released through mcp-relay",
+                json!({"guest": guest.guest, "answer": format!("{answer:?}")}),
+            );
+            if let Some(lease) = lease {
+                self.released = Some((lease.credential, None));
+            }
+            return answer;
+        }
         let lease = self.lease.take().ok_or("no lease")?;
         let answer = self
             .instance
