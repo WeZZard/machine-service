@@ -55,6 +55,7 @@ fn one_cell_under_one_profile_passes() {
                     run.join("mcp-state").display().to_string(),
                 )],
                 log: run.join("mcp-relay.log"),
+                workspace: None,
             }
         }),
     };

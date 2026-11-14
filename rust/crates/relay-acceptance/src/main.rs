@@ -107,6 +107,7 @@ fn run(args: &[String]) -> i32 {
                     run.join("mcp-state").display().to_string(),
                 )],
                 log: run.join("mcp-relay.log"),
+                workspace: None,
             })
         }
         other => {
@@ -114,6 +115,20 @@ fn run(args: &[String]) -> i32 {
             std::process::exit(2)
         }
     };
+    // AC-58 pushes files the way an agent does, staged with the guest's
+    // workspace, so they are prepared before the cell acquires.
+    let mut mcp = mcp;
+    if let Some(settings) = mcp.as_mut() {
+        if only.is_empty() || only.iter().any(|id| id == "AC-58") {
+            match relay_acceptance::mcp::prepare_ac58(&settings.project) {
+                Ok(workspace) => settings.workspace = Some(workspace),
+                Err(error) => {
+                    eprintln!("relay-acceptance: AC-58's files: {error}");
+                    std::process::exit(2)
+                }
+            }
+        }
+    }
     let settings = TargetSettings {
         instance: need(args, "instance"),
         image: flag(args, "image"),
