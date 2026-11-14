@@ -27,7 +27,28 @@ use crate::client::{exec_op, new_id, sha256_hex, Answer, RelayClient};
 /// The outputs the suite's checks bring home with `relay_extract`, declared
 /// when the lease is acquired, as mcp-relay requires: (name, path in the
 /// guest's workspace).
-pub const EXTRACTIONS: [(&str, &str); 1] = [("ac57-output", "acc/ac57.bin")];
+pub const EXTRACTIONS: [(&str, &str); 5] = [
+    ("ac57-output", "acc/ac57.bin"),
+    ("ac58-small", "acc/ac58/small.bin"),
+    ("ac58-mid", "acc/ac58/mid.bin"),
+    ("ac58-big", "acc/ac58/big.bin"),
+    ("ac58-tree", "acc/ac58/tree"),
+];
+
+/// The files AC-58 stages, as (name, size): 1 KiB and 200 MiB. mcp-relay
+/// stages at most 512 MiB and 10,000 files, so its 1908 MiB ("2 GB") file is
+/// only pulled; and it stages and extracts file by file, so its trees hold
+/// 1,000 files each way and their time is recorded.
+pub const AC58_FILES: [(&str, u64); 2] = [("small.bin", 1 << 10), ("mid.bin", 200 << 20)];
+/// How many files AC-58's staged tree holds.
+pub const AC58_TREE: usize = 1_000;
+/// How many files AC-58's pulled tree holds; files beyond the staged tree
+/// are removed from an earlier, larger set.
+pub const AC58_PULLED_TREE: usize = 1_000;
+/// The folder, under mcp-relay's project folder, that the cell stages as
+/// the guest's workspace when AC-58 runs: an agent sends files to a guest
+/// only when it stages it.
+pub const AC58_WORKSPACE: &str = "acc58-push";
 
 /// The MCP protocol version the suite speaks.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -48,6 +69,9 @@ pub struct McpSettings {
     pub env: Vec<(String, String)>,
     /// Where the server's standard error goes.
     pub log: PathBuf,
+    /// A folder under `project` to stage as the guest's workspace, when a
+    /// check pushes files (AC-58).
+    pub workspace: Option<String>,
 }
 
 /// One running mcp-relay server.
@@ -216,40 +240,61 @@ impl McpRelay {
         })
     }
 
-    /// `relay_acquire` of an image or a durable machine; answers the guest's name.
+    /// `relay_acquire` of an image or a durable machine on `instance`, the
+    /// cell's test instance, by its origin (mcp-relay DC-75); answers the
+    /// guest's name. mcp-relay asks every instance on the network (its DC-73),
+    /// so a lease that lands anywhere else is released and refused: a live
+    /// test never touches an installed instance (intents; DC-245).
     pub fn acquire(
         &mut self,
         task: &str,
         what: Acquire<'_>,
         ttl_hours: f64,
+        instance: &str,
     ) -> Result<String, String> {
         let declared: Vec<Value> = EXTRACTIONS
             .iter()
             .map(|(name, path)| json!({"name": name, "path": path}))
             .collect();
-        let mut arguments = json!({"task": task, "extractions": declared, "ttlHours": ttl_hours});
+        let mut arguments = json!({
+            "task": task, "extractions": declared, "ttlHours": ttl_hours, "instance": instance,
+        });
         match what {
             Acquire::Image(image) => arguments["image"] = json!(image),
             Acquire::Machine(machine) => arguments["machine"] = json!(machine),
         }
         let answer = self.call("relay_acquire", arguments, Duration::from_secs(40 * 60))?;
-        match answer
+        let guest = match answer
             .with("guest")
             .and_then(|part| part.get("guest"))
             .and_then(Value::as_str)
         {
-            Some(guest) if !answer.is_error => Ok(guest.to_string()),
-            _ => Err(format!("relay_acquire refused: {:?}", answer.parts)),
+            Some(guest) if !answer.is_error => guest.to_string(),
+            _ => return Err(format!("relay_acquire refused: {:?}", answer.parts)),
+        };
+        let endpoint = answer
+            .with("backend")
+            .and_then(|part| part.pointer("/backend/endpoint"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if endpoint != instance.trim_end_matches('/') {
+            let released = self.release(&guest);
+            return Err(format!(
+                "mcp-relay leased {guest} on {endpoint:?}, not the test instance {instance}; released: {released:?}"
+            ));
         }
+        Ok(guest)
     }
 
     /// `relay_stage` of the guest runtime.
-    pub fn stage(&mut self, guest: &str) -> Result<ToolAnswer, String> {
-        let answer = self.call(
-            "relay_stage",
-            json!({"guest": guest}),
-            Duration::from_secs(10 * 60),
-        )?;
+    pub fn stage(&mut self, guest: &str, workspace: Option<&str>) -> Result<ToolAnswer, String> {
+        let mut arguments = json!({"guest": guest});
+        if let Some(workspace) = workspace {
+            arguments["workspace"] = json!(workspace);
+        }
+        let answer = self.call("relay_stage", arguments, Duration::from_secs(60 * 60))?;
         if answer.is_error {
             return Err(format!("relay_stage refused: {:?}", answer.parts));
         }
@@ -498,6 +543,16 @@ pub enum Acquire<'a> {
 /// in one part, such as an image's delivery and then the run's result. A part
 /// that is not JSON is kept as a string.
 fn json_values(text: &str) -> Vec<Value> {
+    // A result over mcp-relay's 50 KiB text bound is cut and ends naming the
+    // file that holds it whole.
+    if let Some(path) = text
+        .rsplit_once("[Truncated. Full result: ")
+        .and_then(|(_, rest)| rest.strip_suffix(']'))
+    {
+        if let Ok(full) = std::fs::read_to_string(path.trim()) {
+            return json_values(&full);
+        }
+    }
     let values: Result<Vec<Value>, _> = serde_json::Deserializer::from_str(text)
         .into_iter::<Value>()
         .collect();
@@ -587,6 +642,53 @@ pub fn session_events(log: &str) -> Vec<String> {
         .collect()
 }
 
+/// Write AC-58's files into `<project>/<AC58_WORKSPACE>`: seeded bytes, so a
+/// failure can be replayed, written once and kept between runs of the same
+/// folder.
+pub fn prepare_ac58(project: &Path) -> Result<String, String> {
+    let root = project.join(AC58_WORKSPACE);
+    std::fs::create_dir_all(root.join("tree")).map_err(|e| format!("{}: {e}", root.display()))?;
+    let fill = |path: &Path, size: u64, seed: u64| -> Result<(), String> {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() == size) {
+            return Ok(());
+        }
+        let mut file =
+            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        let mut state = seed | 1;
+        let mut left = size;
+        let mut block = [0u8; 8192];
+        while left > 0 {
+            for chunk in block.chunks_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+            }
+            let n = left.min(block.len() as u64) as usize;
+            file.write_all(&block[..n]).map_err(|e| e.to_string())?;
+            left -= n as u64;
+        }
+        file.flush().map_err(|e| e.to_string())
+    };
+    for (i, (name, size)) in AC58_FILES.iter().enumerate() {
+        fill(&root.join(name), *size, 58 + i as u64)?;
+    }
+    for i in 0..AC58_TREE {
+        fill(
+            &root.join("tree").join(format!("f{i}")),
+            64,
+            5800 + i as u64,
+        )?;
+    }
+    // Nothing beyond the staged set: an earlier, larger set would exceed
+    // mcp-relay's staging limit.
+    let _ = std::fs::remove_file(root.join("big.bin"));
+    for i in AC58_TREE..10_000 {
+        let _ = std::fs::remove_file(root.join("tree").join(format!("f{i}")));
+    }
+    Ok(AC58_WORKSPACE.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,6 +750,18 @@ mod tests {
             json_values("plain words"),
             [Value::String("plain words".into())]
         );
+    }
+
+    #[test]
+    fn a_truncated_result_is_read_from_the_file_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = dir.path().join("full.json");
+        std::fs::write(&full, "[{\"name\": \"x\", \"destination\": \"/d\"}]").unwrap();
+        let values = json_values(&format!(
+            "[\n  {{\n    \"name\": \"x\"\n[Truncated. Full result: {}]",
+            full.display()
+        ));
+        assert_eq!(values[0][0]["destination"], "/d");
     }
 
     #[test]

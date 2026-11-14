@@ -889,7 +889,212 @@ fn ac57(ctx: &mut Ctx<'_>) -> Verdict {
 }
 
 // AC-58: files move whole or not at all.
+/// The SHA-256 of a file, hex.
+fn file_sha256(path: &std::path::Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
+    Ok(hex(&hasher.finalize()))
+}
+
+/// A tree's file count and the SHA-256 of its files' bytes in the byte order
+/// of their `./`-relative paths, as `find . -type f | LC_ALL=C sort | xargs
+/// cat` gives them in the guest.
+fn tree_sha256(root: &std::path::Path) -> Result<(usize, String), String> {
+    fn walk(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        out: &mut Vec<(String, std::path::PathBuf)>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                walk(&path, base, out)?;
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((format!("./{rel}"), path));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files).map_err(|e| format!("{}: {e}", root.display()))?;
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut hasher = Sha256::new();
+    for (_, path) in &files {
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
+    }
+    Ok((files.len(), hex(&hasher.finalize())))
+}
+
+/// AC-58 through mcp-relay: files move as an agent moves them. Pushed files
+/// are the cell's staged workspace (an agent sends files to a guest when it
+/// stages it); pulled files are declared outputs that `relay_extract` brings
+/// home. Each must arrive with its SHA-256 (DC-345).
+fn ac58_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    use crate::mcp::{AC58_FILES, AC58_PULLED_TREE, AC58_WORKSPACE};
+    let client = lease_actions(ctx)?;
+    let guest = ctx.target.mcp_guest().ok_or("no mcp-relay guest")?;
+    let project = ctx
+        .target
+        .settings
+        .mcp
+        .as_ref()
+        .map(|m| m.project.clone())
+        .ok_or("no mcp-relay settings")?;
+    let sha = ctx.target.os().sha256_stdin();
+    let local = project.join(AC58_WORKSPACE);
+    if !local.join("tree").is_dir() {
+        return Err(Stop::Failed(
+            "AC-58's files were not staged: the run did not prepare them".into(),
+        ));
+    }
+    // What the guest holds of the staged workspace.
+    let sums = |dir: &str, files: &str| {
+        format!(
+            "cd {dir} && {{ [ -f small.bin ] || cd {AC58_WORKSPACE}; }}; \
+             for f in {files}; do cat $f | {sha}; done; \
+             find tree -type f | wc -l | tr -d ' '; \
+             (cd tree && find . -type f | LC_ALL=C sort | xargs cat) | {sha}"
+        )
+    };
+    let pushed = client.exec(
+        &sums(".", "small.bin mid.bin"),
+        1800.0,
+        Duration::from_secs(3600),
+    )?;
+    let pushed: Vec<String> = pushed
+        .text()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    let mut want = Vec::new();
+    for (name, _) in AC58_FILES {
+        want.push(file_sha256(&local.join(name))?);
+    }
+    let (count, tree) = tree_sha256(&local.join("tree"))?;
+    want.push(count.to_string());
+    want.push(tree);
+    ctx.record("pushed", json!(pushed));
+
+    // Files made in the guest, brought home.
+    let made = client.exec(
+        &format!(
+            "mkdir -p acc/ac58/tree && head -c 1024 /dev/urandom > acc/ac58/small.bin && \
+             head -c {} /dev/urandom > acc/ac58/mid.bin && head -c {} /dev/urandom > acc/ac58/big.bin && \
+             i=0; while [ $i -lt {AC58_PULLED_TREE} ]; do head -c 64 /dev/urandom > acc/ac58/tree/f$i; i=$((i+1)); done; {}",
+            200u64 << 20,
+            1908u64 << 20,
+            sums("acc/ac58", "small.bin mid.bin big.bin")
+        ),
+        3600.0,
+        Duration::from_secs(5400),
+    )?;
+    let made: Vec<String> = made.text().lines().map(|l| l.trim().to_string()).collect();
+    let mut home = Vec::new();
+    let mut seconds = Vec::new();
+    for name in ["ac58-small", "ac58-mid", "ac58-big"] {
+        let started = Instant::now();
+        let landed = guest.extract(name)?;
+        seconds.push(started.elapsed().as_secs_f64());
+        let file = if landed.is_dir() {
+            std::fs::read_dir(&landed)
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .find(|p| p.is_file())
+                .ok_or("no file landed")?
+        } else {
+            landed
+        };
+        home.push(file_sha256(&file)?);
+        let _ = std::fs::remove_file(&file);
+    }
+    let started = Instant::now();
+    let landed = guest.extract("ac58-tree")?;
+    seconds.push(started.elapsed().as_secs_f64());
+    let tree_root = if landed.join("tree").is_dir() {
+        landed.join("tree")
+    } else {
+        landed.clone()
+    };
+    let (count, tree) = tree_sha256(&tree_root)?;
+    home.push(count.to_string());
+    home.push(tree);
+    let _ = std::fs::remove_dir_all(&landed);
+    ctx.record(
+        "pulled",
+        json!({"guest": made, "home": home, "seconds": seconds}),
+    );
+
+    let same = |i: usize, a: &[String], b: &[String]| {
+        a.get(i)
+            .is_some_and(|x| !x.is_empty() && b.get(i) == Some(x))
+    };
+    ctx.check(
+        "1 KiB pushed and pulled with its SHA-256",
+        expect(same(0, &pushed, &want) && same(0, &made, &home), || {
+            format!(
+                "push {:?}/{:?}, pull {:?}/{:?}",
+                pushed.first(),
+                want.first(),
+                made.first(),
+                home.first()
+            )
+        }),
+    );
+    ctx.check(
+        "200 MiB pushed and pulled with its SHA-256",
+        expect(same(1, &pushed, &want) && same(1, &made, &home), || {
+            format!(
+                "push {:?}/{:?}, pull {:?}/{:?}",
+                pushed.get(1),
+                want.get(1),
+                made.get(1),
+                home.get(1)
+            )
+        }),
+    );
+    ctx.check(
+        "a 2 GB file is pulled with its SHA-256",
+        expect(same(2, &made, &home), || {
+            format!("{:?} against {:?}", home.get(2), made.get(2))
+        }),
+    );
+    ctx.record("push_2gb", json!("not possible through mcp-relay: an agent pushes files only by staging, which mcp-relay bounds at 512 MiB and 10,000 files"));
+    ctx.check(
+        "a tree of 1,000 files moves each way",
+        expect(
+            same(2, &pushed, &want)
+                && same(3, &pushed, &want)
+                && same(3, &made, &home)
+                && same(4, &made, &home)
+                && want.get(2).map(String::as_str) == Some("1000")
+                && home.get(3).map(String::as_str) == Some("1000"),
+            || {
+                format!(
+                    "push {:?} against {:?}; pull {:?} against {:?}",
+                    pushed.get(2..),
+                    want.get(2..),
+                    home.get(3..),
+                    made.get(3..)
+                )
+            },
+        ),
+    );
+    ctx.record("partial_reads", json!("not judged through mcp-relay: staging and extraction verify whole files by hash before they are used"));
+    Ok(())
+}
+
 fn ac58(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac58_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let os = ctx.target.os();
     let sha = os.sha256_stdin();
@@ -1703,11 +1908,9 @@ fn ac63_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     Ok(())
 }
 
-/// AC-64 through mcp-relay: the broker restarts while a `relay_script` runs;
-/// mcp-relay asks for the execution's outcome again, so its answer arrives
-/// and the script ran once (DC-345). The relay agent's restart is started
-/// from inside the guest during the script, which mcp-relay, one call at a
-/// time on a guest, cannot do yet.
+/// AC-64 through mcp-relay: the broker, then the relay agent, restarts while
+/// a `relay_script` runs; mcp-relay asks for the execution's outcome again,
+/// so its answer arrives and the script ran once (DC-345).
 fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_actions(ctx)?;
     let host = ctx.target.host()?.clone();
@@ -1744,11 +1947,36 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
             },
         ),
     );
+    // The relay agent's restart: a detached command, in a session of its own
+    // so it outlives its call, kills the agent 6 s later, while the next
+    // script runs; the agent's service manager starts it again.
+    let os = ctx.target.os();
+    let label = ctx.target.agent_job()?.label;
+    client.run("rm -f ~/acc64-agent.txt")?;
+    client.run(&os.detached(&format!("sleep 6; {}", os.kill_agent(&label))))?;
+    let answer = client.exec(
+        "sleep 15; echo once >> ~/acc64-agent.txt; sleep 5; echo done",
+        600.0,
+        Duration::from_secs(900),
+    );
+    ctx.record(
+        "agent_answer",
+        json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
+    );
+    let lines =
+        client.run("wc -l < ~/acc64-agent.txt 2>/dev/null || echo 0; rm -f ~/acc64-agent.txt")?;
     ctx.check(
-        "the relay agent restart",
-        Err(Stop::Blocked(
-            "the agent's restart is started from inside the guest during the script, which mcp-relay does not do yet".into(),
-        )),
+        "after a relay agent restart the answer arrives and the action ran once",
+        expect(
+            answer.as_ref().is_ok_and(|a| a.text() == "done\n") && lines.trim() == "1",
+            || {
+                format!(
+                    "answer {:?}, {} lines",
+                    answer.as_ref().map(|a| a.text()),
+                    lines.trim()
+                )
+            },
+        ),
     );
     Ok(())
 }
@@ -1981,7 +2209,7 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     if ctx.cell.target == network_rig::cell::TargetKind::DurableMac {
         return ac65_durable(ctx);
     }
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let booted = client.run("uptime")?;
     client.run(&os.detached(&format!("sleep 2; {}", os.reboot())))?;
@@ -1991,7 +2219,7 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     // that answers is served by the agent the reboot started.
     let mut back = None;
     while started.elapsed() < Duration::from_secs(900) {
-        let client = lease_client(ctx)?;
+        let client = lease_actions(ctx)?;
         match client.exec(
             &format!("uptime; {}", os.sshd_is_off()),
             60.0,
@@ -2208,7 +2436,96 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n
 }
 
 // AC-67: an expired session still reports its operations.
+/// AC-67 through mcp-relay: a second mcp-relay that asks for a 2 s grace
+/// (mcp-relay DC-87) leases a VM of its own, so the cell's own session keeps
+/// the broker's grace; its connection is held away past the grace while a
+/// `relay_script` runs, so its session expires; mcp-relay must still bring
+/// the call's one answer home by its execution ID (mcp-relay DC-48).
+fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    lease_actions(ctx)?;
+    if ctx.target.durable() {
+        return Err(Stop::Blocked(
+            "AC-67 through mcp-relay leases a second machine, and a durable Mac has one lease"
+                .into(),
+        ));
+    }
+    let image = ctx
+        .target
+        .settings
+        .image
+        .clone()
+        .ok_or("a virtual machine target needs --image")?;
+    let mut settings = ctx.target.mcp_settings(&ctx.client, "ac67")?;
+    settings
+        .env
+        .push(("MCP_RELAY_SESSION_GRACE_MS".into(), "2000".into()));
+    let mut relay = crate::mcp::McpRelay::start(&settings)?;
+    let instance = ctx.target.settings.instance.clone();
+    let guest = relay.acquire(
+        "acc-ac67",
+        crate::mcp::Acquire::Image(&image),
+        1.0,
+        &instance,
+    )?;
+    relay.stage(&guest, None)?;
+    let short = crate::mcp::McpGuest::new(relay, guest);
+    short.run("rm -f ~/acc67.txt")?;
+    let control = ctx.rig.control().clone();
+    let (answer, cut) = std::thread::scope(|scope| {
+        let away = scope.spawn(move || {
+            // mcp-relay opens its relay session only once the script runs,
+            // after its snapshot; 8 s into a 20 s script it is open.
+            std::thread::sleep(Duration::from_secs(8));
+            // Keep the client away for 3.5 s: reset its connections, and every
+            // new one while the reset is armed.
+            let reset = Fault::Reset {
+                stream: Stream::Upstream,
+                window_ms: 0,
+            };
+            let applied = control.apply(&reset);
+            let cut = control.cut(Select::All, Side::Both);
+            std::thread::sleep(Duration::from_millis(3500));
+            let _ = control.revert(&reset);
+            format!("{applied:?} {cut:?}")
+        });
+        let answer = short.exec(
+            "sleep 20; echo once >> ~/acc67.txt; echo done",
+            600.0,
+            Duration::from_secs(900),
+        );
+        (answer, away.join().unwrap_or_default())
+    });
+    ctx.record("cut", json!(cut));
+    let events = crate::mcp::session_events(&short.log());
+    ctx.record("mcp_session_events", json!(events));
+    // Without its own session lost, the check would pass without its fault.
+    ctx.check(
+        "the session was held away past its grace",
+        expect(events.iter().any(|e| e.contains("lost")), || {
+            format!("this mcp-relay logged {events:?}")
+        }),
+    );
+    let lines = short.run("wc -l < ~/acc67.txt 2>/dev/null || echo 0; rm -f ~/acc67.txt");
+    let _ = short.release();
+    let answer = answer?;
+    ctx.check(
+        "after the session expires, the call's outcome still arrives",
+        expect(answer.text() == "done\n" && answer.rc()? == Some(0), || {
+            answer.text()
+        }),
+    );
+    let lines = lines?;
+    ctx.check(
+        "the action ran once",
+        expect(lines.trim() == "1", || format!("{} lines", lines.trim())),
+    );
+    Ok(())
+}
+
 fn ac67(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac67_through_mcp_relay(ctx);
+    }
     lease_client(ctx)?;
     let mut options = ctx.target.options(&ctx.client)?;
     options.grace_ms = Some(2000);
@@ -2312,7 +2629,55 @@ fn ac69(ctx: &mut Ctx<'_>) -> Verdict {
 // AC-70: speed is measured and reported, never judged (DC-193); what is
 // judged is that each action costs one round trip of the open session
 // (DC-194), counted from the session's own counters.
+/// AC-70 through mcp-relay: what an agent sees, `relay_script`'s whole time
+/// against the action's own time in the guest, measured and reported, never
+/// failing a run (DC-193). Whether the protocol adds a round trip of its own
+/// is read from the session's counters, which mcp-relay does not expose.
+fn ac70_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    let client = lease_actions(ctx)?;
+    let command = "perl -MTime::HiRes=time -e '$s=time; system(\"ls -la ~ >/dev/null\"); printf \"%.6f\\n\", time-$s'";
+    let mut total = Vec::new();
+    let mut guest = Vec::new();
+    for _ in 0..20 {
+        let answer = client.exec(command, 120.0, Duration::from_secs(600))?;
+        let g: f64 = answer
+            .text()
+            .trim()
+            .parse()
+            .map_err(|_| format!("the action printed {:?}", answer.text()))?;
+        total.push(answer.elapsed.as_secs_f64());
+        guest.push(g);
+    }
+    let link: Vec<f64> = total
+        .iter()
+        .zip(&guest)
+        .map(|(t, g)| (t - g).max(0.0))
+        .collect();
+    let report = json!({
+        "cell": ctx.cell.id(),
+        "profile": ctx.profile,
+        "client": "mcp-relay",
+        "actions": total.len(),
+        "total_s": Summary::of(&total),
+        "guest_s": Summary::of(&guest),
+        "link_s": Summary::of(&link),
+        "method": "total is relay_script's call as an agent makes it, snapshots included; guest time is the action's own clock around its work; link time is total less guest",
+    });
+    let _ = std::fs::write(ctx.run_dir.join("speed.json"), format!("{report:#}\n"));
+    ctx.record("speed", report);
+    // Speed never fails a run (DC-193); the round-trip count is the suite's
+    // own client's to judge, since mcp-relay does not expose its counters.
+    ctx.record(
+        "round_trips",
+        json!("not measured through mcp-relay: its session's counters are not exposed"),
+    );
+    Ok(())
+}
+
 fn ac70(ctx: &mut Ctx<'_>) -> Verdict {
+    if ctx.target.mcp_mode() {
+        return ac70_through_mcp_relay(ctx);
+    }
     let client = lease_client(ctx)?;
     let command = "perl -MTime::HiRes=time -e '$s=time; system(\"ls -la ~ >/dev/null\"); printf \"%.6f\\n\", time-$s'";
     let mut total = Vec::new();

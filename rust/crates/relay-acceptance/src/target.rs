@@ -284,6 +284,46 @@ impl RealTarget {
         Ok(Arc::clone(self.mcp.as_ref().expect("an mcp-relay guest")) as Arc<dyn Actions>)
     }
 
+    /// mcp-relay's settings for this cell: its instance, the rig's route to
+    /// the broker (mcp-relay DC-84) and release on exit; `suffix` names a
+    /// second server's own state, project and log, so two never share them.
+    pub fn mcp_settings(&self, rig: &ClientSide, suffix: &str) -> Result<McpSettings, Stop> {
+        let mut settings = self
+            .settings
+            .mcp
+            .clone()
+            .ok_or("the cell's client is not mcp-relay")?;
+        if !suffix.is_empty() {
+            let with = |path: &std::path::Path| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                path.with_file_name(format!("{name}-{suffix}"))
+            };
+            settings.project = with(&settings.project);
+            settings.log = with(&settings.log);
+            for (key, value) in &mut settings.env {
+                if key == "MCP_RELAY_STATE_DIR" {
+                    *value = with(std::path::Path::new(value)).display().to_string();
+                }
+            }
+        }
+        settings.env.extend([
+            ("MCP_RELAY_URL".to_string(), self.settings.instance.clone()),
+            (
+                "MCP_RELAY_BROKER_RESOLVE".to_string(),
+                format!("{}={}", rig.host, rig.connect),
+            ),
+            (
+                "MCP_RELAY_BROKER_CA".to_string(),
+                rig.ca_bundle.display().to_string(),
+            ),
+            ("MCP_RELAY_ON_EXIT".to_string(), "release".to_string()),
+        ]);
+        Ok(settings)
+    }
+
     /// The guest mcp-relay acquired, when it is the cell's client.
     pub fn mcp_guest(&self) -> Option<Arc<McpGuest>> {
         self.mcp.as_ref().map(Arc::clone)
@@ -300,19 +340,7 @@ impl RealTarget {
     fn acquire_mcp(&mut self, rig: &ClientSide) -> Result<(), Stop> {
         let started = Instant::now();
         let durable = self.kind == Some(TargetKind::DurableMac);
-        let mut settings = self.settings.mcp.clone().expect("mcp settings");
-        settings.env.extend([
-            ("MCP_RELAY_URL".to_string(), self.settings.instance.clone()),
-            (
-                "MCP_RELAY_BROKER_RESOLVE".to_string(),
-                format!("{}={}", rig.host, rig.connect),
-            ),
-            (
-                "MCP_RELAY_BROKER_CA".to_string(),
-                rig.ca_bundle.display().to_string(),
-            ),
-            ("MCP_RELAY_ON_EXIT".to_string(), "release".to_string()),
-        ]);
+        let settings = self.mcp_settings(rig, "")?;
         let mut relay = McpRelay::start(&settings)?;
         let machine = self
             .discovery
@@ -331,8 +359,13 @@ impl RealTarget {
             )
         };
         let task: String = self.settings.purpose.chars().take(36).collect();
-        let guest = relay.acquire(&task, what, 6.0)?;
-        relay.stage(&guest)?;
+        let guest = relay.acquire(&task, what, 6.0, &self.settings.instance)?;
+        let staging = Instant::now();
+        relay.stage(&guest, settings.workspace.as_deref())?;
+        self.note(
+            "staged through mcp-relay",
+            json!({"workspace": settings.workspace, "seconds": staging.elapsed().as_secs_f64()}),
+        );
         let acquired_in = started.elapsed();
         let mcp = Arc::new(McpGuest::new(relay, guest.clone()));
         self.mcp = Some(Arc::clone(&mcp));
