@@ -1908,11 +1908,9 @@ fn ac63_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     Ok(())
 }
 
-/// AC-64 through mcp-relay: the broker restarts while a `relay_script` runs;
-/// mcp-relay asks for the execution's outcome again, so its answer arrives
-/// and the script ran once (DC-345). The relay agent's restart is started
-/// from inside the guest during the script, which mcp-relay, one call at a
-/// time on a guest, cannot do yet.
+/// AC-64 through mcp-relay: the broker, then the relay agent, restarts while
+/// a `relay_script` runs; mcp-relay asks for the execution's outcome again,
+/// so its answer arrives and the script ran once (DC-345).
 fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_actions(ctx)?;
     let host = ctx.target.host()?.clone();
@@ -1949,11 +1947,36 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
             },
         ),
     );
+    // The relay agent's restart: a detached command, in a session of its own
+    // so it outlives its call, kills the agent 6 s later, while the next
+    // script runs; the agent's service manager starts it again.
+    let os = ctx.target.os();
+    let label = ctx.target.agent_job()?.label;
+    client.run("rm -f ~/acc64-agent.txt")?;
+    client.run(&os.detached(&format!("sleep 6; {}", os.kill_agent(&label))))?;
+    let answer = client.exec(
+        "sleep 15; echo once >> ~/acc64-agent.txt; sleep 5; echo done",
+        600.0,
+        Duration::from_secs(900),
+    );
+    ctx.record(
+        "agent_answer",
+        json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
+    );
+    let lines =
+        client.run("wc -l < ~/acc64-agent.txt 2>/dev/null || echo 0; rm -f ~/acc64-agent.txt")?;
     ctx.check(
-        "the relay agent restart",
-        Err(Stop::Blocked(
-            "the agent's restart is started from inside the guest during the script, which mcp-relay does not do yet".into(),
-        )),
+        "after a relay agent restart the answer arrives and the action ran once",
+        expect(
+            answer.as_ref().is_ok_and(|a| a.text() == "done\n") && lines.trim() == "1",
+            || {
+                format!(
+                    "answer {:?}, {} lines",
+                    answer.as_ref().map(|a| a.text()),
+                    lines.trim()
+                )
+            },
+        ),
     );
     Ok(())
 }
@@ -2186,7 +2209,7 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     if ctx.cell.target == network_rig::cell::TargetKind::DurableMac {
         return ac65_durable(ctx);
     }
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let booted = client.run("uptime")?;
     client.run(&os.detached(&format!("sleep 2; {}", os.reboot())))?;
@@ -2196,7 +2219,7 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     // that answers is served by the agent the reboot started.
     let mut back = None;
     while started.elapsed() < Duration::from_secs(900) {
-        let client = lease_client(ctx)?;
+        let client = lease_actions(ctx)?;
         match client.exec(
             &format!("uptime; {}", os.sshd_is_off()),
             60.0,
