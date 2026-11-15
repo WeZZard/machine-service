@@ -2067,7 +2067,7 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         "broker_answer",
         json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
     );
-    let after = client.run(
+    let after = after_the_restart(client.as_ref(),
         "test -e ~/acc64-broker.started && echo started || echo not-started; \
          wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.started ~/acc64-broker.txt",
     );
@@ -2100,7 +2100,7 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         "agent_answer",
         json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
     );
-    let after = client.run(
+    let after = after_the_restart(client.as_ref(),
         "test -e ~/acc64-agent.started && echo started || echo not-started; \
          wc -l < ~/acc64-agent.txt 2>/dev/null || echo 0; rm -f ~/acc64-agent.started ~/acc64-agent.txt",
     );
@@ -2109,6 +2109,25 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         restart_verdict(&answer, after),
     );
     Ok(())
+}
+
+/// The call after a restart, retried for up to 2 minutes: the action whose
+/// call was lost may still be running in the guest, and while it runs,
+/// mcp-relay's receiver refuses the next run (mcp-relay's receiver lock);
+/// the refusal ends when the earlier run ends, and only a call that still
+/// fails after that means the client did not reconnect.
+fn after_the_restart(client: &dyn Actions, command: &str) -> Result<String, String> {
+    let started = Instant::now();
+    loop {
+        match client.run(command) {
+            Ok(text) => return Ok(text),
+            Err(why) if started.elapsed() < Duration::from_secs(120) => {
+                eprintln!("AC-64: the call after the restart: {why}; again in 10 s");
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            Err(why) => return Err(why),
+        }
+    }
 }
 
 /// AC-64's verdict on one restart: the next call answers (each side
@@ -2343,7 +2362,16 @@ fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     let os = ctx.target.os();
     let label = ctx.target.agent_job()?.label;
     let before = client.run(&os.agent_pid(&label))?.trim().to_string();
-    client.run(&os.detached(&format!("sleep 2; {}", os.restart_agent_job(&label))))?;
+    // The detached command's own shell stays a few seconds, so the
+    // relay's receiver, which ends a script's process group when its shell
+    // ends, never ends the restart before it has left the group.
+    let restart = os.detached(&format!("sleep 2; {}", os.restart_agent_job(&label)));
+    let then = if restart.trim_end().ends_with('&') {
+        " "
+    } else {
+        "; "
+    };
+    client.run(&format!("{restart}{then}sleep 5"))?;
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(5));
     let mut after = None;
