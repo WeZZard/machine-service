@@ -296,25 +296,64 @@ fn approve_a_permission_prompt(
 ) {
     // One script does it all, in one job: a relayed command's job takes its
     // process group with it when it ends, so the Apple Event's script and
-    // the approval live and end together. Return goes to the prompt only
-    // while the script still waits, after 3 s.
+    // the approval live and end together.
+    //
+    // The suite approves only its own prompt (DC-340): it finds the prompt
+    // windows of UserNotificationCenter in the window list (JavaScript for
+    // Automation, which sends no Apple Event), reads each one's text with
+    // cua-driver, and clicks Allow only on the prompt that names the
+    // script's own program and Finder. Any other prompt is reported and
+    // left as it is. A key posted to the prompt's process does not reach it
+    // on a real Mac, so the click goes to the button's place on the screen.
     let script = r#"OUT=/private/tmp/acc-ae-$$.out
+JS=/private/tmp/acc-approve-$$.js
 ( osascript -e 'tell application "Finder" to get name of startup disk' > $OUT 2>&1; echo exit=$? >> $OUT ) &
 job=$!
 sleep 3
 p=$(pgrep -f "osascript -e tell application" | head -1); c=""
 while [ -n "$p" ] && [ "$p" -gt 1 ]; do c="$c $(ps -o comm= -p "$p" | sed 's#.*/##')"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
 echo "chain:$c"
-pressed=no; i=0
+prog=$(for w in $c; do case "$w" in osascript|sh|zsh|bash|launchd|nohup) ;; *) echo "$w"; break ;; esac; done)
+[ -n "$prog" ] || prog=zsh
+driver=$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")
+cat > $JS <<'EOF'
+ObjC.import('CoreGraphics');
+function run(argv) {
+  const pid = parseInt(argv[0]), program = argv[1], driver = argv[2];
+  const app = Application.currentApplication(); app.includeStandardAdditions = true;
+  const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
+  const call = (tool, args) => JSON.parse(app.doShellScript(quote(driver) + ' call ' + tool + ' ' + quote(JSON.stringify(args))));
+  const windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, 0))) || [];
+  for (const w of windows.filter(w => w.kCGWindowOwnerPID === pid && w.kCGWindowLayer > 0)) {
+    let state;
+    try { state = call('get_window_state', {pid, window_id: w.kCGWindowNumber, include_screenshot: false}); } catch (e) { continue; }
+    const elements = state.elements || [];
+    const text = elements.filter(e => e.role === 'AXStaticText').map(e => e.value || e.label || '').join(' ');
+    if (!text.includes('wants access to control')) continue;
+    if (!text.includes('“' + program + '” wants access to control “Finder”')) return 'other: ' + text.slice(0, 160);
+    const allow = elements.find(e => e.role === 'AXButton' && e.label === 'Allow');
+    if (!allow) return 'other: no Allow button: ' + text.slice(0, 120);
+    let scale = 1;
+    try { scale = call('get_screen_size', {}).scale_factor || 1; } catch (e) {}
+    call('click', {x: (allow.frame.x + allow.frame.w / 2) * scale, y: (allow.frame.y + allow.frame.h / 2) * scale, scope: 'desktop'});
+    return 'clicked: ' + text.slice(0, 120);
+  }
+  return 'none';
+}
+EOF
+approval=none; i=0
 while kill -0 $job 2>/dev/null && [ $i -lt 40 ]; do
   P=$(pgrep -x UserNotificationCenter | head -1)
-  if [ -n "$P" ] && cua-driver call press_key "{\"pid\": $P, \"key\": \"return\"}" >/dev/null 2>&1; then pressed=yes; fi
+  if [ -n "$P" ]; then
+    r=$(osascript -l JavaScript $JS "$P" "$prog" "$driver" 2>&1 | tail -1)
+    case "$r" in clicked*) approval="$r" ;; other*) approval="$r"; break ;; esac
+  fi
   sleep 1; i=$((i+1))
 done
-kill -0 $job 2>/dev/null && { kill $job; echo "gave up after 40 s"; }
+kill -0 $job 2>/dev/null && { kill $job; echo "gave up after $i s"; }
 wait $job 2>/dev/null
-echo "pressed=$pressed"
-cat $OUT 2>/dev/null; rm -f $OUT"#;
+echo "approval=$approval"
+cat $OUT 2>/dev/null; rm -f $OUT $JS"#;
     let answer = client.exec(script, 120.0, Duration::from_secs(300));
     let text = answer
         .as_ref()
@@ -325,7 +364,12 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
         .find_map(|l| l.strip_prefix("chain:"))
         .unwrap_or_default()
         .to_string();
-    let pressed = text.contains("pressed=yes");
+    let approval = text
+        .lines()
+        .find_map(|l| l.strip_prefix("approval="))
+        .unwrap_or("none")
+        .to_string();
+    let clicked = approval.starts_with("clicked");
     let completed = text.contains("exit=0");
     // The program macOS asks about is the first one in the script's chain
     // that is not osascript or a shell (DC-310, DC-315).
@@ -334,7 +378,9 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
         .find(|p| !["osascript", "sh", "zsh", "bash", "launchd", "nohup"].contains(p))
         .unwrap_or("/bin/zsh")
         .to_string();
-    if pressed && completed {
+    // The checklist (DC-340) has every prompt the suite approved, whether or
+    // not its script then completed: an approval stays on the Mac either way.
+    if clicked {
         let machine = ctx
             .target
             .lease
@@ -349,15 +395,19 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
                 "program": program,
                 "permission": "Apple Events (Automation)",
                 "app": "Finder",
+                "prompt": approval,
                 "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             }),
         );
     }
+    // It passes when the script completes: after the suite approved its
+    // prompt, or with no prompt at all when an earlier run's approval
+    // stands. Another program's prompt waiting on the Mac fails it, named.
     ctx.check(
         &name("an Apple Event script completes after the suite approves its permission prompt"),
         expect(completed, || {
             format!(
-                "pressed={pressed} chain={} output={}",
+                "approval={approval} chain={} output={}",
                 chain.trim(),
                 text.trim()
             )

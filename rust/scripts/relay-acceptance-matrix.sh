@@ -37,7 +37,7 @@
 # Usage: relay-acceptance-matrix.sh up|authorize|run|down|all <work dir>
 #
 # The work dir holds plan.json, hosts/, host-key/, evidence/, logs/,
-# revisions.json and summary.json. Settings, from the environment:
+# revisions-<time>.json for each `run` and summary.json. Settings, from the environment:
 #   RELAY_MATRIX_HOST_BUILD    the host folder's binaries, as
 #                              relay-acceptance-host.sh lists them (required)
 #   RELAY_MATRIX_MAC_CLIENT    relay-acceptance for this Mac (default: the
@@ -48,6 +48,8 @@
 #   RELAY_MATRIX_EXCLUDE       instances the plan leaves out, comma-separated
 #   RELAY_MATRIX_ONLY          runs to carry out, as cell:profile,... (default:
 #                              every assigned run)
+#   RELAY_MATRIX_CHECKS        the checks each run runs, as relay-acceptance's
+#                              --only takes them (default: every check)
 #   RELAY_MATRIX_RUN_HOURS     each run's cap (default 3)
 #   PILOT_REPO                 the image source, used on a Mac that has it
 set -eu
@@ -225,6 +227,7 @@ one_run() {
     image=$(image_of "$cell")
     set -- --cell "$cell" --profile "$profile" --instance "$(host "$target" url)"
     [ -n "$image" ] && set -- "$@" --image "$image"
+    [ -n "${RELAY_MATRIX_CHECKS:-}" ] && set -- "$@" --only "$RELAY_MATRIX_CHECKS"
     purpose=$(printf 'acc-%s-%s-%s' "$(git -C "$repo" rev-parse --short HEAD)" "$cell" "$profile" | tr 'A-Z.' 'a-z-' | cut -c1-64)
     hostdir="$(host "$target" hostdir)"
     echo "START $cell $profile on $target $(date '+%H:%M')"
@@ -240,12 +243,23 @@ one_run() {
         out="$work/ubuntu/$cell.$profile"
         rm -rf "$out"
         rc=0
+        if [ -f "$work/host-key/authorized" ]; then
+            set -- "$@" --host-shell "ssh -i @HOST_KEY@ -o StrictHostKeyChecking=accept-new -o BatchMode=yes $(host "$target" user)@$(host "$target" ip)" \
+                --host-script "$hostdir/relay-acceptance-host.sh" --agent-rig manage
+        else
+            # Without the key the client VM has no host control: this
+            # runner starts the target's agent chain itself, for the run's
+            # profile and seed, and the host-control checks report blocked
+            # (DC-343).
+            seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+            on "$(host "$target" dest)" "RELAY_HOST_DIR='$hostdir' /bin/sh '$hostdir/relay-acceptance-host.sh' rig-start $profile $((seed + 1))" > "$out.agent-rig.json" 2>&1 < /dev/null
+            set -- "$@" --seed "$seed" --agent-rig external
+        fi
         RELAY_ACCEPTANCE_HOST_KEY="$key" RELAY_ACCEPTANCE_MCP_DIST="$RELAY_MATRIX_MCP_DIST" \
             perl -e "alarm $((cap_hours * 3600)); exec @ARGV" /bin/sh "$scripts/relay-acceptance-ubuntu-client.sh" \
             "$(host "$client" url)" "${RELAY_MATRIX_LINUX_CLIENT:?set RELAY_MATRIX_LINUX_CLIENT}" "$out" "$@" \
-            --host-shell "ssh -i @HOST_KEY@ -o StrictHostKeyChecking=accept-new -o BatchMode=yes $(host "$target" user)@$(host "$target" ip)" \
-            --host-script "$hostdir/relay-acceptance-host.sh" --agent-rig manage --purpose "$purpose" \
-            --client mcp --mcp-server @MCP_SERVER@ > "$log" 2>&1 || rc=$?
+            --purpose "$purpose" --client mcp --mcp-server @MCP_SERVER@ > "$log" 2>&1 || rc=$?
+        [ -f "$work/host-key/authorized" ] || on "$(host "$target" dest)" "RELAY_HOST_DIR='$hostdir' /bin/sh '$hostdir/relay-acceptance-host.sh' rig-stop" >/dev/null 2>&1 < /dev/null || true
         [ -f "$out/run.log" ] && cat "$out/run.log" >> "$log"
         if [ -d "$out/$cell/$profile" ]; then
             mkdir -p "$work/evidence/$cell"
@@ -307,6 +321,7 @@ down() {
             && echo "second instance stopped on $instance" || echo "the second instance on $instance did not stop; see logs/stop-$instance.log"
         [ -f "$key.pub" ] && deauthorize "$dest" && echo "key removed from $instance"
     done
+    rm -f "$work/host-key/authorized"
 }
 
 authorize_all() {
@@ -315,6 +330,7 @@ authorize_all() {
         instance=$(basename "$f" .json)
         authorize "$(host "$instance" dest)" "$(host "$instance" hostdir)" < /dev/null && echo "key authorized on $instance"
     done
+    touch "$work/host-key/authorized"
 }
 
 case "$step" in

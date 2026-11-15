@@ -467,10 +467,12 @@ impl RealTarget {
 
     /// The host control, or why a scenario cannot run without it.
     pub fn host(&self) -> Result<&HostControl, Stop> {
-        self.settings
-            .host
-            .as_ref()
-            .ok_or_else(|| Stop::Failed("this run has no host control (--host-shell)".into()))
+        self.settings.host.as_ref().ok_or_else(|| {
+            // Without host control a check cannot be proved here, never
+            // passed: the target Mac has not authorized the restricted
+            // key (DC-343).
+            Stop::Blocked("this run has no host control (--host-shell)".into())
+        })
     }
 
     fn acquire(&mut self, rig: &ClientSide) -> Result<(), Stop> {
