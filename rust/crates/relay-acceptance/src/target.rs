@@ -874,14 +874,20 @@ fn release_body(record: &Value) -> Value {
     body
 }
 
+/// Where the broker's name leads from here: the first of its addresses,
+/// IPv4 first, where the broker answers. A host's own name resolves to
+/// loopback and to its bridges too, in an order that changes, and a second
+/// instance's broker listens on one address; with no answer at all, the
+/// first IPv4 address.
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let addrs: Vec<SocketAddr> = (host, port)
+    let mut addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve {host}: {e}"))?
         .collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
     addrs
         .iter()
-        .find(|a| a.is_ipv4())
+        .find(|a| std::net::TcpStream::connect_timeout(a, Duration::from_secs(3)).is_ok())
         .or_else(|| addrs.first())
         .copied()
         .ok_or_else(|| format!("{host} has no address"))
