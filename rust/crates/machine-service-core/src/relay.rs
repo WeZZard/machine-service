@@ -292,7 +292,11 @@ pub struct Relay {
     pub broker: Broker,
     /// The broker's TLS authority.
     pub authority: Arc<Authority>,
+    /// The session server and its bound listener until [`Relay::open`]
+    /// starts accepting on them (BK-1).
+    unopened: Mutex<Option<(SessionServer, TcpListener)>>,
     listening: Mutex<Option<Listening>>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
     /// Client credentials issued at acquisition, until the acquisition's
     /// answer carries them.
     credentials: Mutex<HashMap<String, String>>,
@@ -309,10 +313,12 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Make or load the authority under `<state>/relay/tls`, and start the
-    /// broker on the session listener, under TLS: on every interface, where
-    /// the guests reach it on their network's host address (BK-5), unless
-    /// the settings name one address.
+    /// Make or load the authority under `<state>/relay/tls`, build the
+    /// broker, and bind its session listener, for TLS: on every interface,
+    /// where the guests reach it on their network's host address (BK-5),
+    /// unless the settings name one address. No connection is accepted
+    /// until [`Relay::open`], so the credentials of the leases that
+    /// survived a restart are admitted again before the first hello (BK-1).
     pub fn start(
         settings: RelaySettings,
         state_dir: &Path,
@@ -344,20 +350,13 @@ impl Relay {
                 remote_session::SESSION_PORT_ENV
             )
         })?;
-        let listening = server.listen(listener).map_err(|e| e.to_string())?;
-        broker.serve(server);
-        log(&format!(
-            "relay: broker listening on port {} at {}; advertised as {}; authority {}",
-            settings.session_port,
-            remote_session::RELAY_PATH,
-            settings.relay_url,
-            authority.sha256()
-        ));
         let relay = Arc::new(Relay {
             settings,
             broker,
             authority,
-            listening: Mutex::new(Some(listening)),
+            unopened: Mutex::new(Some((server, listener))),
+            listening: Mutex::new(None),
+            log: Arc::clone(&log),
             credentials: Mutex::new(HashMap::new()),
             replacing: Mutex::new(HashSet::new()),
             failed_builds: Mutex::new(HashMap::new()),
@@ -377,6 +376,33 @@ impl Relay {
             )),
         }
         Ok(relay)
+    }
+
+    /// Start accepting sessions on the listener [`Relay::start`] bound.
+    /// Call it once every credential that survived a restart is admitted
+    /// again: a hello is authenticated before its session is looked up, so
+    /// one that came before its credential would be refused (BK-1). A
+    /// connection made before is held by the system until then.
+    pub fn open(&self) -> Result<(), String> {
+        let Some((server, listener)) = self
+            .unopened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return Err("relay: the broker was opened twice".to_string());
+        };
+        let listening = server.listen(listener).map_err(|e| e.to_string())?;
+        self.broker.serve(server);
+        *self.listening.lock().unwrap_or_else(|e| e.into_inner()) = Some(listening);
+        (self.log)(&format!(
+            "relay: broker listening on port {} at {}; advertised as {}; authority {}",
+            self.settings.session_port,
+            remote_session::RELAY_PATH,
+            self.settings.relay_url,
+            self.authority.sha256()
+        ));
+        Ok(())
     }
 
     /// Check the relay agent release this instance holds against its trust
@@ -407,8 +433,12 @@ impl Relay {
             .clone()
     }
 
-    /// Stop accepting connections.
+    /// Stop accepting connections, and never start when not yet opened.
     pub fn stop(&self) {
+        self.unopened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(listening) = self
             .listening
             .lock()

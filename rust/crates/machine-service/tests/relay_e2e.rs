@@ -414,6 +414,16 @@ fn a_relay_lease_runs_its_actions_through_the_relay_agent() {
     daemon.stop();
     let _daemon = lab.start();
     let client = connect(&url, &credential, tls.clone());
+    // BK-1: the restarted broker listens only once the lease's
+    // credentials are admitted again.
+    let log = service_log(&lab);
+    let admitted = log
+        .rfind(&format!(
+            "relay: {vm}: credentials admitted again after restart"
+        ))
+        .expect("the restart admits the lease's credentials again");
+    let listening = log.rfind("relay: broker listening").expect("listening");
+    assert!(admitted < listening, "{log}");
     client.query(1, "client-1");
     assert!(matches!(
         client.wait(1, WAIT).query,
