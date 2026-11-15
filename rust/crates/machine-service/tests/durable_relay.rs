@@ -1409,6 +1409,14 @@ fn m4_a_durable_leases_client_credential_outlives_a_restart() {
     let registered = lab.log().matches("agent registered").count();
     lab.restart_daemon();
     lab.wait_for_registrations(registered + 1);
+    // BK-1: the restarted broker listens only once the lease's client
+    // credential is admitted again.
+    let log = lab.log();
+    let admitted = log
+        .rfind("client credential admitted again after restart")
+        .expect("the restart admits the lease's client credential again");
+    let listening = log.rfind("relay: broker listening").expect("listening");
+    assert!(admitted < listening, "{log}");
     let client = try_lease_client(&acquired).expect("the restarted broker refuses the lease");
     client.call(1, "after-restart", relay_common::exec("echo back"), b"");
     let answer = client.wait(1, Duration::from_secs(60));
