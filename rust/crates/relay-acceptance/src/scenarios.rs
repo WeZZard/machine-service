@@ -319,7 +319,7 @@ driver=$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")
 cat > $JS <<'EOF'
 ObjC.import('CoreGraphics');
 function run(argv) {
-  const pid = parseInt(argv[0]), program = argv[1], driver = argv[2];
+  const pid = parseInt(argv[0]), program = argv[1], driver = argv[2], attempt = parseInt(argv[3]) || 0;
   const app = Application.currentApplication(); app.includeStandardAdditions = true;
   const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
   const call = (tool, args) => JSON.parse(app.doShellScript(quote(driver) + ' call ' + tool + ' ' + quote(JSON.stringify(args))));
@@ -333,10 +333,16 @@ function run(argv) {
     if (!text.includes('“' + program + '” wants access to control “Finder”')) return 'other: ' + text.slice(0, 160);
     const allow = elements.find(e => e.role === 'AXButton' && e.label === 'Allow');
     if (!allow) return 'other: no Allow button: ' + text.slice(0, 120);
-    let scale = 1;
-    try { scale = call('get_screen_size', {}).scale_factor || 1; } catch (e) {}
-    call('click', {x: (allow.frame.x + allow.frame.w / 2) * scale, y: (allow.frame.y + allow.frame.h / 2) * scale, scope: 'desktop'});
-    return 'clicked: ' + text.slice(0, 120);
+    // Each pass tries the next way to press Allow, as displays and macOS
+    // releases differ in which reaches the prompt; the text is read again
+    // before every attempt.
+    const x = allow.frame.x + allow.frame.w / 2, y = allow.frame.y + allow.frame.h / 2;
+    const way = attempt % 4;
+    if (way === 0) call('click', {pid, window_id: w.kCGWindowNumber, element_index: allow.element_index, snapshot_id: state.snapshot_id});
+    else if (way === 1) call('click', {x, y, scope: 'desktop'});
+    else if (way === 2) { let scale = 2; try { scale = call('get_screen_size', {}).scale_factor || 2; } catch (e) {} call('click', {x: x * (scale > 1 ? scale : 2), y: y * (scale > 1 ? scale : 2), scope: 'desktop'}); }
+    else call('press_key', {pid, key: 'return'});
+    return 'clicked(' + ['accessibility', 'points', 'pixels', 'return'][way] + '): ' + text.slice(0, 120);
   }
   return 'none';
 }
@@ -345,8 +351,8 @@ approval=none; i=0
 while kill -0 $job 2>/dev/null && [ $i -lt 40 ]; do
   P=$(pgrep -x UserNotificationCenter | head -1)
   if [ -n "$P" ]; then
-    r=$(osascript -l JavaScript $JS "$P" "$prog" "$driver" 2>&1 | tail -1)
-    case "$r" in clicked*) approval="$r" ;; other*) approval="$r"; break ;; esac
+    r=$(osascript -l JavaScript $JS "$P" "$prog" "$driver" "$i" 2>&1 | tail -1)
+    case "$r" in clicked*) approval="$r"; sleep 2 ;; other*) approval="$r"; break ;; esac
   fi
   sleep 1; i=$((i+1))
 done
@@ -396,6 +402,8 @@ cat $OUT 2>/dev/null; rm -f $OUT $JS"#;
                 "permission": "Apple Events (Automation)",
                 "app": "Finder",
                 "prompt": approval,
+                // Whether the script then completed, which shows Allow took.
+                "completed": completed,
                 "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             }),
         );
