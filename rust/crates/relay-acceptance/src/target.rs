@@ -673,12 +673,27 @@ impl RealTarget {
     pub fn release(&mut self) -> Result<Value, String> {
         if let Some(guest) = self.mcp.take() {
             let lease = self.lease.take();
-            let answer = guest.release().map(|()| json!({"released": guest.guest}));
+            let mut answer = guest.release().map(|()| json!({"released": guest.guest}));
             self.note(
                 "released through mcp-relay",
                 json!({"guest": guest.guest, "answer": format!("{answer:?}")}),
             );
-            if let Some(lease) = lease {
+            // A release mcp-relay did not confirm is made on the instance
+            // itself, so no lease outlives the check; its credentials count
+            // as released only once a release is confirmed (AC-60, AC-66).
+            if let (Err(_), Some(lease)) = (&answer, &lease) {
+                let direct = self
+                    .instance
+                    .release(&lease.name, release_body(&lease.record));
+                self.note(
+                    "released on the instance",
+                    json!({"name": lease.name, "answer": format!("{direct:?}")}),
+                );
+                if direct.is_ok() {
+                    answer = direct;
+                }
+            }
+            if let (Ok(_), Some(lease)) = (&answer, lease) {
                 // As the suite's own release: a durable Mac's agent
                 // credential is the machine's and outlives the lease (RA-4);
                 // a virtual machine's ends with it.

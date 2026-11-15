@@ -395,7 +395,10 @@ impl McpRelay {
         let answer = self.call(
             "relay_release",
             json!({"guest": guest}),
-            Duration::from_secs(10 * 60),
+            // relay_release pulls every declared extraction again before it
+            // releases (mcp-relay's manager), about 2.4 GB after AC-57 and
+            // AC-58, which takes over 10 minutes at N2's bandwidth.
+            Duration::from_secs(60 * 60),
         )?;
         if answer.is_error {
             return Err(format!("relay_release refused: {:?}", answer.parts));
