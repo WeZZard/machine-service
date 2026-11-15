@@ -14,6 +14,7 @@
 //! runs it from `cargo test` when asked (`#[ignore]`).
 
 pub mod client;
+pub mod forward;
 pub mod guest;
 pub mod instance;
 pub mod matrix;

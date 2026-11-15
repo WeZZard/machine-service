@@ -296,25 +296,70 @@ fn approve_a_permission_prompt(
 ) {
     // One script does it all, in one job: a relayed command's job takes its
     // process group with it when it ends, so the Apple Event's script and
-    // the approval live and end together. Return goes to the prompt only
-    // while the script still waits, after 3 s.
+    // the approval live and end together.
+    //
+    // The suite approves only its own prompt (DC-340): it finds the prompt
+    // windows of UserNotificationCenter in the window list (JavaScript for
+    // Automation, which sends no Apple Event), reads each one's text with
+    // cua-driver, and clicks Allow only on the prompt that names the
+    // script's own program and Finder. Any other prompt is reported and
+    // left as it is. A key posted to the prompt's process does not reach it
+    // on a real Mac, so the click goes to the button's place on the screen.
     let script = r#"OUT=/private/tmp/acc-ae-$$.out
+JS=/private/tmp/acc-approve-$$.js
 ( osascript -e 'tell application "Finder" to get name of startup disk' > $OUT 2>&1; echo exit=$? >> $OUT ) &
 job=$!
 sleep 3
 p=$(pgrep -f "osascript -e tell application" | head -1); c=""
 while [ -n "$p" ] && [ "$p" -gt 1 ]; do c="$c $(ps -o comm= -p "$p" | sed 's#.*/##')"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
 echo "chain:$c"
-pressed=no; i=0
+prog=zsh
+for w in $c; do case "$w" in osascript|sh|zsh|bash|launchd|nohup) ;; *) prog="$w"; break ;; esac; done
+driver=$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")
+cat > $JS <<'EOF'
+ObjC.import('CoreGraphics');
+function run(argv) {
+  const pid = parseInt(argv[0]), program = argv[1], driver = argv[2], attempt = parseInt(argv[3]) || 0;
+  const app = Application.currentApplication(); app.includeStandardAdditions = true;
+  const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
+  const call = (tool, args) => JSON.parse(app.doShellScript(quote(driver) + ' call ' + tool + ' ' + quote(JSON.stringify(args))));
+  const windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, 0))) || [];
+  for (const w of windows.filter(w => w.kCGWindowOwnerPID === pid && w.kCGWindowLayer > 0)) {
+    let state;
+    try { state = call('get_window_state', {pid, window_id: w.kCGWindowNumber, include_screenshot: false}); } catch (e) { continue; }
+    const elements = state.elements || [];
+    const text = elements.filter(e => e.role === 'AXStaticText').map(e => e.value || e.label || '').join(' ');
+    if (!text.includes('wants access to control')) continue;
+    if (!text.includes('“' + program + '” wants access to control “Finder”')) return 'other: ' + text.slice(0, 160);
+    const allow = elements.find(e => e.role === 'AXButton' && e.label === 'Allow');
+    if (!allow) return 'other: no Allow button: ' + text.slice(0, 120);
+    // Each pass tries the next way to press Allow, as displays and macOS
+    // releases differ in which reaches the prompt; the text is read again
+    // before every attempt.
+    const x = allow.frame.x + allow.frame.w / 2, y = allow.frame.y + allow.frame.h / 2;
+    const way = attempt % 4;
+    if (way === 0) call('click', {pid, window_id: w.kCGWindowNumber, element_index: allow.element_index, snapshot_id: state.snapshot_id});
+    else if (way === 1) call('click', {x, y, scope: 'desktop'});
+    else if (way === 2) { let scale = 2; try { scale = call('get_screen_size', {}).scale_factor || 2; } catch (e) {} call('click', {x: x * (scale > 1 ? scale : 2), y: y * (scale > 1 ? scale : 2), scope: 'desktop'}); }
+    else call('press_key', {pid, key: 'return'});
+    return 'clicked(' + ['accessibility', 'points', 'pixels', 'return'][way] + '): ' + text.slice(0, 120);
+  }
+  return 'none';
+}
+EOF
+approval=none; i=0
 while kill -0 $job 2>/dev/null && [ $i -lt 40 ]; do
   P=$(pgrep -x UserNotificationCenter | head -1)
-  if [ -n "$P" ] && cua-driver call press_key "{\"pid\": $P, \"key\": \"return\"}" >/dev/null 2>&1; then pressed=yes; fi
+  if [ -n "$P" ]; then
+    r=$(osascript -l JavaScript $JS "$P" "$prog" "$driver" "$i" 2>&1 | tail -1)
+    case "$r" in clicked*) approval="$r"; sleep 2 ;; other*) approval="$r"; break ;; esac
+  fi
   sleep 1; i=$((i+1))
 done
-kill -0 $job 2>/dev/null && { kill $job; echo "gave up after 40 s"; }
+kill -0 $job 2>/dev/null && { kill $job; echo "gave up after $i s"; }
 wait $job 2>/dev/null
-echo "pressed=$pressed"
-cat $OUT 2>/dev/null; rm -f $OUT"#;
+echo "approval=$approval"
+cat $OUT 2>/dev/null; rm -f $OUT $JS"#;
     let answer = client.exec(script, 120.0, Duration::from_secs(300));
     let text = answer
         .as_ref()
@@ -325,7 +370,12 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
         .find_map(|l| l.strip_prefix("chain:"))
         .unwrap_or_default()
         .to_string();
-    let pressed = text.contains("pressed=yes");
+    let approval = text
+        .lines()
+        .find_map(|l| l.strip_prefix("approval="))
+        .unwrap_or("none")
+        .to_string();
+    let clicked = approval.starts_with("clicked");
     let completed = text.contains("exit=0");
     // The program macOS asks about is the first one in the script's chain
     // that is not osascript or a shell (DC-310, DC-315).
@@ -334,7 +384,9 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
         .find(|p| !["osascript", "sh", "zsh", "bash", "launchd", "nohup"].contains(p))
         .unwrap_or("/bin/zsh")
         .to_string();
-    if pressed && completed {
+    // The checklist (DC-340) has every prompt the suite approved, whether or
+    // not its script then completed: an approval stays on the Mac either way.
+    if clicked {
         let machine = ctx
             .target
             .lease
@@ -349,15 +401,21 @@ cat $OUT 2>/dev/null; rm -f $OUT"#;
                 "program": program,
                 "permission": "Apple Events (Automation)",
                 "app": "Finder",
+                "prompt": approval,
+                // Whether the script then completed, which shows Allow took.
+                "completed": completed,
                 "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             }),
         );
     }
+    // It passes when the script completes: after the suite approved its
+    // prompt, or with no prompt at all when an earlier run's approval
+    // stands. Another program's prompt waiting on the Mac fails it, named.
     ctx.check(
         &name("an Apple Event script completes after the suite approves its permission prompt"),
         expect(completed, || {
             format!(
-                "pressed={pressed} chain={} output={}",
+                "approval={approval} chain={} output={}",
                 chain.trim(),
                 text.trim()
             )
@@ -2166,7 +2224,7 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
 // the agent's LaunchAgent job started afresh (`launchctl kickstart -k`),
 // after which the agent registers again by itself (DC-216).
 fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let label = ctx.target.agent_job()?.label;
     let before = client.run(&os.agent_pid(&label))?.trim().to_string();
@@ -2175,7 +2233,7 @@ fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     std::thread::sleep(Duration::from_secs(5));
     let mut after = None;
     while started.elapsed() < Duration::from_secs(300) {
-        let client = lease_client(ctx)?;
+        let client = lease_actions(ctx)?;
         match client.exec(&os.agent_pid(&label), 60.0, Duration::from_secs(300)) {
             Ok(answer) if answer.rc() == Ok(Some(0)) => {
                 let pid = answer.text().trim().to_string();
@@ -2443,27 +2501,38 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n
 /// the call's one answer home by its execution ID (mcp-relay DC-48).
 fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     lease_actions(ctx)?;
-    if ctx.target.durable() {
-        return Err(Stop::Blocked(
-            "AC-67 through mcp-relay leases a second machine, and a durable Mac has one lease"
-                .into(),
-        ));
-    }
-    let image = ctx
-        .target
-        .settings
-        .image
-        .clone()
-        .ok_or("a virtual machine target needs --image")?;
+    // AC-67 leases through an mcp-relay of its own, whose session grace is
+    // short. A durable Mac has one lease, so the run's lease is released
+    // first, and the next check leases the Mac again.
+    let durable = ctx.target.durable();
+    let what = if durable {
+        let machine = ctx
+            .target
+            .durable_machine()
+            .ok_or("discovery names no machine")?;
+        ctx.target.release().map_err(Stop::Failed)?;
+        ctx.record("released the run's lease for AC-67's own", json!(machine));
+        machine
+    } else {
+        ctx.target
+            .settings
+            .image
+            .clone()
+            .ok_or("a virtual machine target needs --image")?
+    };
     let mut settings = ctx.target.mcp_settings(&ctx.client, "ac67")?;
     settings
         .env
         .push(("MCP_RELAY_SESSION_GRACE_MS".into(), "2000".into()));
     let mut relay = crate::mcp::McpRelay::start(&settings)?;
-    let instance = ctx.target.settings.instance.clone();
+    let instance = ctx.target.mcp_origin()?;
     let guest = relay.acquire(
         "acc-ac67",
-        crate::mcp::Acquire::Image(&image),
+        if durable {
+            crate::mcp::Acquire::Machine(&what)
+        } else {
+            crate::mcp::Acquire::Image(&what)
+        },
         1.0,
         &instance,
     )?;

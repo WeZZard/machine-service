@@ -17,6 +17,16 @@
 # control that AC-61 and AC-64 need. The VM is deleted with the key at
 # release.
 #
+# RELAY_ACCEPTANCE_MCP_DIST, when set, names mcp-relay's dist folder, the
+# bundled MCP server that a --client mcp run drives (DC-345). It goes into the
+# client VM as ~/mcp-relay/dist, whose Node.js the ubuntu2404 image carries,
+# and every @MCP_SERVER@ in the run arguments becomes the path of its
+# server.mjs there.
+#
+# The client instance leases a VM, so it must be a second instance, never
+# the installed one: its port is neither 6240 nor 6241 and its /health names
+# it a second instance, or nothing is leased.
+#
 # The client VM resolves host names with its own resolver. A NAT guest has no
 # multicast DNS beyond its host, so the names the run uses (the target
 # instance's and its relay_url's) are looked up here, at run time, and written
@@ -30,6 +40,12 @@ shift 3
 mkdir -p "$evidence"
 
 json() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"; }
+
+case "$(printf %s "$client_instance" | sed -E 's#^[a-z]+://##; s#/.*$##; s#^.*:##')" in
+6240|6241) echo "$client_instance is the installed instance's port; the client VM is leased only from a second instance" >&2; exit 2 ;;
+esac
+second=$(curl -fsS -m 20 "$client_instance/health" | json '(d.get("second_instance") or {}).get("id","")')
+[ -n "$second" ] || { echo "$client_instance does not report itself a second instance in /health; nothing is leased" >&2; exit 2; }
 
 exec_script() {
     body=$(python3 -c 'import json,sys; print(json.dumps({"script": sys.argv[1], "timeout": int(sys.argv[2])}))' "$2" "${3:-300}")
@@ -65,6 +81,18 @@ trap release EXIT
 sha=$(shasum -a 256 "$binary" | cut -d' ' -f1)
 curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=relay-acceptance" \
     -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $sha" --data-binary "@$binary" >/dev/null
+
+server_path=""
+if [ -n "${RELAY_ACCEPTANCE_MCP_DIST:-}" ]; then
+    dist_tar=$(mktemp)
+    tar -cf "$dist_tar" -C "$RELAY_ACCEPTANCE_MCP_DIST" .
+    dist_sha=$(shasum -a 256 "$dist_tar" | cut -d' ' -f1)
+    curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=mcp-relay-dist.tar" \
+        -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $dist_sha" --data-binary "@$dist_tar" >/dev/null
+    rm -f "$dist_tar"
+    server_path=$(exec_script "$vm" 'mkdir -p ~/mcp-relay/dist && tar -xf ~/mcp-relay-dist.tar -C ~/mcp-relay/dist && node --version >&2 && printf %s "$HOME/mcp-relay/dist/server.mjs"' 120 | json 'd.get("output","")' | tail -1)
+    case "$server_path" in */server.mjs) ;; *) echo "could not place mcp-relay in $vm: $server_path" >&2; exit 1 ;; esac
+fi
 
 key_path=""
 if [ -n "${RELAY_ACCEPTANCE_HOST_KEY:-}" ]; then
@@ -102,6 +130,9 @@ quoted=""
 for arg in "$@"; do
     if [ -n "$key_path" ]; then
         arg=$(printf %s "$arg" | sed "s#@HOST_KEY@#$key_path#g")
+    fi
+    if [ -n "$server_path" ]; then
+        arg=$(printf %s "$arg" | sed "s#@MCP_SERVER@#$server_path#g")
     fi
     quoted="$quoted '$(printf %s "$arg" | sed "s/'/'\\\\''/g")'"
 done

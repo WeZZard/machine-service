@@ -167,6 +167,11 @@ pub struct RealTarget {
     client: Option<Arc<RelayClient>>,
     /// The guest mcp-relay acquired, when the cell's client is mcp-relay.
     mcp: Option<Arc<McpGuest>>,
+    /// The origin mcp-relay is given for the test instance, once made.
+    mcp_origin: std::sync::OnceLock<String>,
+    /// Whether the cell's workspace was staged, which only the first
+    /// lease needs (AC-58 runs on it).
+    workspace_staged: bool,
     /// Facts found while setting the lease up, for the scenarios that judge
     /// them.
     pub facts: Map<String, Value>,
@@ -189,6 +194,8 @@ impl RealTarget {
             blocked: None,
             client: None,
             mcp: None,
+            mcp_origin: std::sync::OnceLock::new(),
+            workspace_staged: false,
             facts: Map::new(),
             released: None,
             log: Vec::new(),
@@ -310,7 +317,7 @@ impl RealTarget {
             }
         }
         settings.env.extend([
-            ("MCP_RELAY_URL".to_string(), self.settings.instance.clone()),
+            ("MCP_RELAY_URL".to_string(), self.mcp_origin()?),
             (
                 "MCP_RELAY_BROKER_RESOLVE".to_string(),
                 format!("{}={}", rig.host, rig.connect),
@@ -320,8 +327,38 @@ impl RealTarget {
                 rig.ca_bundle.display().to_string(),
             ),
             ("MCP_RELAY_ON_EXIT".to_string(), "release".to_string()),
+            // mcp-relay sees only the test instance: it always asks its own
+            // origin, and Consul discovery with no agent finds nothing else,
+            // so neither an image nor a durable machine, which an installed
+            // instance lists too, is ever leased there.
+            (
+                "MACHINE_SERVICE_DISCOVERY".to_string(),
+                "consul".to_string(),
+            ),
+            ("CONSUL_HTTP_ADDR".to_string(), NO_CONSUL.to_string()),
         ]);
         Ok(settings)
+    }
+
+    /// The origin mcp-relay is given for the test instance: the instance's
+    /// own on loopback, else a loopback forwarder to it (`forward`), made
+    /// once and kept for the run. Acquisitions name it, and a lease whose
+    /// endpoint is any other is refused (DC-346).
+    pub fn mcp_origin(&self) -> Result<String, Stop> {
+        if let Some(origin) = self.mcp_origin.get() {
+            return Ok(origin.clone());
+        }
+        let origin = crate::forward::loopback_origin(&self.settings.instance)?;
+        Ok(self.mcp_origin.get_or_init(|| origin).clone())
+    }
+
+    /// The durable machine's name, as its instance's discovery names it.
+    pub fn durable_machine(&self) -> Option<String> {
+        self.discovery
+            .as_ref()
+            .and_then(|d| d.health.get("instance"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// The guest mcp-relay acquired, when it is the cell's client.
@@ -342,12 +379,7 @@ impl RealTarget {
         let durable = self.kind == Some(TargetKind::DurableMac);
         let settings = self.mcp_settings(rig, "")?;
         let mut relay = McpRelay::start(&settings)?;
-        let machine = self
-            .discovery
-            .as_ref()
-            .and_then(|d| d.health.get("instance"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let machine = self.durable_machine();
         let image = self.settings.image.clone();
         let what = if durable {
             Acquire::Machine(machine.as_deref().ok_or("discovery names no machine")?)
@@ -359,12 +391,29 @@ impl RealTarget {
             )
         };
         let task: String = self.settings.purpose.chars().take(36).collect();
-        let guest = relay.acquire(&task, what, 6.0, &self.settings.instance)?;
+        let guest = relay.acquire(&task, what, 6.0, &self.mcp_origin()?)?;
         let staging = Instant::now();
-        relay.stage(&guest, settings.workspace.as_deref())?;
+        // A later lease of the same machine, as after AC-67 on a durable
+        // Mac, stages without the workspace, which only AC-58 uses.
+        let workspace = settings
+            .workspace
+            .as_deref()
+            .filter(|_| !self.workspace_staged);
+        if let Err(error) = relay.stage(&guest, workspace) {
+            // mcp-relay keeps a guest whose stage was refused, for diagnosis;
+            // the suite records why and releases it, so no lease outlives the
+            // run.
+            let released = relay.release(&guest);
+            self.note(
+                "stage refused; released",
+                json!({"guest": guest, "error": error, "released": format!("{released:?}")}),
+            );
+            return Err(Stop::Failed(error));
+        }
+        self.workspace_staged = true;
         self.note(
             "staged through mcp-relay",
-            json!({"workspace": settings.workspace, "seconds": staging.elapsed().as_secs_f64()}),
+            json!({"workspace": workspace, "seconds": staging.elapsed().as_secs_f64()}),
         );
         let acquired_in = started.elapsed();
         let mcp = Arc::new(McpGuest::new(relay, guest.clone()));
@@ -443,10 +492,12 @@ impl RealTarget {
 
     /// The host control, or why a scenario cannot run without it.
     pub fn host(&self) -> Result<&HostControl, Stop> {
-        self.settings
-            .host
-            .as_ref()
-            .ok_or_else(|| Stop::Failed("this run has no host control (--host-shell)".into()))
+        self.settings.host.as_ref().ok_or_else(|| {
+            // Without host control a check cannot be proved here, never
+            // passed: the target Mac has not authorized the restricted
+            // key (DC-343).
+            Stop::Blocked("this run has no host control (--host-shell)".into())
+        })
     }
 
     fn acquire(&mut self, rig: &ClientSide) -> Result<(), Stop> {
@@ -814,6 +865,10 @@ pub fn base_port(base: &str) -> u16 {
         .unwrap_or(80)
 }
 
+/// A Consul agent address where none listens (the discard port on loopback),
+/// so mcp-relay's discovery finds no instance but its own origin.
+pub const NO_CONSUL: &str = "http://127.0.0.1:9";
+
 /// The TTL of AC-66's short lease, the shortest an acquisition takes.
 pub const SHORT_TTL_HOURS: f64 = 0.1;
 
@@ -846,14 +901,20 @@ fn release_body(record: &Value) -> Value {
     body
 }
 
+/// Where the broker's name leads from here: the first of its addresses,
+/// IPv4 first, where the broker answers. A host's own name resolves to
+/// loopback and to its bridges too, in an order that changes, and a second
+/// instance's broker listens on one address; with no answer at all, the
+/// first IPv4 address.
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let addrs: Vec<SocketAddr> = (host, port)
+    let mut addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve {host}: {e}"))?
         .collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
     addrs
         .iter()
-        .find(|a| a.is_ipv4())
+        .find(|a| std::net::TcpStream::connect_timeout(a, Duration::from_secs(3)).is_ok())
         .or_else(|| addrs.first())
         .copied()
         .ok_or_else(|| format!("{host} has no address"))
