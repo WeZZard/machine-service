@@ -2497,6 +2497,12 @@ const LONGEST_EXPIRY_WAIT: Duration = Duration::from_secs(15 * 60);
 /// by the TTL (RP-3). Its credential is accepted before that end and
 /// refused after it.
 fn expired_credential(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
+    // A durable Mac has one lease: the run's lease is released first, and
+    // the next check leases the Mac again.
+    if ctx.target.durable() && ctx.target.lease.is_some() {
+        let released = ctx.target.release().map_err(Stop::Failed)?;
+        ctx.record("released the run's lease for the short one", released);
+    }
     let short = ctx.target.short_lease()?;
     let result = (|| {
         let credential = short.credential.clone().ok_or_else(|| {
