@@ -2460,7 +2460,7 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         .env
         .push(("MCP_RELAY_SESSION_GRACE_MS".into(), "2000".into()));
     let mut relay = crate::mcp::McpRelay::start(&settings)?;
-    let instance = ctx.target.settings.instance.clone();
+    let instance = ctx.target.mcp_origin()?;
     let guest = relay.acquire(
         "acc-ac67",
         crate::mcp::Acquire::Image(&image),

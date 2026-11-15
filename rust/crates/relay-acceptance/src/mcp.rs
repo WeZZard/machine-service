@@ -240,11 +240,12 @@ impl McpRelay {
         })
     }
 
-    /// `relay_acquire` of an image or a durable machine on `instance`, the
-    /// cell's test instance, by its origin (mcp-relay DC-75); answers the
-    /// guest's name. mcp-relay asks every instance on the network (its DC-73),
-    /// so a lease that lands anywhere else is released and refused: a live
-    /// test never touches an installed instance (intents; DC-245).
+    /// `relay_acquire` of an image on `instance`, the cell's test instance,
+    /// by its origin (mcp-relay DC-75), or of a durable machine, which names
+    /// its own instance; answers the guest's name. mcp-relay sees only the
+    /// test instance (`TargetSettings::mcp_settings`), and a lease that lands
+    /// anywhere else all the same is released and refused: a live test never
+    /// touches an installed instance (intents; DC-245, DC-346).
     pub fn acquire(
         &mut self,
         task: &str,
@@ -256,11 +257,12 @@ impl McpRelay {
             .iter()
             .map(|(name, path)| json!({"name": name, "path": path}))
             .collect();
-        let mut arguments = json!({
-            "task": task, "extractions": declared, "ttlHours": ttl_hours, "instance": instance,
-        });
+        let mut arguments = json!({"task": task, "extractions": declared, "ttlHours": ttl_hours});
         match what {
-            Acquire::Image(image) => arguments["image"] = json!(image),
+            Acquire::Image(image) => {
+                arguments["image"] = json!(image);
+                arguments["instance"] = json!(instance);
+            }
             Acquire::Machine(machine) => arguments["machine"] = json!(machine),
         }
         let answer = self.call("relay_acquire", arguments, Duration::from_secs(40 * 60))?;

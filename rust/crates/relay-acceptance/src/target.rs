@@ -167,6 +167,8 @@ pub struct RealTarget {
     client: Option<Arc<RelayClient>>,
     /// The guest mcp-relay acquired, when the cell's client is mcp-relay.
     mcp: Option<Arc<McpGuest>>,
+    /// The origin mcp-relay is given for the test instance, once made.
+    mcp_origin: std::sync::OnceLock<String>,
     /// Facts found while setting the lease up, for the scenarios that judge
     /// them.
     pub facts: Map<String, Value>,
@@ -189,6 +191,7 @@ impl RealTarget {
             blocked: None,
             client: None,
             mcp: None,
+            mcp_origin: std::sync::OnceLock::new(),
             facts: Map::new(),
             released: None,
             log: Vec::new(),
@@ -310,7 +313,7 @@ impl RealTarget {
             }
         }
         settings.env.extend([
-            ("MCP_RELAY_URL".to_string(), self.settings.instance.clone()),
+            ("MCP_RELAY_URL".to_string(), self.mcp_origin()?),
             (
                 "MCP_RELAY_BROKER_RESOLVE".to_string(),
                 format!("{}={}", rig.host, rig.connect),
@@ -320,8 +323,29 @@ impl RealTarget {
                 rig.ca_bundle.display().to_string(),
             ),
             ("MCP_RELAY_ON_EXIT".to_string(), "release".to_string()),
+            // mcp-relay sees only the test instance: it always asks its own
+            // origin, and Consul discovery with no agent finds nothing else,
+            // so neither an image nor a durable machine, which an installed
+            // instance lists too, is ever leased there.
+            (
+                "MACHINE_SERVICE_DISCOVERY".to_string(),
+                "consul".to_string(),
+            ),
+            ("CONSUL_HTTP_ADDR".to_string(), NO_CONSUL.to_string()),
         ]);
         Ok(settings)
+    }
+
+    /// The origin mcp-relay is given for the test instance: the instance's
+    /// own on loopback, else a loopback forwarder to it (`forward`), made
+    /// once and kept for the run. Acquisitions name it, and a lease whose
+    /// endpoint is any other is refused (DC-346).
+    pub fn mcp_origin(&self) -> Result<String, Stop> {
+        if let Some(origin) = self.mcp_origin.get() {
+            return Ok(origin.clone());
+        }
+        let origin = crate::forward::loopback_origin(&self.settings.instance)?;
+        Ok(self.mcp_origin.get_or_init(|| origin).clone())
     }
 
     /// The guest mcp-relay acquired, when it is the cell's client.
@@ -359,7 +383,7 @@ impl RealTarget {
             )
         };
         let task: String = self.settings.purpose.chars().take(36).collect();
-        let guest = relay.acquire(&task, what, 6.0, &self.settings.instance)?;
+        let guest = relay.acquire(&task, what, 6.0, &self.mcp_origin()?)?;
         let staging = Instant::now();
         relay.stage(&guest, settings.workspace.as_deref())?;
         self.note(
@@ -813,6 +837,10 @@ pub fn base_port(base: &str) -> u16 {
         .and_then(|(_, port)| port.parse().ok())
         .unwrap_or(80)
 }
+
+/// A Consul agent address where none listens (the discard port on loopback),
+/// so mcp-relay's discovery finds no instance but its own origin.
+pub const NO_CONSUL: &str = "http://127.0.0.1:9";
 
 /// The TTL of AC-66's short lease, the shortest an acquisition takes.
 pub const SHORT_TTL_HOURS: f64 = 0.1;
