@@ -215,7 +215,7 @@ revisions() {
             sep=", "
         done
         printf '}}\n'
-    } | py 'import json,sys; print(json.dumps(json.loads(sys.stdin.read()), indent=2))' > "$work/revisions.json"
+    } | py 'import json,sys; print(json.dumps(json.loads(sys.stdin.read()), indent=2))' > "$work/revisions-$(date -u +%Y%m%dT%H%M%SZ).json"
 }
 
 one_run() {
@@ -262,10 +262,6 @@ queue() {
     # Every run assigned to one target Mac, one at a time, in the plan's order.
     target="$1"
     current=""
-    py 'import json,sys,os; d=json.load(open(sys.argv[1])); only=[o for o in os.environ.get("RELAY_MATRIX_ONLY","").split(",") if o]
-for a in d["assignments"]:
-    if a["target_instance"]==sys.argv[2] and (not only or a["cell"]+":"+a["profile"] in only):
-        print(a["cell"], a["profile"], a["client_instance"] or "-")' "$work/plan.json" "$target" > "$work/logs/queue-$target.list"
     while read -r cell profile client <&3; do
         if [ "$(host "$target" kind)" = durable ] && [ "$cell" != "$current" ]; then
             start_instance "$target" "$cell" || { echo "RESULT $cell $profile on $target rc=instance-not-started"; continue; }
@@ -282,7 +278,18 @@ run() {
     revisions
     targets=$(py 'import json,sys; print(" ".join(sorted({a["target_instance"] for a in json.load(open(sys.argv[1]))["assignments"] if a["target_instance"]})))' "$work/plan.json")
     for target in $targets; do
-        queue "$target" > "$work/logs/queue-$target.log" 2>&1 &
+        # A target with no run here is left alone, so a second `run` beside
+        # a first one never touches the first one's queue.
+        py 'import json,sys,os; d=json.load(open(sys.argv[1])); only=[o for o in os.environ.get("RELAY_MATRIX_ONLY","").split(",") if o]
+for a in d["assignments"]:
+    if a["target_instance"]==sys.argv[2] and (not only or a["cell"]+":"+a["profile"] in only):
+        print(a["cell"], a["profile"], a["client_instance"] or "-")' "$work/plan.json" "$target" > "$work/logs/queue-$target.next"
+        if [ -s "$work/logs/queue-$target.next" ]; then
+            mv "$work/logs/queue-$target.next" "$work/logs/queue-$target.list"
+            queue "$target" >> "$work/logs/queue-$target.log" 2>&1 &
+        else
+            rm -f "$work/logs/queue-$target.next"
+        fi
     done
     wait
     cat "$work"/logs/queue-*.log | grep -E '^(START|RESULT)' || true

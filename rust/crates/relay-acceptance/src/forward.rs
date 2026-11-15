@@ -64,11 +64,21 @@ fn forwarder(host: String, port: u16) -> Result<String, String> {
 }
 
 fn forward(client: TcpStream, host: &str, port: u16) -> std::io::Result<()> {
-    let address = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::other("the instance's name does not resolve"))?;
-    let upstream = TcpStream::connect_timeout(&address, Duration::from_secs(20))?;
+    // A host's own name resolves to loopback, link-local and bridge
+    // addresses too, in an order that changes, and a second instance listens
+    // on one address: the first that answers is the instance.
+    let mut last = std::io::Error::other("the instance's name does not resolve");
+    let mut answered = None;
+    for address in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            Ok(stream) => {
+                answered = Some(stream);
+                break;
+            }
+            Err(error) => last = error,
+        }
+    }
+    let upstream = answered.ok_or(last)?;
     let (mut client_in, mut upstream_out) = (client.try_clone()?, upstream.try_clone()?);
     let pump = thread::spawn(move || {
         let _ = copy(&mut client_in, &mut upstream_out);
