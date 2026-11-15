@@ -732,9 +732,7 @@ fn ac56(ctx: &mut Ctx<'_>) -> Verdict {
     if ctx.target.durable() {
         match ctx.target.current_client() {
             Some(session) => durable_lease_checks(ctx, &session)?,
-            None => return Err(Stop::Blocked(
-                "AC-56's durable lease checks need the suite's own session, and are not yet driven through mcp-relay".into(),
-            )),
+            None => durable_lease_checks_through_mcp_relay(ctx, client.as_ref())?,
         }
     }
     Ok(())
@@ -762,6 +760,80 @@ fn base64(bytes: &[u8]) -> String {
 /// What a durable lease's command sees: its lease, its working directory
 /// and temporary folder, its agent keys as a command prints them and as
 /// their SHA-256, and its whole environment.
+/// AC-56's durable lease checks through mcp-relay (DC-345): mcp-relay runs a
+/// script in its own workspace under its own runtime, so its directory and
+/// environment are mcp-relay's, not the HTTP exec's, and the check compares
+/// what the lease gives its commands: the lease's ID, its temporary folder
+/// and the agent keys, each loaded key reaching the client only as
+/// `[redacted]`. Every other difference is recorded.
+fn durable_lease_checks_through_mcp_relay(ctx: &mut Ctx<'_>, client: &dyn Actions) -> Verdict {
+    let (name, lease) = ctx
+        .target
+        .lease_id()
+        .ok_or("the durable lease has no lease_id")?;
+    let http = ctx.target.instance().exec(
+        &name,
+        json!({"lease_id": lease, "script": LEASE_PROBE, "timeout": 120}),
+    )?;
+    let over_http = http
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let relayed = client.exec(LEASE_PROBE, 120.0, Duration::from_secs(300))?;
+    let seen = relayed.text();
+    let keys = ["ANTHROPIC_API_KEY", "LITELLM_CODEX_KEY"];
+    let wanted = |line: &&str| {
+        line.starts_with("lease=")
+            || line.starts_with("tmp=")
+            || keys
+                .iter()
+                .any(|key| line.starts_with(&format!("{key} sha256=")))
+    };
+    let pick =
+        |text: &str| -> Vec<String> { text.lines().filter(wanted).map(str::to_string).collect() };
+    let (relay_lines, http_lines) = (pick(&seen), pick(&over_http));
+    let empty = sha256_hex(b"");
+    let loaded: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| {
+            seen.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} sha256=")))
+                .is_some_and(|hash| hash != empty)
+        })
+        .collect();
+    let others: Vec<String> = seen
+        .lines()
+        .filter(|l| !over_http.lines().any(|o| o == *l))
+        .map(|l| format!("relay only: {}", l.split('=').next().unwrap_or_default()))
+        .collect();
+    ctx.record(
+        "lease_environment",
+        json!({"http_link": http.get("link"), "keys_loaded": loaded, "relay_lines": relay_lines, "other_differences": others}),
+    );
+    ctx.check(
+        "a relay client's command sees the lease's ID, temporary folder and keys as an HTTP exec does",
+        expect(
+            relayed.rc()? == Some(0)
+                && relay_lines == http_lines
+                && relay_lines.iter().any(|l| l == &format!("lease={lease}")),
+            || format!("rc {:?}; relay {relay_lines:?}; http {http_lines:?}", relayed.rc()),
+        ),
+    );
+    ctx.check(
+        "a loaded agent key reaches the relay client only as [redacted]",
+        expect(
+            loaded.iter().all(|key| {
+                seen.lines()
+                    .filter_map(|l| l.strip_prefix(&format!("{key}=")))
+                    .all(|value| value == "[redacted]")
+            }),
+            || format!("the environment shows {loaded:?} unredacted"),
+        ),
+    );
+    Ok(())
+}
+
 const LEASE_PROBE: &str = r#"echo "lease=$MACHINE_SERVICE_LEASE_ID"
 echo "pwd=$(pwd)"
 echo "tmp=$TMPDIR"
@@ -2425,6 +2497,12 @@ const LONGEST_EXPIRY_WAIT: Duration = Duration::from_secs(15 * 60);
 /// by the TTL (RP-3). Its credential is accepted before that end and
 /// refused after it.
 fn expired_credential(ctx: &mut Ctx<'_>) -> Result<(), Stop> {
+    // A durable Mac has one lease: the run's lease is released first, and
+    // the next check leases the Mac again.
+    if ctx.target.durable() && ctx.target.lease.is_some() {
+        let released = ctx.target.release().map_err(Stop::Failed)?;
+        ctx.record("released the run's lease for the short one", released);
+    }
     let short = ctx.target.short_lease()?;
     let result = (|| {
         let credential = short.credential.clone().ok_or_else(|| {

@@ -449,8 +449,19 @@ impl RealTarget {
                 json!("registered: mcp-relay leased it on the relay link"),
             );
         }
+        // The lease's name is machine-service's, the VM's or the durable
+        // machine's, never mcp-relay's guest name: the checks that ask
+        // machine-service about the lease name it (AC-56, AC-60).
+        let name = record
+            .get("vm")
+            .or_else(|| record.get("machine"))
+            .or_else(|| record.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| durable.then(|| self.durable_machine()).flatten())
+            .unwrap_or_else(|| guest.clone());
         self.lease = Some(Lease {
-            name: guest,
+            name,
             record,
             credential: field("credential"),
             url: field("url"),

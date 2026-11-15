@@ -228,7 +228,7 @@ one_run() {
     set -- --cell "$cell" --profile "$profile" --instance "$(host "$target" url)"
     [ -n "$image" ] && set -- "$@" --image "$image"
     [ -n "${RELAY_MATRIX_CHECKS:-}" ] && set -- "$@" --only "$RELAY_MATRIX_CHECKS"
-    purpose=$(printf 'acc-%s-%s-%s' "$(git -C "$repo" rev-parse --short HEAD)" "$cell" "$profile" | tr 'A-Z.' 'a-z-' | cut -c1-64)
+    purpose=$(printf 'acc-%s-%s-%s' "$revision" "$cell" "$profile" | tr 'A-Z.' 'a-z-' | cut -c1-64)
     hostdir="$(host "$target" hostdir)"
     echo "START $cell $profile on $target $(date '+%H:%M')"
     case "$cell" in
@@ -287,6 +287,9 @@ queue() {
 
 run() {
     need_plan
+    # The revision each run's purpose names: this checkout's when `run`
+    # starts, so a later checkout never renames the runs in flight.
+    revision=$(git -C "$repo" rev-parse --short HEAD)
     [ -n "${RELAY_MATRIX_MCP_DIST:-}" ] && [ -f "$RELAY_MATRIX_MCP_DIST/server.mjs" ] || { echo "set RELAY_MATRIX_MCP_DIST to mcp-relay's dist folder" >&2; exit 2; }
     mkdir -p "$work/evidence" "$work/logs" "$work/ubuntu"
     revisions
