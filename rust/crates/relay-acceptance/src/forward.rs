@@ -69,7 +69,9 @@ fn forward(client: TcpStream, host: &str, port: u16) -> std::io::Result<()> {
     // on one address: the first that answers is the instance.
     let mut last = std::io::Error::other("the instance's name does not resolve");
     let mut answered = None;
-    for address in (host, port).to_socket_addrs()? {
+    let mut addresses: Vec<_> = (host, port).to_socket_addrs()?.collect();
+    addresses.sort_by_key(|a| !a.is_ipv4());
+    for address in addresses {
         match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
             Ok(stream) => {
                 answered = Some(stream);
