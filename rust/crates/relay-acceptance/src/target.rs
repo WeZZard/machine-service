@@ -169,6 +169,9 @@ pub struct RealTarget {
     mcp: Option<Arc<McpGuest>>,
     /// The origin mcp-relay is given for the test instance, once made.
     mcp_origin: std::sync::OnceLock<String>,
+    /// Whether the cell's workspace was staged, which only the first
+    /// lease needs (AC-58 runs on it).
+    workspace_staged: bool,
     /// Facts found while setting the lease up, for the scenarios that judge
     /// them.
     pub facts: Map<String, Value>,
@@ -192,6 +195,7 @@ impl RealTarget {
             client: None,
             mcp: None,
             mcp_origin: std::sync::OnceLock::new(),
+            workspace_staged: false,
             facts: Map::new(),
             released: None,
             log: Vec::new(),
@@ -348,6 +352,15 @@ impl RealTarget {
         Ok(self.mcp_origin.get_or_init(|| origin).clone())
     }
 
+    /// The durable machine's name, as its instance's discovery names it.
+    pub fn durable_machine(&self) -> Option<String> {
+        self.discovery
+            .as_ref()
+            .and_then(|d| d.health.get("instance"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// The guest mcp-relay acquired, when it is the cell's client.
     pub fn mcp_guest(&self) -> Option<Arc<McpGuest>> {
         self.mcp.as_ref().map(Arc::clone)
@@ -366,12 +379,7 @@ impl RealTarget {
         let durable = self.kind == Some(TargetKind::DurableMac);
         let settings = self.mcp_settings(rig, "")?;
         let mut relay = McpRelay::start(&settings)?;
-        let machine = self
-            .discovery
-            .as_ref()
-            .and_then(|d| d.health.get("instance"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let machine = self.durable_machine();
         let image = self.settings.image.clone();
         let what = if durable {
             Acquire::Machine(machine.as_deref().ok_or("discovery names no machine")?)
@@ -385,10 +393,17 @@ impl RealTarget {
         let task: String = self.settings.purpose.chars().take(36).collect();
         let guest = relay.acquire(&task, what, 6.0, &self.mcp_origin()?)?;
         let staging = Instant::now();
-        relay.stage(&guest, settings.workspace.as_deref())?;
+        // A later lease of the same machine, as after AC-67 on a durable
+        // Mac, stages without the workspace, which only AC-58 uses.
+        let workspace = settings
+            .workspace
+            .as_deref()
+            .filter(|_| !self.workspace_staged);
+        relay.stage(&guest, workspace)?;
+        self.workspace_staged = true;
         self.note(
             "staged through mcp-relay",
-            json!({"workspace": settings.workspace, "seconds": staging.elapsed().as_secs_f64()}),
+            json!({"workspace": workspace, "seconds": staging.elapsed().as_secs_f64()}),
         );
         let acquired_in = started.elapsed();
         let mcp = Arc::new(McpGuest::new(relay, guest.clone()));

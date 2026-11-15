@@ -2216,7 +2216,7 @@ fn ac64(ctx: &mut Ctx<'_>) -> Verdict {
 // the agent's LaunchAgent job started afresh (`launchctl kickstart -k`),
 // after which the agent registers again by itself (DC-216).
 fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
-    let client = lease_client(ctx)?;
+    let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let label = ctx.target.agent_job()?.label;
     let before = client.run(&os.agent_pid(&label))?.trim().to_string();
@@ -2225,7 +2225,7 @@ fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     std::thread::sleep(Duration::from_secs(5));
     let mut after = None;
     while started.elapsed() < Duration::from_secs(300) {
-        let client = lease_client(ctx)?;
+        let client = lease_actions(ctx)?;
         match client.exec(&os.agent_pid(&label), 60.0, Duration::from_secs(300)) {
             Ok(answer) if answer.rc() == Ok(Some(0)) => {
                 let pid = answer.text().trim().to_string();
@@ -2493,18 +2493,25 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n
 /// the call's one answer home by its execution ID (mcp-relay DC-48).
 fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     lease_actions(ctx)?;
-    if ctx.target.durable() {
-        return Err(Stop::Blocked(
-            "AC-67 through mcp-relay leases a second machine, and a durable Mac has one lease"
-                .into(),
-        ));
-    }
-    let image = ctx
-        .target
-        .settings
-        .image
-        .clone()
-        .ok_or("a virtual machine target needs --image")?;
+    // AC-67 leases through an mcp-relay of its own, whose session grace is
+    // short. A durable Mac has one lease, so the run's lease is released
+    // first, and the next check leases the Mac again.
+    let durable = ctx.target.durable();
+    let what = if durable {
+        let machine = ctx
+            .target
+            .durable_machine()
+            .ok_or("discovery names no machine")?;
+        ctx.target.release().map_err(Stop::Failed)?;
+        ctx.record("released the run's lease for AC-67's own", json!(machine));
+        machine
+    } else {
+        ctx.target
+            .settings
+            .image
+            .clone()
+            .ok_or("a virtual machine target needs --image")?
+    };
     let mut settings = ctx.target.mcp_settings(&ctx.client, "ac67")?;
     settings
         .env
@@ -2513,7 +2520,11 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let instance = ctx.target.mcp_origin()?;
     let guest = relay.acquire(
         "acc-ac67",
-        crate::mcp::Acquire::Image(&image),
+        if durable {
+            crate::mcp::Acquire::Machine(&what)
+        } else {
+            crate::mcp::Acquire::Image(&what)
+        },
         1.0,
         &instance,
     )?;
