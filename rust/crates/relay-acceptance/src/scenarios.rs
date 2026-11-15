@@ -2364,14 +2364,16 @@ fn ac65_durable(ctx: &mut Ctx<'_>) -> Verdict {
     let before = client.run(&os.agent_pid(&label))?.trim().to_string();
     // The detached command's own shell stays a few seconds, so the
     // relay's receiver, which ends a script's process group when its shell
-    // ends, never ends the restart before it has left the group.
-    let restart = os.detached(&format!("sleep 2; {}", os.restart_agent_job(&label)));
+    // ends, never ends the restart before it has left the group; and the
+    // restart comes 8 s in, after that script has ended at 3 s, so it never
+    // ends the script that started it.
+    let restart = os.detached(&format!("sleep 8; {}", os.restart_agent_job(&label)));
     let then = if restart.trim_end().ends_with('&') {
         " "
     } else {
         "; "
     };
-    client.run(&format!("{restart}{then}sleep 5"))?;
+    client.run(&format!("{restart}{then}sleep 3"))?;
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(5));
     let mut after = None;
