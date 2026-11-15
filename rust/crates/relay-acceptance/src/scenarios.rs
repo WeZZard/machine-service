@@ -313,8 +313,8 @@ sleep 3
 p=$(pgrep -f "osascript -e tell application" | head -1); c=""
 while [ -n "$p" ] && [ "$p" -gt 1 ]; do c="$c $(ps -o comm= -p "$p" | sed 's#.*/##')"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done
 echo "chain:$c"
-prog=$(for w in $c; do case "$w" in osascript|sh|zsh|bash|launchd|nohup) ;; *) echo "$w"; break ;; esac; done)
-[ -n "$prog" ] || prog=zsh
+prog=zsh
+for w in $c; do case "$w" in osascript|sh|zsh|bash|launchd|nohup) ;; *) prog="$w"; break ;; esac; done
 driver=$(command -v cua-driver || echo "$HOME/.local/bin/cua-driver")
 cat > $JS <<'EOF'
 ObjC.import('CoreGraphics');
