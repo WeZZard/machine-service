@@ -90,7 +90,7 @@ if [ -n "${RELAY_ACCEPTANCE_MCP_DIST:-}" ]; then
     curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=mcp-relay-dist.tar" \
         -H 'content-type: application/octet-stream' -H "X-Content-SHA256: $dist_sha" --data-binary "@$dist_tar" >/dev/null
     rm -f "$dist_tar"
-    server_path=$(exec_script "$vm" 'mkdir -p ~/mcp-relay/dist && tar -xf ~/mcp-relay-dist.tar -C ~/mcp-relay/dist && node --version >&2 && printf %s "$HOME/mcp-relay/dist/server.mjs"' 120 | json 'd.get("output","")' | tail -1)
+    server_path=$(exec_script "$vm" 'mkdir -p ~/mcp-relay/dist && tar -xf ~/mcp-relay-dist.tar -C ~/mcp-relay/dist && node --version >/dev/null && echo "$HOME/mcp-relay/dist/server.mjs"' 120 | json 'd.get("output","")' | grep '/server\.mjs$' | tail -1)
     case "$server_path" in */server.mjs) ;; *) echo "could not place mcp-relay in $vm: $server_path" >&2; exit 1 ;; esac
 fi
 
