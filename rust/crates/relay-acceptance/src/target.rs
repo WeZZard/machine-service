@@ -399,7 +399,17 @@ impl RealTarget {
             .workspace
             .as_deref()
             .filter(|_| !self.workspace_staged);
-        relay.stage(&guest, workspace)?;
+        if let Err(error) = relay.stage(&guest, workspace) {
+            // mcp-relay keeps a guest whose stage was refused, for diagnosis;
+            // the suite records why and releases it, so no lease outlives the
+            // run.
+            let released = relay.release(&guest);
+            self.note(
+                "stage refused; released",
+                json!({"guest": guest, "error": error, "released": format!("{released:?}")}),
+            );
+            return Err(Stop::Failed(error));
+        }
         self.workspace_staged = true;
         self.note(
             "staged through mcp-relay",
