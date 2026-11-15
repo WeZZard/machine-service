@@ -460,6 +460,9 @@ impl RealTarget {
             .map(str::to_string)
             .or_else(|| durable.then(|| self.durable_machine()).flatten())
             .unwrap_or_else(|| guest.clone());
+        // A durable Mac's relay agent is the one its lease record names, the
+        // second instance's own (DC-213); a VM's is the image's.
+        let agent = AgentPlace::of_record(&record);
         self.lease = Some(Lease {
             name,
             record,
@@ -469,7 +472,7 @@ impl RealTarget {
             acquired_in,
             agent_credential: None,
             os,
-            agent: AgentPlace::guest(),
+            agent,
         });
         self.set_up(os, durable)
     }
