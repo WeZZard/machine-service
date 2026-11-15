@@ -168,6 +168,13 @@ while :; do
     case "$state" in active*|activating*) ;; *) break ;; esac
 done
 
+# The run's evidence holds the bulk test data of AC-57 and AC-58, gigabytes
+# of random bytes whose hashes the checks already recorded; each file over
+# 4 MiB is listed with its size and SHA-256 in pruned-files.txt and removed
+# before the evidence comes home, so the copy carries the record, not the
+# bytes.
+exec_script "$vm" 'cd ~/evidence && find . -type f -size +4M | while read -r f; do printf "%s %s %s\n" "$(stat -c %s "$f")" "$(sha256sum "$f" | cut -d" " -f1)" "$f"; rm -f "$f"; done > pruned-files.txt; wc -l < pruned-files.txt' 1800 >/dev/null || echo "could not prune the bulk test data in $vm; copying it whole"
+
 # Bring the evidence home as a tar stream.
 curl -fsS -m 1800 --retry 5 --retry-delay 30 --retry-all-errors "$client_instance/machines/$vm/files?lease_id=$lease&path=evidence" -o "$evidence/ubuntu-client-evidence.tar"
 tar -xf "$evidence/ubuntu-client-evidence.tar" -C "$evidence" && rm -f "$evidence/ubuntu-client-evidence.tar"
