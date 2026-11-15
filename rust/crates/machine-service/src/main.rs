@@ -209,7 +209,9 @@ fn serve(config: Config, discovery_mode: discovery::Mode) -> Result<(), String> 
 /// Start the broker on the session listener and install the relay link
 /// (`docs/arch/broker.md`, BK-1). A listener that cannot start stops the
 /// daemon: an instance told to serve the relay link must not silently serve
-/// SSH instead.
+/// SSH instead. The broker accepts its first connection only once the
+/// credentials of every lease that survived a restart, durable and
+/// virtual, are admitted again.
 fn start_relay(service: &Arc<Service>) -> Result<(), String> {
     use machine_service_core::relay::{Relay, RelaySettings};
     let settings = RelaySettings::from_environment()?;
@@ -220,10 +222,10 @@ fn start_relay(service: &Arc<Service>) -> Result<(), String> {
     let relay = Relay::start(settings, &service.config.state_dir, log)?;
     durable_routes::install_relay(&relay, &service.config.state_dir);
     service
-        .install_relay(relay)
+        .install_relay(Arc::clone(&relay))
         .map_err(|error| error.to_string())?;
     service.watch_relay_agents();
-    Ok(())
+    relay.open()
 }
 
 /// `virtual` needs Tart as well as a catalog: a Mac without Tart offers only
