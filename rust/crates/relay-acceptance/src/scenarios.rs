@@ -2042,16 +2042,21 @@ fn ac63_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
 /// a `relay_script` runs; mcp-relay asks for the execution's outcome again,
 /// so its answer arrives and the script ran once (DC-345).
 fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
+    // AC-64: with an action in flight, the broker or the relay agent
+    // restarts; each side reconnects, and the action is reported completed,
+    // running or unknown and is never run again. The action marks its own
+    // start and its one effect; the restart lands well inside it, after
+    // relay_script's own setup, which takes seconds on a slow link.
     let client = lease_actions(ctx)?;
     let host = ctx.target.host()?.clone();
-    client.run("rm -f ~/acc64-broker.txt")?;
+    client.run("rm -f ~/acc64-broker.started ~/acc64-broker.txt")?;
     let (answer, restarted) = std::thread::scope(|scope| {
         let restarter = scope.spawn(move || {
-            std::thread::sleep(Duration::from_secs(4));
+            std::thread::sleep(Duration::from_secs(30));
             host.run(&["restart"])
         });
         let answer = client.exec(
-            "sleep 15; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
+            "touch ~/acc64-broker.started; sleep 60; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
             600.0,
             Duration::from_secs(900),
         );
@@ -2062,53 +2067,91 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         "broker_answer",
         json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
     );
-    let lines =
-        client.run("wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.txt")?;
-    ctx.check(
-        "after a broker restart the answer arrives and the action ran once",
-        expect(
-            answer.as_ref().is_ok_and(|a| a.text() == "done\n") && lines.trim() == "1",
-            || {
-                format!(
-                    "answer {:?}, {} lines",
-                    answer.as_ref().map(|a| a.text()),
-                    lines.trim()
-                )
-            },
-        ),
+    let after = client.run(
+        "test -e ~/acc64-broker.started && echo started || echo not-started; \
+         wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.started ~/acc64-broker.txt",
     );
-    // The relay agent's restart: a detached command, in a session of its own
-    // so it outlives its call, kills the agent 6 s later, while the next
-    // script runs; the agent's service manager starts it again.
+    ctx.check(
+        "after a broker restart the client reconnects, the action is reported completed or unknown, and it ran at most once",
+        restart_verdict(&answer, after),
+    );
+
+    // The relay agent's restart: the action itself starts a detached command,
+    // in a session of its own, that stops the agent 10 s later, so the stop
+    // always lands inside the action; the agent's service manager starts it
+    // again. A stopped agent ends its commands (RA-5), so the action is
+    // reported unknown or interrupted, never run again.
     let os = ctx.target.os();
     let label = ctx.target.agent_job()?.label;
-    client.run("rm -f ~/acc64-agent.txt")?;
-    client.run(&os.detached(&format!("sleep 6; {}", os.kill_agent(&label))))?;
-    let answer = client.exec(
-        "sleep 15; echo once >> ~/acc64-agent.txt; sleep 5; echo done",
-        600.0,
-        Duration::from_secs(900),
+    client.run("rm -f ~/acc64-agent.started ~/acc64-agent.txt")?;
+    let stop = os.detached(&format!("sleep 10; {}", os.kill_agent(&label)));
+    // A detached command that ends in `&` is followed by the next one
+    // directly; any other by `;`.
+    let then = if stop.trim_end().ends_with('&') {
+        " "
+    } else {
+        "; "
+    };
+    let script = format!(
+        "touch ~/acc64-agent.started; {stop}{then}sleep 30; echo once >> ~/acc64-agent.txt; sleep 5; echo done"
     );
+    let answer = client.exec(&script, 600.0, Duration::from_secs(900));
     ctx.record(
         "agent_answer",
         json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
     );
-    let lines =
-        client.run("wc -l < ~/acc64-agent.txt 2>/dev/null || echo 0; rm -f ~/acc64-agent.txt")?;
+    let after = client.run(
+        "test -e ~/acc64-agent.started && echo started || echo not-started; \
+         wc -l < ~/acc64-agent.txt 2>/dev/null || echo 0; rm -f ~/acc64-agent.started ~/acc64-agent.txt",
+    );
     ctx.check(
-        "after a relay agent restart the answer arrives and the action ran once",
-        expect(
-            answer.as_ref().is_ok_and(|a| a.text() == "done\n") && lines.trim() == "1",
-            || {
-                format!(
-                    "answer {:?}, {} lines",
-                    answer.as_ref().map(|a| a.text()),
-                    lines.trim()
-                )
-            },
-        ),
+        "after a relay agent restart the client reconnects, the action is reported completed or unknown, and it ran at most once",
+        restart_verdict(&answer, after),
     );
     Ok(())
+}
+
+/// AC-64's verdict on one restart: the next call answers (each side
+/// reconnected), the action began, and it is reported completed (its one
+/// effect made) or unknown (an uncertain or interrupted outcome, at most one
+/// effect); never twice, and never a refusal.
+fn restart_verdict(
+    answer: &Result<Answer, String>,
+    after: Result<String, String>,
+) -> Result<(), Stop> {
+    let after = after.map_err(|why| {
+        Stop::Failed(format!(
+            "the client did not reconnect after the restart: {why}"
+        ))
+    })?;
+    let mut lines = after.lines().map(str::trim);
+    let started = lines.next() == Some("started");
+    let runs: u32 = lines
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX);
+    let completed = answer.as_ref().is_ok_and(|a| a.text() == "done\n");
+    let unknown = match answer {
+        Err(why) => {
+            why.contains("uncertain")
+                || why.contains("interrupted")
+                || why.contains("stopped while")
+        }
+        Ok(a) => a.text() != "done\n",
+    };
+    if !started {
+        return Err(Stop::Failed(format!(
+            "the action never began, so the restart did not land inside it: {answer:?}"
+        )));
+    }
+    match (completed, unknown, runs) {
+        (true, _, 1) => Ok(()),
+        (false, true, 0 | 1) => Ok(()),
+        _ => Err(Stop::Failed(format!(
+            "answer {:?}, ran {runs} times",
+            answer.as_ref().map(|a| a.text())
+        ))),
+    }
 }
 
 /// AC-69 through mcp-relay: a script stays silent for minutes; mcp-relay's
