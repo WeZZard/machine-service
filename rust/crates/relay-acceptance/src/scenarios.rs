@@ -2677,17 +2677,37 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         .push(("MCP_RELAY_SESSION_GRACE_MS".into(), "2000".into()));
     let mut relay = crate::mcp::McpRelay::start(&settings)?;
     let instance = ctx.target.mcp_origin()?;
-    let guest = relay.acquire(
-        "acc-ac67",
-        if durable {
-            crate::mcp::Acquire::Machine(&what)
-        } else {
-            crate::mcp::Acquire::Image(&what)
-        },
-        1.0,
-        &instance,
-    )?;
-    relay.stage(&guest, None)?;
+    // The setup is not what AC-67 judges: with a 2 s grace, a random cut of
+    // N3 can lose the session while the guest is staged, which leaves the
+    // stage uncertain. The lease is then released and set up again, up to
+    // three times.
+    let mut attempt = 0;
+    let guest = loop {
+        attempt += 1;
+        let guest = relay.acquire(
+            "acc-ac67",
+            if durable {
+                crate::mcp::Acquire::Machine(&what)
+            } else {
+                crate::mcp::Acquire::Image(&what)
+            },
+            1.0,
+            &instance,
+        )?;
+        match relay.stage(&guest, None) {
+            Ok(_) => break guest,
+            Err(why) if attempt < 3 => {
+                ctx.record(&format!("ac67 setup {attempt} failed"), json!(why));
+                let _ = relay.release(&guest);
+            }
+            Err(why) => {
+                let _ = relay.release(&guest);
+                return Err(Stop::Failed(format!(
+                    "AC-67's own lease could not be set up in 3 attempts: {why}"
+                )));
+            }
+        }
+    };
     let short = crate::mcp::McpGuest::new(relay, guest);
     short.run("rm -f ~/acc67.txt")?;
     let control = ctx.rig.control().clone();
