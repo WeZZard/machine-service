@@ -137,9 +137,20 @@ start_instance() {
     else
         write_env "$dest" "$hostdir" "$(host "$1" bind)" "$(host "$1" home)/.tart" -
     fi
-    on "$dest" "RELAY_HOST_DIR='$hostdir' perl -e 'alarm 900; exec @ARGV' /bin/sh '$hostdir/relay-acceptance-host.sh' stop >/dev/null 2>&1 || true"
-    on "$dest" "RELAY_HOST_DIR='$hostdir' perl -e 'alarm 900; exec @ARGV' /bin/sh '$hostdir/relay-acceptance-host.sh' start" > "$work/logs/start-$1.log" 2>&1 \
-        || { echo "the second instance did not start on $1; see logs/start-$1.log" >&2; return 1; }
+    # Each start is logged apart, and a failed one is tried once more after a
+    # pause, as a previous instance may still be releasing its machine.
+    log="$work/logs/start-$1-$(date +%H%M%S).log"
+    started=no
+    for attempt in 1 2; do
+        on "$dest" "RELAY_HOST_DIR='$hostdir' perl -e 'alarm 900; exec @ARGV' /bin/sh '$hostdir/relay-acceptance-host.sh' stop" >> "$log" 2>&1 < /dev/null || true
+        if on "$dest" "RELAY_HOST_DIR='$hostdir' perl -e 'alarm 900; exec @ARGV' /bin/sh '$hostdir/relay-acceptance-host.sh' start" >> "$log" 2>&1 < /dev/null; then
+            started=yes
+            break
+        fi
+        echo "start attempt $attempt failed" >> "$log"
+        sleep 30
+    done
+    [ "$started" = yes ] || { echo "the second instance did not start on $1; see $log" >&2; return 1; }
     url="$(host "$1" url)"
     id=$(curl -fsS -m 20 "$url/health" | py 'import json,sys; print((json.load(sys.stdin).get("second_instance") or {}).get("id",""))')
     [ -n "$id" ] || { echo "$url does not answer as a second instance" >&2; return 1; }
