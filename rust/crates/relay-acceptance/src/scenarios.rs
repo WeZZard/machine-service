@@ -2053,21 +2053,31 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     // can be lost before it reaches the relay agent; then nothing was in
     // flight when the broker restarted, and the attempt is made again, up to
     // three times. An action that began is judged as before.
+    // The restart must land inside the action, after relay_script's own setup,
+    // whose length follows the link: one full call is timed, and the restart
+    // comes at 30 s or three such calls and 10 s, whichever is later, inside
+    // an action that lasts 30 s more.
     let mut attempt = 0;
     let (answer, after) = loop {
         attempt += 1;
+        let timed = Instant::now();
         client.run("rm -f ~/acc64-broker.started ~/acc64-broker.txt")?;
+        let delay = Duration::from_secs(30).max(timed.elapsed() * 3 + Duration::from_secs(10));
+        ctx.record(
+            &format!("broker_restart_delay_s {attempt}"),
+            json!(delay.as_secs_f64()),
+        );
         let host = host.clone();
+        let action = format!(
+            "touch ~/acc64-broker.started; sleep {}; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
+            delay.as_secs() + 30
+        );
         let (answer, restarted) = std::thread::scope(|scope| {
             let restarter = scope.spawn(move || {
-                std::thread::sleep(Duration::from_secs(30));
+                std::thread::sleep(delay);
                 host.run(&["restart"])
             });
-            let answer = client.exec(
-                "touch ~/acc64-broker.started; sleep 60; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
-                600.0,
-                Duration::from_secs(900),
-            );
+            let answer = client.exec(&action, 600.0, Duration::from_secs(900));
             (answer, restarter.join().ok())
         });
         ctx.record(
@@ -2748,13 +2758,26 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let never_reached =
         |why: &str| why.contains("neither the broker nor the relay agent has a record");
     let mut prepared = Err(String::new());
+    // The fault must land after relay_script's own setup, whose length
+    // follows the link: the preparation's call is timed, and the fault comes
+    // at 8 s or three such calls and 5 s, whichever is later, inside a script
+    // that lasts 12 s more.
+    let mut call = Duration::ZERO;
     for _ in 0..3 {
+        let timed = Instant::now();
         prepared = short.run("rm -f ~/acc67.txt");
+        call = timed.elapsed();
         if prepared.is_ok() {
             break;
         }
     }
     prepared?;
+    let delay = Duration::from_secs(8).max(call * 3 + Duration::from_secs(5));
+    ctx.record("ac67_fault_delay_s", json!(delay.as_secs_f64()));
+    let action = format!(
+        "sleep {}; echo once >> ~/acc67.txt; echo done",
+        delay.as_secs() + 12
+    );
     let control = ctx.rig.control().clone();
     let mut attempt = 0;
     let (answer, cut) = loop {
@@ -2763,8 +2786,8 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         let (answer, cut) = std::thread::scope(|scope| {
             let away = scope.spawn(move || {
                 // mcp-relay opens its relay session only once the script runs,
-                // after its snapshot; 8 s into a 20 s script it is open.
-                std::thread::sleep(Duration::from_secs(8));
+                // after its setup; by the timed delay it is open.
+                std::thread::sleep(delay);
                 // Keep the client away for 3.5 s: reset its connections, and
                 // every new one while the reset is armed.
                 let reset = Fault::Reset {
@@ -2777,11 +2800,7 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
                 let _ = control.revert(&reset);
                 format!("{applied:?} {cut:?}")
             });
-            let answer = short.exec(
-                "sleep 20; echo once >> ~/acc67.txt; echo done",
-                600.0,
-                Duration::from_secs(900),
-            );
+            let answer = short.exec(&action, 600.0, Duration::from_secs(900));
             (answer, away.join().unwrap_or_default())
         });
         match &answer {
