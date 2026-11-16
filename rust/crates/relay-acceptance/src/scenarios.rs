@@ -2784,7 +2784,16 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
             format!("this mcp-relay logged {events:?}")
         }),
     );
-    let lines = short.run("wc -l < ~/acc67.txt 2>/dev/null || echo 0; rm -f ~/acc67.txt");
+    // The count is read-only, so a call lost to N3's cuts within the 2 s
+    // grace is made again, up to three times; the marker goes after.
+    let mut lines = Err(String::new());
+    for _ in 0..3 {
+        lines = short.run("wc -l < ~/acc67.txt 2>/dev/null || echo 0");
+        if lines.is_ok() {
+            break;
+        }
+    }
+    let _ = short.run("rm -f ~/acc67.txt");
     let _ = short.release();
     let answer = answer?;
     ctx.check(
