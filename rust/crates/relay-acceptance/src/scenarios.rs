@@ -2709,32 +2709,61 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
         }
     };
     let short = crate::mcp::McpGuest::new(relay, guest);
-    short.run("rm -f ~/acc67.txt")?;
+    // AC-67 judges an action in flight. Under N3's random cuts and a 2 s
+    // grace, a call can be lost before it reaches the relay agent ("neither
+    // the broker nor the relay agent has a record"); then nothing was in
+    // flight, and the attempt is made again, up to three times. The
+    // preparation is idempotent and retried the same way.
+    let never_reached =
+        |why: &str| why.contains("neither the broker nor the relay agent has a record");
+    let mut prepared = Err(String::new());
+    for _ in 0..3 {
+        prepared = short.run("rm -f ~/acc67.txt");
+        if prepared.is_ok() {
+            break;
+        }
+    }
+    prepared?;
     let control = ctx.rig.control().clone();
-    let (answer, cut) = std::thread::scope(|scope| {
-        let away = scope.spawn(move || {
-            // mcp-relay opens its relay session only once the script runs,
-            // after its snapshot; 8 s into a 20 s script it is open.
-            std::thread::sleep(Duration::from_secs(8));
-            // Keep the client away for 3.5 s: reset its connections, and every
-            // new one while the reset is armed.
-            let reset = Fault::Reset {
-                stream: Stream::Upstream,
-                window_ms: 0,
-            };
-            let applied = control.apply(&reset);
-            let cut = control.cut(Select::All, Side::Both);
-            std::thread::sleep(Duration::from_millis(3500));
-            let _ = control.revert(&reset);
-            format!("{applied:?} {cut:?}")
+    let mut attempt = 0;
+    let (answer, cut) = loop {
+        attempt += 1;
+        let control = control.clone();
+        let (answer, cut) = std::thread::scope(|scope| {
+            let away = scope.spawn(move || {
+                // mcp-relay opens its relay session only once the script runs,
+                // after its snapshot; 8 s into a 20 s script it is open.
+                std::thread::sleep(Duration::from_secs(8));
+                // Keep the client away for 3.5 s: reset its connections, and
+                // every new one while the reset is armed.
+                let reset = Fault::Reset {
+                    stream: Stream::Upstream,
+                    window_ms: 0,
+                };
+                let applied = control.apply(&reset);
+                let cut = control.cut(Select::All, Side::Both);
+                std::thread::sleep(Duration::from_millis(3500));
+                let _ = control.revert(&reset);
+                format!("{applied:?} {cut:?}")
+            });
+            let answer = short.exec(
+                "sleep 20; echo once >> ~/acc67.txt; echo done",
+                600.0,
+                Duration::from_secs(900),
+            );
+            (answer, away.join().unwrap_or_default())
         });
-        let answer = short.exec(
-            "sleep 20; echo once >> ~/acc67.txt; echo done",
-            600.0,
-            Duration::from_secs(900),
-        );
-        (answer, away.join().unwrap_or_default())
-    });
+        match &answer {
+            Err(why) if never_reached(why) && attempt < 3 => {
+                ctx.record(
+                    &format!("ac67 attempt {attempt}: the action never reached the agent"),
+                    json!(why),
+                );
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            _ => break (answer, cut),
+        }
+    };
     ctx.record("cut", json!(cut));
     let events = crate::mcp::session_events(&short.log());
     ctx.record("mcp_session_events", json!(events));
