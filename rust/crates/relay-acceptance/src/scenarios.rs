@@ -2049,28 +2049,49 @@ fn ac64_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     // relay_script's own setup, which takes seconds on a slow link.
     let client = lease_actions(ctx)?;
     let host = ctx.target.host()?.clone();
-    client.run("rm -f ~/acc64-broker.started ~/acc64-broker.txt")?;
-    let (answer, restarted) = std::thread::scope(|scope| {
-        let restarter = scope.spawn(move || {
-            std::thread::sleep(Duration::from_secs(30));
-            host.run(&["restart"])
+    // AC-64 starts from an action in flight. Under N3's random cuts the call
+    // can be lost before it reaches the relay agent; then nothing was in
+    // flight when the broker restarted, and the attempt is made again, up to
+    // three times. An action that began is judged as before.
+    let mut attempt = 0;
+    let (answer, after) = loop {
+        attempt += 1;
+        client.run("rm -f ~/acc64-broker.started ~/acc64-broker.txt")?;
+        let host = host.clone();
+        let (answer, restarted) = std::thread::scope(|scope| {
+            let restarter = scope.spawn(move || {
+                std::thread::sleep(Duration::from_secs(30));
+                host.run(&["restart"])
+            });
+            let answer = client.exec(
+                "touch ~/acc64-broker.started; sleep 60; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
+                600.0,
+                Duration::from_secs(900),
+            );
+            (answer, restarter.join().ok())
         });
-        let answer = client.exec(
-            "touch ~/acc64-broker.started; sleep 60; echo once >> ~/acc64-broker.txt; sleep 5; echo done",
-            600.0,
-            Duration::from_secs(900),
+        ctx.record(
+            &format!("broker_restart {attempt}"),
+            json!(format!("{restarted:?}")),
         );
-        (answer, restarter.join().ok())
-    });
-    ctx.record("broker_restart", json!(format!("{restarted:?}")));
-    ctx.record(
-        "broker_answer",
-        json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
-    );
-    let after = after_the_restart(client.as_ref(),
-        "test -e ~/acc64-broker.started && echo started || echo not-started; \
-         wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.started ~/acc64-broker.txt",
-    );
+        ctx.record(
+            &format!("broker_answer {attempt}"),
+            json!(format!("{:?}", answer.as_ref().map(|a| a.text()))),
+        );
+        let after = after_the_restart(
+            client.as_ref(),
+            "test -e ~/acc64-broker.started && echo started || echo not-started; \
+             wc -l < ~/acc64-broker.txt 2>/dev/null || echo 0; rm -f ~/acc64-broker.started ~/acc64-broker.txt",
+        );
+        let began = after
+            .as_ref()
+            .is_ok_and(|text| text.lines().next() == Some("started"));
+        if began || attempt >= 3 || after.is_err() {
+            break (answer, after);
+        }
+        // The broker's restart takes its time; the next attempt waits for it.
+        std::thread::sleep(Duration::from_secs(20));
+    };
     ctx.check(
         "after a broker restart the client reconnects, the action is reported completed or unknown, and it ran at most once",
         restart_verdict(&answer, after),
