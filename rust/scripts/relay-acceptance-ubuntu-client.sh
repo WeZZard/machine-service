@@ -77,6 +77,9 @@ release() {
         -d '{"reason":"relay acceptance client done"}' >/dev/null && echo "released $vm"
 }
 trap release EXIT
+# A run stopped by its cap (SIGALRM) or a signal still releases its VMs.
+trap 'exit 142' ALRM
+trap 'exit 143' TERM INT
 
 sha=$(shasum -a 256 "$binary" | cut -d' ' -f1)
 curl -fsS -m 600 -X PUT "$client_instance/machines/$vm/files?lease_id=$lease&path=relay-acceptance" \

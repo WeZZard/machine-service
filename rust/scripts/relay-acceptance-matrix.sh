@@ -255,8 +255,10 @@ one_run() {
             on "$(host "$target" dest)" "RELAY_HOST_DIR='$hostdir' /bin/sh '$hostdir/relay-acceptance-host.sh' rig-start $profile $((seed + 1))" > "$out.agent-rig.json" 2>&1 < /dev/null
             set -- "$@" --seed "$seed" --agent-rig external
         fi
+        # A client in a VM, behind its own NAT, takes about twice as long
+        # under a long-haul profile, so its cap is twice the run's.
         RELAY_ACCEPTANCE_HOST_KEY="$key" RELAY_ACCEPTANCE_MCP_DIST="$RELAY_MATRIX_MCP_DIST" \
-            perl -e "alarm $((cap_hours * 3600)); exec @ARGV" /bin/sh "$scripts/relay-acceptance-ubuntu-client.sh" \
+            perl -e "alarm $((cap_hours * 2 * 3600)); exec @ARGV" /bin/sh "$scripts/relay-acceptance-ubuntu-client.sh" \
             "$(host "$client" url)" "${RELAY_MATRIX_LINUX_CLIENT:?set RELAY_MATRIX_LINUX_CLIENT}" "$out" "$@" \
             --purpose "$purpose" --client mcp --mcp-server @MCP_SERVER@ > "$log" 2>&1 || rc=$?
         [ -f "$work/host-key/authorized" ] || on "$(host "$target" dest)" "RELAY_HOST_DIR='$hostdir' /bin/sh '$hostdir/relay-acceptance-host.sh' rig-stop" >/dev/null 2>&1 < /dev/null || true
