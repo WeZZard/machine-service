@@ -2751,12 +2751,12 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     };
     let short = crate::mcp::McpGuest::new(relay, guest);
     // AC-67 judges an action in flight. Under N3's random cuts and a 2 s
-    // grace, a call can be lost before it reaches the relay agent ("neither
-    // the broker nor the relay agent has a record"); then nothing was in
-    // flight, and the attempt is made again, up to three times. The
+    // grace, a call can be lost before its action starts; the action marks
+    // its own start, and only an attempt whose action provably never started
+    // is made again, up to three times. An uncertain answer alone is never
+    // a reason to send the action again: it may have run (2026-11-16, an
+    // action that ran was sent again on such an answer and ran twice). The
     // preparation is idempotent and retried the same way.
-    let never_reached =
-        |why: &str| why.contains("neither the broker nor the relay agent has a record");
     let mut prepared = Err(String::new());
     // The fault must land after relay_script's own setup, whose length
     // follows the link: the preparation's call is timed, and the fault comes
@@ -2765,7 +2765,7 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let mut call = Duration::ZERO;
     for _ in 0..3 {
         let timed = Instant::now();
-        prepared = short.run("rm -f ~/acc67.txt");
+        prepared = short.run("rm -f ~/acc67.txt ~/acc67.started");
         call = timed.elapsed();
         if prepared.is_ok() {
             break;
@@ -2775,7 +2775,7 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     let delay = Duration::from_secs(8).max(call * 3 + Duration::from_secs(5));
     ctx.record("ac67_fault_delay_s", json!(delay.as_secs_f64()));
     let action = format!(
-        "sleep {}; echo once >> ~/acc67.txt; echo done",
+        "echo start >> ~/acc67.started; sleep {}; echo once >> ~/acc67.txt; echo done",
         delay.as_secs() + 12
     );
     let control = ctx.rig.control().clone();
@@ -2803,16 +2803,22 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
             let answer = short.exec(&action, 600.0, Duration::from_secs(900));
             (answer, away.join().unwrap_or_default())
         });
-        match &answer {
-            Err(why) if never_reached(why) && attempt < 3 => {
-                ctx.record(
-                    &format!("ac67 attempt {attempt}: the action never reached the agent"),
-                    json!(why),
-                );
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            _ => break (answer, cut),
+        let Err(why) = &answer else {
+            break (answer, cut);
+        };
+        // Once any earlier run has ended (the receiver refuses the next run
+        // until then), the start marker tells whether the action began.
+        let started = after_the_restart(&short, "wc -l < ~/acc67.started 2>/dev/null || echo 0")
+            .ok()
+            .and_then(|n| n.trim().parse::<u32>().ok());
+        ctx.record(
+            &format!("ac67 attempt {attempt}"),
+            json!({"answer": why, "starts": started}),
+        );
+        if started != Some(0) || attempt >= 3 {
+            break (answer, cut);
         }
+        std::thread::sleep(Duration::from_secs(5));
     };
     ctx.record("cut", json!(cut));
     let events = crate::mcp::session_events(&short.log());
@@ -2828,12 +2834,14 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
     // grace is made again, up to three times; the marker goes after.
     let mut lines = Err(String::new());
     for _ in 0..3 {
-        lines = short.run("wc -l < ~/acc67.txt 2>/dev/null || echo 0");
+        lines = short.run(
+            "printf '%s %s\\n' \"$(wc -l < ~/acc67.txt 2>/dev/null || echo 0)\" \"$(wc -l < ~/acc67.started 2>/dev/null || echo 0)\"",
+        );
         if lines.is_ok() {
             break;
         }
     }
-    let _ = short.run("rm -f ~/acc67.txt");
+    let _ = short.run("rm -f ~/acc67.txt ~/acc67.started");
     let _ = short.release();
     let answer = answer?;
     ctx.check(
@@ -2842,10 +2850,18 @@ fn ac67_through_mcp_relay(ctx: &mut Ctx<'_>) -> Verdict {
             answer.text()
         }),
     );
+    // Its one effect, and one start across every attempt.
     let lines = lines?;
+    let counts: Vec<&str> = lines.split_whitespace().collect();
     ctx.check(
         "the action ran once",
-        expect(lines.trim() == "1", || format!("{} lines", lines.trim())),
+        expect(counts == ["1", "1"], || {
+            format!(
+                "{} effects, {} starts",
+                counts.first().unwrap_or(&"?"),
+                counts.get(1).unwrap_or(&"?")
+            )
+        }),
     );
     Ok(())
 }
