@@ -196,6 +196,41 @@ up() {
         echo "host $instance ready: $kind, folder ~/$folder"
         if [ "$kind" = vm ]; then start_instance "$instance"; fi
     done 3< "$work/hosts.list"
+    start_client_copies
+}
+
+# The Ubuntu client VMs are leased from a second instance of their own on
+# their client Mac (~/accc, ports 6272-6274), whose agent chain is started
+# once under N0 and never stopped: a client VM's relay agent dials its
+# instance's agent chain, and the target instance's chain is started and
+# stopped for each run's profile, which took the clients' relay agents with
+# it (2026-11-16, three runs held up until their cap).
+client_port=6272
+start_client_copies() {
+    py 'import json,sys; d=json.load(open(sys.argv[1]))
+for c in sorted({a["client_instance"] for a in d["assignments"] if a["client_instance"]}): print(c)' "$work/plan.json" > "$work/clients.list"
+    while read -r instance <&3; do
+        dest="$(host "$instance" dest)" home="$(host "$instance" home)" name="$(host "$instance" name)" bind="$(host "$instance" bind)"
+        copy="$home/accc"
+        on "$dest" "mkdir -p '$copy' && rsync -a --exclude instance --exclude agent-rig --exclude cache --exclude host.env --exclude tart-empty '$(host "$instance" hostdir)/' '$copy/'" < /dev/null
+        pilot=""
+        if [ -n "${PILOT_REPO:-}" ] && on "$dest" "test -d '$PILOT_REPO'" < /dev/null; then pilot="PILOT_REPO=$PILOT_REPO"; fi
+        on "$dest" "cat > '$copy/host.env'" <<EOF
+RELAY_HOST_PORT=$client_port
+RELAY_HOST_SESSION_PORT=$((client_port + 1))
+RELAY_HOST_AGENT_PORT=$((client_port + 2))
+RELAY_HOST_TART_HOME=$home/.tart
+RELAY_HOST_BIND=$bind
+$pilot
+EOF
+        on "$dest" "RELAY_HOST_DIR='$copy' /bin/sh '$copy/relay-acceptance-host.sh' stop >/dev/null 2>&1; RELAY_HOST_DIR='$copy' perl -e 'alarm 900; exec @ARGV' /bin/sh '$copy/relay-acceptance-host.sh' start && RELAY_HOST_DIR='$copy' /bin/sh '$copy/relay-acceptance-host.sh' rig-start N0 1" > "$work/logs/client-copy-$instance.log" 2>&1 < /dev/null \
+            || { echo "the client copy did not start on $instance; see logs/client-copy-$instance.log" >&2; return 1; }
+        url="http://$name.local:$client_port"
+        id=$(curl -fsS -m 20 "$url/health" | py 'import json,sys; print((json.load(sys.stdin).get("second_instance") or {}).get("id",""))')
+        [ -n "$id" ] || { echo "$url does not answer as a second instance" >&2; return 1; }
+        py 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["client_url"]=sys.argv[2]; d["client_dir"]=sys.argv[3]; json.dump(d, open(p,"w"), indent=2)' "$work/hosts/$instance.json" "$url" "$copy"
+        echo "client copy $id on $instance at $url, its agent chain under N0"
+    done 3< "$work/clients.list"
 }
 
 image_of() {
@@ -259,7 +294,7 @@ one_run() {
         # under a long-haul profile, so its cap is twice the run's.
         RELAY_ACCEPTANCE_HOST_KEY="$key" RELAY_ACCEPTANCE_MCP_DIST="$RELAY_MATRIX_MCP_DIST" \
             perl -e "alarm $((cap_hours * 2 * 3600)); exec @ARGV" /bin/sh "$scripts/relay-acceptance-ubuntu-client.sh" \
-            "$(host "$client" url)" "${RELAY_MATRIX_LINUX_CLIENT:?set RELAY_MATRIX_LINUX_CLIENT}" "$out" "$@" \
+            "$(host "$client" client_url)" "${RELAY_MATRIX_LINUX_CLIENT:?set RELAY_MATRIX_LINUX_CLIENT}" "$out" "$@" \
             --purpose "$purpose" --client mcp --mcp-server @MCP_SERVER@ > "$log" 2>&1 || rc=$?
         [ -f "$work/host-key/authorized" ] || on "$(host "$target" dest)" "RELAY_HOST_DIR='$hostdir' /bin/sh '$hostdir/relay-acceptance-host.sh' rig-stop" >/dev/null 2>&1 < /dev/null || true
         [ -f "$out/run.log" ] && cat "$out/run.log" >> "$log"
@@ -324,6 +359,11 @@ down() {
         dest="$(host "$instance" dest)" hostdir="$(host "$instance" hostdir)"
         on "$dest" "RELAY_HOST_DIR='$hostdir' perl -e 'alarm 900; exec @ARGV' /bin/sh '$hostdir/relay-acceptance-host.sh' stop" > "$work/logs/stop-$instance.log" 2>&1 \
             && echo "second instance stopped on $instance" || echo "the second instance on $instance did not stop; see logs/stop-$instance.log"
+        copy=$(py 'import json,sys; print(json.load(open(sys.argv[1])).get("client_dir",""))' "$f")
+        if [ -n "$copy" ]; then
+            on "$dest" "RELAY_HOST_DIR='$copy' /bin/sh '$copy/relay-acceptance-host.sh' rig-stop; RELAY_HOST_DIR='$copy' perl -e 'alarm 900; exec @ARGV' /bin/sh '$copy/relay-acceptance-host.sh' stop" > "$work/logs/stop-client-$instance.log" 2>&1 < /dev/null \
+                && echo "client copy stopped on $instance" || echo "the client copy on $instance did not stop; see logs/stop-client-$instance.log"
+        fi
         [ -f "$key.pub" ] && deauthorize "$dest" && echo "key removed from $instance"
     done
     rm -f "$work/host-key/authorized"
