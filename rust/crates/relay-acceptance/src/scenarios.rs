@@ -2415,9 +2415,19 @@ fn ac65(ctx: &mut Ctx<'_>) -> Verdict {
     let client = lease_actions(ctx)?;
     let os = ctx.target.os();
     let booted = client.run("uptime")?;
-    client.run(&os.detached(&format!("sleep 2; {}", os.reboot())))?;
+    // As on a durable Mac: the starting script stays 3 s, so the receiver
+    // never ends the detached reboot before it leaves the script's group,
+    // and the reboot comes 15 s in, after that script's answer has arrived
+    // even on a long-haul link, so it never ends the call that started it.
+    let reboot = os.detached(&format!("sleep 15; {}", os.reboot()));
+    let then = if reboot.trim_end().ends_with('&') {
+        " "
+    } else {
+        "; "
+    };
+    client.run(&format!("{reboot}{then}sleep 3"))?;
     let started = Instant::now();
-    std::thread::sleep(Duration::from_secs(20));
+    std::thread::sleep(Duration::from_secs(30));
     // Calls wait for the relay agent's next session (RP-8); the first one
     // that answers is served by the agent the reboot started.
     let mut back = None;
