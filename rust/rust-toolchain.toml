@@ -1,0 +1,8 @@
+# One compiler for every build of this workspace, so two release builds of
+# one commit are built alike (DC-356). The workflows install the same
+# version; raise both together.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt", "llvm-tools"]
+# The Linux guest agents and relay agent of an Apple silicon host.
+targets = ["aarch64-unknown-linux-musl"]

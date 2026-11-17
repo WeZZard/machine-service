@@ -112,7 +112,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           targets: ${{ matrix.target }}
 
       - name: musl-gcc
@@ -160,7 +160,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           targets: aarch64-unknown-linux-musl
           components: llvm-tools
 
@@ -168,7 +168,8 @@ jobs:
         run: |
           bundle="$RUNNER_TEMP/bundle"
           out="$RUNNER_TEMP/test-environment"
-          scripts/build-release.sh "$bundle"
+          # A run tests its own commit's relay agent, an ad hoc pre-release (DC-356).
+          scripts/build-release.sh --relay-agent-from-source "$bundle"
           cargo build --release -p second-instance
           cp target/release/second-instance "$bundle/"
           mkdir -p "$out"

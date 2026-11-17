@@ -90,8 +90,11 @@ the installer installs exactly those executables: both read one list, the
 # 1. Build every executable of the installation, each under its installed
 #    name, into target/machine-service/ (the Linux guest agents need
 #    `rustup target add aarch64-unknown-linux-musl` and aarch64-linux-musl-gcc).
-cd vm-service/rust   # your checkout
-scripts/build-release.sh
+#    The relay agent is the published, signed release of the tag you deploy
+#    (DC-356); --relay-agent-from-source builds an ad hoc pre-release instead,
+#    which the installer takes only with --allow-prerelease-relay-agent.
+cd vm-service/rust   # your checkout, at the tag
+scripts/build-release.sh --relay-agent-release v0.2.0
 
 # 2. Validate, then install into the install folder. Loopback only is the
 #    fresh-install default.

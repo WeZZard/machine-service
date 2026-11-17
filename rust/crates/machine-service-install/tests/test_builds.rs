@@ -151,6 +151,60 @@ fn a_release_installer_refuses_a_test_build() {
     assert!(!stderr.contains("must never be installed"), "{stderr}");
 }
 
+/// DC-356: a release's installer refuses a relay agent release whose
+/// version is a pre-release, such as a local build's `<version>-adhoc`,
+/// before it writes anything or runs any `launchctl`; it installs one only
+/// with `--allow-prerelease-relay-agent`.
+#[test]
+fn a_release_installer_refuses_a_prerelease_relay_agent() {
+    let release = release_installer();
+    let harness = Harness::new();
+    fs::copy(&release, &harness.installer).unwrap();
+    // A daemon that is no test build, so only the release is refused.
+    fs::write(
+        harness.bin.join("machine-service"),
+        "#!/bin/sh\n# machine-service\nexit 0\n",
+    )
+    .unwrap();
+    let before = tree(&harness.home);
+    let run = |extra: &[&str]| {
+        let mut command = harness::command(&harness.installer);
+        command
+            .args(["install", "--check"])
+            .args(extra)
+            .env("HOME", &harness.home)
+            .env("TART", &harness.tart)
+            .env("PATH", format!("{}:/usr/bin:/bin", harness.bin.display()));
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (passed, stderr) = run(&[]);
+    assert!(!passed, "{stderr}");
+    assert!(
+        stderr.contains("pre-release 9.9.9-adhoc")
+            && stderr.contains("--relay-agent-release")
+            && stderr.contains("--allow-prerelease-relay-agent"),
+        "{stderr}"
+    );
+    assert_eq!(tree(&harness.home), before, "the refusal wrote something");
+    assert!(!harness.log.exists(), "the refusal ran launchctl");
+
+    let (_, stderr) = run(&["--allow-prerelease-relay-agent"]);
+    assert!(!stderr.contains("pre-release 9.9.9-adhoc"), "{stderr}");
+}
+
+#[test]
+fn only_a_prerelease_is_refused_and_only_without_the_flag() {
+    use machine_service_install::installer::prerelease_refusal;
+    assert!(prerelease_refusal("0.2.0-adhoc", false).is_some());
+    assert!(prerelease_refusal("0.3.0-rc.1", false).is_some());
+    assert!(prerelease_refusal("0.2.0-adhoc", true).is_none());
+    assert!(prerelease_refusal("0.2.0", false).is_none());
+}
+
 /// Every path under `root`, with its length.
 fn tree(root: &Path) -> Vec<(PathBuf, u64)> {
     let mut found = Vec::new();
