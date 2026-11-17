@@ -136,6 +136,11 @@ pub struct Cli {
     /// Make a new agent credential for the durable Mac's relay agent (RA-4).
     #[arg(long)]
     pub rotate_relay_credential: bool,
+    /// Install a relay agent release whose version is a pre-release, such
+    /// as a local build's `<version>-adhoc`. Without it, an installer that
+    /// is not a test build takes only a published release (DC-356).
+    #[arg(long)]
+    pub allow_prerelease_relay_agent: bool,
 }
 
 /// The durable-exposure setting (DC-39).
@@ -727,6 +732,7 @@ fn validate_install(installation: &Installation) -> Result<Validated, InstallErr
     } else {
         let folder = source.join(service_layout::release::FOLDER);
         let release = Release::open(&folder).map_err(InstallError::Refused)?;
+        refuse_prerelease(&release.version, cli.allow_prerelease_relay_agent)?;
         for archive in &release.archives {
             release
                 .verified(&archive.platform)
@@ -890,6 +896,8 @@ fn relay_agent_only(
         rotate: cli.rotate_relay_credential,
         team: relay_agent_team(env)?,
     };
+    let release = Release::open(&spec.release_dir).map_err(InstallError::Refused)?;
+    refuse_prerelease(&release.version, cli.allow_prerelease_relay_agent)?;
     crate::relay_agent::check(&spec)?;
     if readonly {
         println!("Check passed; no files written and no launchctl calls (relay-agent).");
@@ -1272,6 +1280,33 @@ pub(crate) fn which(name: &str, path: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// The refusal of a relay agent release of `version` that an installer
+/// would install: a pre-release, such as the `<version>-adhoc` that
+/// `scripts/build-relay-agent.sh` makes without Developer ID, is installed
+/// only on purpose, with `allowed` (`--allow-prerelease-relay-agent`), so a
+/// deploy never installs an unsigned relay agent by accident (DC-356). A
+/// release that is not a pre-release must be signed with Developer ID
+/// (DC-224), which the installer and the daemon check (DC-236).
+pub fn prerelease_refusal(version: &str, allowed: bool) -> Option<String> {
+    (service_layout::signing::is_prerelease(version) && !allowed).then(|| {
+        format!(
+            "the relay agent release is the pre-release {version}; an installation takes a published release, which `scripts/build-release.sh --relay-agent-release <tag>` puts in the build, or pass --allow-prerelease-relay-agent to install a pre-release on purpose (DC-356)"
+        )
+    })
+}
+
+/// [`prerelease_refusal`] for this installer: a test build installs the
+/// test releases its tests make (DC-258), so only a release build refuses.
+fn refuse_prerelease(version: &str, allowed: bool) -> Result<(), InstallError> {
+    if service_layout::test_build::is_test_build() {
+        return Ok(());
+    }
+    match prerelease_refusal(version, allowed) {
+        Some(refusal) => Err(InstallError::Refused(refusal)),
+        None => Ok(()),
+    }
 }
 
 /// The refusals of every executable of `helpers` in `source`, and of the
