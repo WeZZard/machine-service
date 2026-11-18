@@ -38,6 +38,7 @@
 #
 # The work dir holds plan.json, hosts/, host-key/, evidence/, logs/,
 # revisions-<time>.json for each `run` and summary.json. Settings, from the environment:
+#   RELAY_MATRIX_KEEP_EVIDENCE set: a passed run keeps its payloads and screenshots (DC-357)
 #   RELAY_MATRIX_HOST_BUILD    the host folder's binaries, as
 #                              relay-acceptance-host.sh lists them (required)
 #   RELAY_MATRIX_MAC_CLIENT    relay-acceptance for this Mac (default: the
@@ -317,7 +318,25 @@ one_run() {
         ;;
     esac
     verdicts=$(grep -oE ' AC-[0-9]+: (Passed|Failed|Blocked)' "$log" | sort -u | awk '{print $2}' | sort | uniq -c | tr -s ' \n' ' ' || true)
+    case "$rc:$verdicts" in
+    0:*Passed*) case "$verdicts" in *Failed* | *Blocked*) ;; *) prune_passed "$work/evidence/$cell/$profile" ;; esac ;;
+    esac
     echo "RESULT $cell $profile on $target rc=$rc$verdicts $(date '+%H:%M')"
+}
+
+prune_passed() {
+    # A run that passed every check keeps its report, logs, receipts and
+    # records, and drops the bulk that only a failure would need (DC-357):
+    # the generated transfer payloads of AC-57 and AC-58, whose sizes and
+    # SHA-256 its report keeps, and its screenshots. pruned.tsv lists each
+    # file removed with its size; the run's evidence packages no longer
+    # verify whole. RELAY_MATRIX_KEEP_EVIDENCE=1 keeps everything.
+    dir="$1"
+    [ -d "$dir" ] && [ -z "${RELAY_MATRIX_KEEP_EVIDENCE:-}" ] || return 0
+    find "$dir" -type f \( -path '*/extractions/ac5[78]-*' -o -path '*/acc58-push/*' -o -name '*.png' \) \
+        -exec stat -f '%z	%N' {} + > "$dir/pruned.tsv" 2>/dev/null || true
+    cut -f2 "$dir/pruned.tsv" | while IFS= read -r file; do rm -f "$file"; done
+    awk -F'\t' '{t+=$1} END{printf "pruned %d files, %.1f GB, of a passed run\n", NR, t/1e9}' "$dir/pruned.tsv"
 }
 
 queue() {
